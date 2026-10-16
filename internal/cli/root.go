@@ -118,6 +118,70 @@ func safeText(s string) string {
 	return b.String()
 }
 
+var agentHelpTopics = map[string]string{
+	"agent": `Agent workflow
+
+1. Create/open the vault: agsecret init
+2. Store through stdin and save the returned ID:
+     printf '%s' "$VALUE" | agsecret put NAME --secret-stdin --json
+3. Use the ID for later commands:
+     agsecret view ID --json --quiet
+     agsecret exec -- curl -H 'Authorization: Bearer ID' URL
+4. If pass output is exposed, report before rotating:
+     agsecret report ID --reason '...'
+5. Rotate with put. A changed secret gets a new ID; the old ID stops resolving.
+
+TOTP seeds are never printed or reportable. Use get, exec, or send for codes.
+Use --quiet when stderr is merged into machine-readable stdout.
+
+Topics: put, view, get, exec, send, report, list, doctor.`,
+	"put": `put NAME|ID [SECRET]
+
+Create with a NAME; update with NAME or the current ID. Prefer --secret-stdin or
+--secret-file. Use --json and save .id. Policy-only updates keep the ID and leak
+history. A changed secret or type gets a new ID and clears that record's history.
+Pass duplicates are reported on stderr by ID; no secret is printed.
+
+Options: --type pass|totp, --ttl, --mask, --allow-get, --allow-exec.`,
+	"view": `view NAME|ID
+
+Shows metadata, policy, status, leak history, and a masked value. Prefer --json.
+TOTP values always display as [set]. --dangerously-show-secret reveals a pass
+only; for TOTP it displays the current code and never the seed. --quiet suppresses
+the periodic stderr tip.`,
+	"get": `get NAME|ID
+
+Checks expiry and allow_get. Pass output requires a terminal or an indirect pipe
+on Linux; captured stdout and regular-file redirects fail closed. TOTP returns a
+current code. Use --dangerously-skip-check only for a destination you trust.
+Prefer exec or send for Agent workflows.`,
+	"exec": `exec -- COMMAND [ARGS...]
+
+Replaces ags_<16 lowercase hex> IDs in argv and inherited environment values,
+then starts COMMAND directly. TOTP IDs become current codes. Child stdout/stderr
+are filtered for active secrets; a stderr note appears only after a match.
+Prefer argv positions or environment values over shell source.`,
+	"send": `send tmux:<TARGET> NAME|ID
+
+Sends a pass or current TOTP code to a tmux pane after checking TTY ECHO and
+allow_exec. --enter=false skips Enter; --force-echo overrides only the ECHO
+check. Pass values containing terminal control characters are rejected; use exec.`,
+	"report": `report ID|NAME [--secret-stdin]
+
+Appends a leak event without changing permissions. Prefer the current ID. An ID
+or NAME report resolves one pass and appends to every pass record with the same
+exact value, including expired or disabled records. --secret-stdin matches exact
+pass bytes and never TOTP. --json always returns an array. There is no --revoke.`,
+	"list": `list [--json]
+
+Lists current names, IDs, types, statuses, and masks. Save IDs from JSON output.
+Use --quiet when stderr is merged with stdout.`,
+	"doctor": `doctor [--json]
+
+Checks the vault and lists credentials with leak history. It does not change
+permissions or rotate values. Use --quiet when stderr is merged with stdout.`,
+}
+
 func newRoot(o *options) *cobra.Command {
 	var showVersion bool
 	r := &cobra.Command{
@@ -125,63 +189,10 @@ func newRoot(o *options) *cobra.Command {
 		Short:         "Keep Agent credentials out of model-visible command output",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Long: `AG-Secret keeps passwords and TOTP seeds in an encrypted SQLite database.
-Credentials have random IDs such as ags_9f8e7d6c5b4a3210. IDs are tokens,
-not plaintext secrets. A changed secret gets a new ID and invalidates the old
-one. All single-credential commands accept a name or current ID.
-
-Agent usage guide:
-  Discover credentials with agsecret list and agsecret view NAME|ID. view shows
-  metadata, leak history and a masked value by default. Use --json for structure.
-  The default mask is [set]; prefix/suffix masks intentionally reveal characters.
-
-  Pass a token to a command with agsecret exec -- COMMAND [ARGUMENTS...]. Tokens
-  in arguments and environment variable values are replaced just before launch:
-    agsecret exec -- curl -H 'Authorization: Bearer ags_9f8e7d6c5b4a3210' URL
-    API_KEY=ags_9f8e7d6c5b4a3210 agsecret exec -- your-program
-  The child runs directly, without an implicit shell. Known active passwords
-  and TOTP seeds are redacted on stdout/stderr as [REDACTED:ags_<16hex>]. A notice
-  is printed only when a replacement actually occurs. Redaction is exact-byte;
-  transformed values, files, network traffic and programs opening their own TTY
-  are outside this protection. Expanded arguments may be visible to local
-  process inspectors, so prefer an environment or program-specific stdin input.
-
-  get emits a password only to an interactive TTY or an indirect pipe/substitution
-  under a non-interactive shell on Linux:
-    your-program --password "$(agsecret get NAME)"
-    agsecret get NAME | your-program --password-stdin
-  Top-level captured output and regular-file redirects are refused. Only a distinct
-  pipe compared with the shell's fd 1/2 is treated as indirect. The receiving program must not print the
-  password; indirect get does not redact downstream output. A TOTP get prints the
-  current short-lived code. --dangerously-skip-check bypasses the output check.
-
-  Inject a password or current TOTP code into an existing tmux prompt:
-    agsecret send tmux:dev:0.1 NAME
-  The target TTY must have ECHO disabled (a password prompt). --enter=false skips
-  Enter, while --force-echo overrides the echo check and may expose the value.
-
-  If plaintext is exposed, report it immediately without repeating it in chat:
-    agsecret report ags_9f8e7d6c5b4a3210 --reason 'unexpected command output'
-    agsecret report ags_9f8e7d6c5b4a3210 --context 'log excerpt' --attachment /path/to/log
-    printf '%s' "$LEAKED_VALUE" | agsecret report --secret-stdin
-  Reports append the event to every pass record sharing the same plaintext,
-  including expired or disabled records, and never change access policy.
-  --secret-stdin matches stored passphrases. TOTP credentials do not support
-  reports. report --json always returns an array of affected pass records.
-  Use --quiet with list/view/doctor to suppress periodic tips. A human decides
-  whether to change permissions or rotate; reports never do either automatically.
-  A changed secret receives a new ID and clears that record's leak history;
-  same-value updates retain both. Save the ID returned by put --json. A stale ID
-  fails; do not retry a delayed incident report against the replacement by name.
-
-  Store or rotate a password with agsecret put NAME|ID --secret-stdin. For a TOTP seed or
-  otpauth://totp URI add --type totp. New credentials permit get/exec/send; expiry
-  and per-credential policies still apply. view never exposes a TOTP seed; its
-  dangerous mode only shows the current short-lived code.
-
-Run agsecret init to create the database and a random owner-only default pass
-file. An external --pass-file or AGSECRET_PASS_FILE can supply the passphrase.
-Encrypted SQLite uses a pure-Go VFS and does not require CGO.`,
+		Long: `Encrypted local credentials for Agent workflows.
+Use list/view to discover current IDs, put --json to capture an ID, and exec to
+expand IDs while filtering child output. Use "agsecret help agent" for the
+short workflow guide and "agsecret help TOPIC" for safety details.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if showVersion {
@@ -220,6 +231,22 @@ Encrypted SQLite uses a pure-Go VFS and does not require CGO.`,
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "agsecret "+safeText(Version))
 		return err
 	}})
+	help := &cobra.Command{Use: "help [TOPIC|COMMAND]", Short: "Show concise Agent workflow help", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if len(args) == 0 {
+			return cmd.Root().Help()
+		}
+		if text, ok := agentHelpTopics[args[0]]; ok {
+			_, err := fmt.Fprintln(cmd.OutOrStdout(), text)
+			return err
+		}
+		target, rest, err := r.Find(args)
+		if err != nil || len(rest) != 0 {
+			return usage("unknown help topic %q; choose agent, put, view, get, exec, send, report, list, or doctor", strings.Join(args, " "))
+		}
+		target.InitDefaultHelpFlag()
+		return target.Help()
+	}}
+	r.SetHelpCommand(help)
 	return r
 }
 
