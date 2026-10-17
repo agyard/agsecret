@@ -308,9 +308,9 @@ func TestMetadataEscapesTerminalControls(t *testing.T) {
 		t.Fatalf("JSON changed the value: %q", value)
 	}
 	for input, want := range map[string]string{
-		"ordinary 中文":          "ordinary 中文",
-		"\x00\r\n\t\b\x1b\x7f": `\0\r\n\t\b\x1b\x7f`,
-		"\u009b\u202e\u2028":   `\u009b\u202e\u2028`,
+		"ordinary \u4e2d\u6587": "ordinary \u4e2d\u6587",
+		"\x00\r\n\t\b\x1b\x7f":  `\0\r\n\t\b\x1b\x7f`,
+		"\u009b\u202e\u2028":    `\u009b\u202e\u2028`,
 	} {
 		if got := safeText(input); got != want {
 			t.Fatalf("safeText(%q)=%q, want %q", input, got, want)
