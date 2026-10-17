@@ -12,8 +12,8 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/agyard/agsecret/internal/store"
 	"github.com/spf13/cobra"
-	"github.com/thezzisu/agsecret/internal/store"
 )
 
 var Version = "dev"
@@ -118,69 +118,34 @@ func safeText(s string) string {
 	return b.String()
 }
 
-var agentHelpTopics = map[string]string{
-	"agent": `Agent workflow
+const agentHelpText = `Agent workflow
 
-1. Create/open the vault: agsecret init
-2. Store through stdin and save the returned ID:
-     printf '%s' "$VALUE" | agsecret put NAME --secret-stdin --json
-3. Use the ID for later commands:
-     agsecret view ID --json --quiet
-     agsecret exec -- curl -H 'Authorization: Bearer ID' URL
-4. If pass output is exposed, report before rotating:
-     agsecret report ID --reason '...'
-5. Rotate with put. A changed secret gets a new ID; the old ID stops resolving.
+Discover credentials with agsecret list --json and agsecret view ID --json.
+Replace ID below with the current ags_<16 lowercase hex> ID from those results.
 
-TOTP seeds are never printed or reportable. Use get, exec, or send for codes.
-Use --quiet when stderr is merged into machine-readable stdout.
+  agsecret exec -- curl -H 'Authorization: Bearer ID' URL
+  agsecret send tmux:<PANE> ID
+  agsecret get TOTP_ID
+  agsecret report ID --reason 'unexpected plaintext output'
 
-Topics: put, view, get, exec, send, report, list, doctor.`,
-	"put": `put NAME|ID [SECRET]
+exec expands IDs in argv/environment and filters stdout/stderr. Pass IDs as
+arguments or environment values, not shell source. Filtering matches exact
+bytes; transformed output, files and direct terminal writes bypass it.
+[REDACTED:ID] marks removed bytes; it does not mean plaintext escaped.
+send requires a password prompt with TTY ECHO disabled.
 
-Create with a NAME; update with NAME or the current ID. Prefer --secret-stdin or
---secret-file. Use --json and save .id. Policy-only updates keep the ID and leak
-history. A changed secret or type gets a new ID and clears that record's history.
-Pass duplicates are reported on stderr by ID; no secret is printed.
+Pass get refuses captured stdout. On Linux, indirect use such as
+consumer "$(agsecret get ID)" or agsecret get ID | consumer is allowed;
+the consumer must not echo the value. Prefer exec or send. TOTP get returns a
+current code; TOTP seeds are never printed and TOTP is not reportable.
 
-Options: --type pass|totp, --ttl, --mask, --allow-get, --allow-exec.`,
-	"view": `view NAME|ID
+If plaintext escapes, report its ID before rotation. All matching pass records
+receive the report; permissions never change. report --json returns an array;
+report --secret-stdin matches exact pass bytes. A changed secret/type gets a new
+ID. Never retry an old-ID report by name: it could blame a replacement secret.
 
-Shows metadata, policy, status, leak history, and a masked value. Prefer --json.
-TOTP values always display as [set]. --dangerously-show-secret reveals a pass
-only; for TOTP it displays the current code and never the seed. --quiet suppresses
-the periodic stderr tip.`,
-	"get": `get NAME|ID
-
-Checks expiry and allow_get. Pass output requires a terminal or an indirect pipe
-on Linux; captured stdout and regular-file redirects fail closed. TOTP returns a
-current code. Use --dangerously-skip-check only for a destination you trust.
-Prefer exec or send for Agent workflows.`,
-	"exec": `exec -- COMMAND [ARGS...]
-
-Replaces ags_<16 lowercase hex> IDs in argv and inherited environment values,
-then starts COMMAND directly. TOTP IDs become current codes. Child stdout/stderr
-are filtered for active secrets; a stderr note appears only after a match.
-Prefer argv positions or environment values over shell source.`,
-	"send": `send tmux:<TARGET> NAME|ID
-
-Sends a pass or current TOTP code to a tmux pane after checking TTY ECHO and
-allow_exec. --enter=false skips Enter; --force-echo overrides only the ECHO
-check. Pass values containing terminal control characters are rejected; use exec.`,
-	"report": `report ID|NAME [--secret-stdin]
-
-Appends a leak event without changing permissions. Prefer the current ID. An ID
-or NAME report resolves one pass and appends to every pass record with the same
-exact value, including expired or disabled records. --secret-stdin matches exact
-pass bytes and never TOTP. --json always returns an array. There is no --revoke.`,
-	"list": `list [--json]
-
-Lists current names, IDs, types, statuses, and masks. Save IDs from JSON output.
-Use --quiet when stderr is merged with stdout.`,
-	"doctor": `doctor [--json]
-
-Checks the vault and lists credentials with leak history. It does not change
-permissions or rotate values. Use --quiet when stderr is merged with stdout.`,
-}
+Keep JSON stdout separate from stderr; --quiet suppresses the periodic tip.
+For command options: agsecret COMMAND --help or agsecret help COMMAND`
 
 func newRoot(o *options) *cobra.Command {
 	var showVersion bool
@@ -191,8 +156,8 @@ func newRoot(o *options) *cobra.Command {
 		SilenceErrors: true,
 		Long: `Encrypted local credentials for Agent workflows.
 Use list/view to discover current IDs, put --json to capture an ID, and exec to
-expand IDs while filtering child output. Use "agsecret help agent" for the
-short workflow guide and "agsecret help TOPIC" for safety details.`,
+expand IDs while filtering child output. Use "agsecret help --agent" for the
+short Agent workflow guide.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if showVersion {
@@ -231,21 +196,23 @@ short workflow guide and "agsecret help TOPIC" for safety details.`,
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "agsecret "+safeText(Version))
 		return err
 	}})
-	help := &cobra.Command{Use: "help [TOPIC|COMMAND]", Short: "Show concise Agent workflow help", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		if len(args) == 0 {
-			return cmd.Root().Help()
-		}
-		if text, ok := agentHelpTopics[args[0]]; ok {
-			_, err := fmt.Fprintln(cmd.OutOrStdout(), text)
+	var agentOnly bool
+	help := &cobra.Command{Use: "help [COMMAND]", Short: "Show command help", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if agentOnly {
+			if len(args) != 0 {
+				return usage("--agent cannot be combined with COMMAND; use agsecret COMMAND --help for command flags")
+			}
+			_, err := io.WriteString(cmd.OutOrStdout(), agentHelpText+"\n")
 			return err
 		}
 		target, rest, err := r.Find(args)
 		if err != nil || len(rest) != 0 {
-			return usage("unknown help topic %q; choose agent, put, view, get, exec, send, report, list, or doctor", strings.Join(args, " "))
+			return usage("unknown command %q; use agsecret help --agent for Agent workflow guidance", strings.Join(args, " "))
 		}
 		target.InitDefaultHelpFlag()
 		return target.Help()
 	}}
+	help.Flags().BoolVar(&agentOnly, "agent", false, "show the concise Agent workflow guide")
 	r.SetHelpCommand(help)
 	return r
 }

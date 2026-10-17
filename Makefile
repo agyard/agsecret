@@ -3,13 +3,13 @@ GO ?= go
 VERSION ?= dev
 GOMEMLIMIT ?= 512MiB
 TEST_TIMEOUT ?= 2m
-LDFLAGS := -s -w -X github.com/thezzisu/agsecret/internal/cli.Version=$(VERSION)
+LDFLAGS := -s -w -X github.com/agyard/agsecret/internal/cli.Version=$(VERSION)
 
 .PHONY: build test check integration clean
 
 build:
 	mkdir -p bin
-	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o bin/agsecret ./cmd/agsecret
+	CGO_ENABLED=0 $(GO) build -p 1 -trimpath -ldflags '$(LDFLAGS)' -o bin/agsecret ./cmd/agsecret
 
 test:
 	GOMEMLIMIT=$(GOMEMLIMIT) CGO_ENABLED=0 sh scripts/bounded-check.sh $(GO) test -p 1 -timeout $(TEST_TIMEOUT) ./...

@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agyard/agsecret/internal/redact"
+	"github.com/agyard/agsecret/internal/store"
+	"github.com/agyard/agsecret/internal/totp"
 	"github.com/spf13/cobra"
-	"github.com/thezzisu/agsecret/internal/redact"
-	"github.com/thezzisu/agsecret/internal/store"
-	"github.com/thezzisu/agsecret/internal/totp"
 )
 
 func newPut(o *options) *cobra.Command {
@@ -303,7 +303,7 @@ func maybeLecture(cmd *cobra.Command, s *store.Store, quiet bool) error {
 		return err
 	}
 	if show {
-		_, err = fmt.Fprintln(cmd.ErrOrStderr(), `agsecret: tip: run "agsecret help" for agent-safe usage patterns.`)
+		_, err = fmt.Fprintln(cmd.ErrOrStderr(), `agsecret: tip: run "agsecret help --agent" for agent-safe usage patterns.`)
 	}
 	return err
 }

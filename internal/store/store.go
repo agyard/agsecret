@@ -25,10 +25,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/agyard/agsecret/internal/totp"
 	"github.com/ncruces/go-sqlite3"
 	"github.com/ncruces/go-sqlite3/driver"
 	_ "github.com/ncruces/go-sqlite3/vfs/adiantum"
-	"github.com/thezzisu/agsecret/internal/totp"
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/chacha20poly1305"
 )

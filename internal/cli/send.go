@@ -8,8 +8,8 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/agyard/agsecret/internal/store"
 	"github.com/spf13/cobra"
-	"github.com/thezzisu/agsecret/internal/store"
 )
 
 func parseTmuxTarget(value string) (string, error) {

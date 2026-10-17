@@ -12,8 +12,8 @@ import (
 	"runtime"
 	"time"
 
+	"github.com/agyard/agsecret/internal/store"
 	"github.com/spf13/cobra"
-	"github.com/thezzisu/agsecret/internal/store"
 	"golang.org/x/term"
 )
 

@@ -18,10 +18,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agyard/agsecret/internal/redact"
+	"github.com/agyard/agsecret/internal/store"
+	"github.com/agyard/agsecret/internal/totp"
 	"github.com/spf13/cobra"
-	"github.com/thezzisu/agsecret/internal/redact"
-	"github.com/thezzisu/agsecret/internal/store"
-	"github.com/thezzisu/agsecret/internal/totp"
 	"golang.org/x/term"
 )
 
@@ -233,7 +233,7 @@ func runExpandedCommand(ctx context.Context, o *options, cmd *cobra.Command, arg
 		if description == "" {
 			description = "matching bytes removed"
 		}
-		note := fmt.Sprintf("%sagsecret: redacted secret output (%s); see \"agsecret help\" for details.\n", prefix, description)
+		note := fmt.Sprintf("%sagsecret: redacted secret output (%s); see \"agsecret help --agent\" for details.\n", prefix, description)
 		err = stderr.emit(stderr.redactor.Feed([]byte(note), true))
 		if stderrErr == nil {
 			stderrErr = err
@@ -311,7 +311,7 @@ func processExitCode(err *exec.ExitError) int {
 	return 1
 }
 
-const capturedOutputRefusal = `refused to print secret directly to captured stdout. Use indirectly via "$(agsecret get <ref>)", pipes, "agsecret send tmux:<pane> <ref>", or "agsecret exec", or pass --dangerously-skip-check. Run "agsecret help" for details.`
+const capturedOutputRefusal = `refused to print secret directly to captured stdout. Use exec or send; run "agsecret help --agent" for safe usage.`
 
 func trustedTerminal(out, _ io.Writer) error {
 	if runtime.GOOS == "linux" {

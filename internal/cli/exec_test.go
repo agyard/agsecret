@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thezzisu/agsecret/internal/store"
+	"github.com/agyard/agsecret/internal/store"
 )
 
 func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
@@ -46,7 +46,7 @@ func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 		t.Fatalf("no-hit output should have no footer: code=%d out=%q err=%q", code, out, errOut)
 	}
 	code, out, errOut = call("large")
-	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "see \"agsecret help\" for details.\n") {
+	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "see \"agsecret help --agent\" for details.\n") {
 		t.Fatalf("trailing output lost: code=%d output bytes=%d stderr=%q", code, len(out), errOut)
 	}
 	code, out, errOut = call("exit")

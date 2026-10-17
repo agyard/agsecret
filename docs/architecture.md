@@ -155,11 +155,11 @@ socket when tmux is installed.
 
 ## Resource-bounded verification
 
-`make test` and `make check` use `scripts/bounded-check.sh`. With a Linux user
-systemd manager, a transient cgroup limits the full process tree to 2 GiB RAM,
-zero swap, 256 tasks and 180 seconds. Without it, Linux uses a 2 GiB per-process
-virtual-memory cap. Compilation uses `-p 1`; tests have a 2 minute timeout and
-Go's GC memory target defaults to 512 MiB. `GOMEMLIMIT` alone is not a hard limit.
+`make test` and `make check` use `scripts/bounded-check.sh`. The wrapper sets
+Go's GC target to 512 MiB, limits concurrency with `GOMAXPROCS=2`, and on Linux
+adds a 2 GiB per-process virtual-memory cap. Compilation uses `-p 1`; tests
+have a 2 minute timeout. `GOMEMLIMIT` alone is not a hard limit, so keep the
+explicit timeout and address-space guard when running checks in CI or locally.
 
 Tests cover RFC vectors, migrations, atomic policy preservation and leak reports,
 process-level SQLite concurrency, pipe identity, real shell capture/substitution,

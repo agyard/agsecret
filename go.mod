@@ -1,4 +1,4 @@
-module github.com/thezzisu/agsecret
+module github.com/agyard/agsecret
 
 go 1.26.0
 

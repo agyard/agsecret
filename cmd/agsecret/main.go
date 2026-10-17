@@ -6,7 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/thezzisu/agsecret/internal/cli"
+	"github.com/agyard/agsecret/internal/cli"
 )
 
 func main() {

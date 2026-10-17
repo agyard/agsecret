@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thezzisu/agsecret/internal/store"
+	"github.com/agyard/agsecret/internal/store"
 )
 
 type testCLI struct {
@@ -55,6 +55,40 @@ func (c testCLI) record(args ...string) map[string]any {
 		c.t.Fatalf("invalid JSON %q: %v", out, err)
 	}
 	return record
+}
+
+func TestHelpEntrypoints(t *testing.T) {
+	call := func(args ...string) (int, string, string) {
+		var out, errOut bytes.Buffer
+		code := Execute(t.Context(), args, strings.NewReader(""), &out, &errOut)
+		return code, out.String(), errOut.String()
+	}
+
+	for _, command := range []string{"", "init", "put", "view", "get", "send", "exec", "report", "list", "ls", "delete", "rm", "doctor", "version", "help"} {
+		helpArgs, flagArgs := []string{"help"}, []string{"--help"}
+		if command != "" {
+			helpArgs = append(helpArgs, command)
+			flagArgs = []string{command, "--help"}
+		}
+		code, out, errOut := call(helpArgs...)
+		flagCode, flagOut, flagErr := call(flagArgs...)
+		if code != 0 || flagCode != 0 || errOut != "" || flagErr != "" || out != flagOut || !strings.Contains(out, "--help") {
+			t.Fatalf("help mismatch for %q: code=%d/%d out=%q/%q err=%q/%q", command, code, flagCode, out, flagOut, errOut, flagErr)
+		}
+	}
+	if code, out, errOut := call("help", "--agent"); code != 0 || errOut != "" ||
+		!strings.Contains(out, "Agent workflow") || strings.Contains(out, "Available Commands:") {
+		t.Fatalf("agent help: code=%d out=%q err=%q", code, out, errOut)
+	}
+	for _, args := range [][]string{{"--agent"}, {"view", "--agent"}, {"help", "agent"}, {"help", "missing-command"}} {
+		if code, out, errOut := call(args...); code == 0 || out != "" || errOut == "" {
+			t.Fatalf("invalid help %v: code=%d out=%q err=%q", args, code, out, errOut)
+		}
+	}
+	if code, out, errOut := call("help", "--agent", "view"); code != 2 || out != "" ||
+		!strings.Contains(errOut, "--agent cannot be combined with COMMAND") {
+		t.Fatalf("agent help with command: code=%d out=%q err=%q", code, out, errOut)
+	}
 }
 
 func TestWorkflowAndOutputProtection(t *testing.T) {
@@ -172,7 +206,7 @@ func TestReportSecretAndLecture(t *testing.T) {
 	if len(reported) != 2 {
 		t.Fatalf("matched %d records", len(reported))
 	}
-	if _, errText := c.ok("", "list"); !strings.Contains(errText, "agsecret help") {
+	if _, errText := c.ok("", "list"); !strings.Contains(errText, "agsecret help --agent") {
 		t.Fatalf("first lecture missing: %q", errText)
 	}
 	if _, errText := c.ok("", "view", "first"); errText != "" {
@@ -188,7 +222,7 @@ func TestReportSecretAndLecture(t *testing.T) {
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, errText := c.ok("", "doctor"); !strings.Contains(errText, "agsecret help") {
+	if _, errText := c.ok("", "doctor"); !strings.Contains(errText, "agsecret help --agent") {
 		t.Fatalf("expired lecture missing: %q", errText)
 	}
 	if code, _, _ := c.call("unmatched", "report", "--secret-stdin"); code == 0 {

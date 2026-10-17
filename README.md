@@ -4,6 +4,12 @@ AG-Secret is a local credential vault for Agent workflows. It stores passwords a
 
 Licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
 
+Install with Go 1.26+:
+
+```sh
+CGO_ENABLED=0 go install github.com/agyard/agsecret/cmd/agsecret@latest
+```
+
 ## Agent workflow
 
 ```sh
@@ -21,7 +27,7 @@ agsecret report ags_0123456789abcdef --reason 'unexpected output'
 agsecret put ags_0123456789abcdef --secret-stdin --json
 ```
 
-Run `agsecret help agent` for the short workflow guide. Use `agsecret help put`, `help exec`, `help report`, `help get`, or `help send` for focused instructions. Regular command help remains available with `agsecret COMMAND --help`.
+Run `agsecret help --agent` for the short Agent workflow guide. Use `agsecret help COMMAND` or `agsecret COMMAND --help` for command details.
 
 `put --json` returns a record containing the current ID. A policy-only update keeps the ID and leak history. Changing the secret or type creates a new ID and invalidates the old one. A stale ID fails; do not retry a delayed incident report by name.
 
@@ -69,7 +75,7 @@ SQLite encryption is at rest, not tamper or rollback protection. Same-user proce
 
 ## Development
 
-Requires Go 1.26+.
+Requires Go 1.26+ and Make. Standard checks need no C compiler or service manager.
 
 ```sh
 make test       # bounded memory, bounded time, CGO disabled
@@ -78,4 +84,4 @@ make build
 make integration  # local HTTP + isolated tmux E2E; Linux/Python 3
 ```
 
-The integration test uses synthetic credentials, a temporary vault, a loopback HTTP server, and a private tmux socket. It never uses an existing user pane. Cross-compilation is checked with `CGO_ENABLED=0` for Windows amd64, macOS arm64, and Linux arm64.
+Checks limit Go concurrency and memory, with a 2 GiB per-process virtual-memory cap on Linux and a 2-minute Go test timeout. The optional integration test requires Python 3; its real-tmux checks skip when tmux is unavailable. It uses synthetic credentials, a temporary vault, a loopback HTTP server, and a private tmux socket. Cross-compilation is checked with `CGO_ENABLED=0` for Windows amd64, macOS arm64, and Linux arm64.

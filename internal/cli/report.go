@@ -3,8 +3,8 @@ package cli
 import (
 	"fmt"
 
+	"github.com/agyard/agsecret/internal/store"
 	"github.com/spf13/cobra"
-	"github.com/thezzisu/agsecret/internal/store"
 )
 
 func newReport(o *options) *cobra.Command {
