@@ -132,18 +132,27 @@ func TestWorkflow(t *testing.T) {
 		t.Fatalf("put without a value: code=%d err=%q", code, errText)
 	}
 
-	// Options change without the value, and keep the ID.
+	// Narrowing needs no value and keeps the ID; loosening needs the value.
 	if r := c.json("", "put", "api", "--access", "exec").(map[string]any); r["id"] != id || r["access"] != "exec" {
 		t.Fatalf("option change: %v", r)
 	}
-	if code, _, errText := c.call("", "get", "api"); code != 1 || !strings.Contains(errText, "ask the user to allow it with agsecret put api --access get,exec") {
+	if code, _, errText := c.call("", "get", "api", "--dangerously-skip-check"); code != 1 || !strings.Contains(errText, "get is turned off for api") || strings.Contains(errText, "--access") {
 		t.Fatalf("disabled get: code=%d err=%q", code, errText)
 	}
 	c.ok("", "put", "api", "--ttl", "1ns")
-	if code, _, errText := c.call("", "exec", "--", "echo", id); code != 125 || !strings.Contains(errText, "has expired; ask the user to renew it") {
+	if code, _, errText := c.call("", "exec", "--", "echo", id); code != 125 || !strings.Contains(errText, "has expired; renewing it is up to the user") {
 		t.Fatalf("expired exec: code=%d err=%q", code, errText)
 	}
-	c.ok("", "put", "api", "--ttl", "0", "--access", "get,exec")
+	for _, args := range [][]string{{"--ttl", "0"}, {"--access", "get,exec"}} {
+		if code, _, errText := c.call("", append([]string{"put", "api"}, args...)...); code != 1 || !strings.Contains(errText, "put needs the value of api to widen") {
+			t.Fatalf("loosening %v without the value: code=%d err=%q", args, code, errText)
+		}
+	}
+	c.ok("", "put", "api", "--ttl", "0", "--dangerously-skip-check")
+	c.ok("secret-value", "put", "api", "--stdin", "--access", "get,exec")
+	if r := c.record("view", "api"); r["id"] != id || r["access"] != "get,exec" || r["expires_at"] != nil {
+		t.Fatalf("loosened with the value: %v", r)
+	}
 
 	if out, _ := c.ok("", "report", id, "--reason", "printed by a debug endpoint"); out != "Reported a leak of api ("+id+")\n" {
 		t.Fatalf("report: %q", out)
@@ -190,7 +199,7 @@ func TestDuplicatesReportsAndTOTP(t *testing.T) {
 	c := newTestCLI(t)
 	first := c.put("first", "same-secret")["id"].(string)
 	_, note := c.ok("same-secret", "put", "second", "--stdin", "--access", "none")
-	if !strings.Contains(note, "first has the same value") || strings.Contains(note, "same-secret") {
+	if !strings.Contains(note, "also stored as first") || strings.Contains(note, "same-secret") {
 		t.Fatalf("duplicate note: %q", note)
 	}
 	reported := c.json("", "report", first).([]any)

@@ -192,7 +192,7 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	}
 }
 
-func TestShellCode(t *testing.T) {
+func TestUnsafeArgs(t *testing.T) {
 	for _, tc := range []struct {
 		args []string
 		code string
@@ -203,9 +203,12 @@ func TestShellCode(t *testing.T) {
 		{[]string{"fish", "--command=echo"}, "--command=echo"},
 		{[]string{"env", "sh", "-c", "script"}, "-c|script"},
 		{[]string{"timeout", "5", "/bin/bash", "-lc", "script", "arg"}, "-lc|script"},
-		{[]string{"python3", "-c", "code"}, ""},
+		{[]string{"python3", "-c", "code", "arg"}, "-c|code"},
+		{[]string{"node", "-e", "code"}, "-e|code"},
+		{[]string{"tmux", "send-keys", "-t", "0", "x"}, "tmux|send-keys|-t|0|x"},
+		{[]string{"curl", "-H", "x", "sh"}, ""},
 	} {
-		if got := strings.Join(shellCode(tc.args), "|"); got != tc.code {
+		if got := strings.Join(unsafeArgs(tc.args), "|"); got != tc.code {
 			t.Fatalf("%v: got %q, want %q", tc.args, got, tc.code)
 		}
 	}

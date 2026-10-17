@@ -124,6 +124,40 @@ func TestIDsChangeWithTheValue(t *testing.T) {
 	}
 }
 
+func TestLooseningNeedsTheValue(t *testing.T) {
+	s, _ := newTestStore(t)
+	soon := time.Now().Add(time.Hour)
+	later := soon.Add(time.Hour)
+	if _, err := s.Put("api", Change{Secret: []byte("value"), ExpiresAt: ptr(&soon), AllowGet: ptr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]Change{
+		"allow get":     {AllowGet: ptr(true)},
+		"later expiry":  {ExpiresAt: ptr(&later)},
+		"never expires": {ExpiresAt: ptr[*time.Time](nil)},
+	} {
+		if _, err := s.Put("api", c); !errors.Is(err, ErrNeedsValue) {
+			t.Fatalf("%s without the value: %v", name, err)
+		}
+		c.SkipCheck = true
+		if _, err := s.Put("api", c); err != nil {
+			t.Fatalf("%s with SkipCheck: %v", name, err)
+		}
+		if _, err := s.Put("api", Change{ExpiresAt: ptr(&soon), AllowGet: ptr(false)}); err != nil {
+			t.Fatalf("narrowing again: %v", err)
+		}
+	}
+	for name, c := range map[string]Change{
+		"deny exec":        {AllowExec: ptr(false)},
+		"earlier expiry":   {ExpiresAt: ptr(&soon)},
+		"allow with value": {Secret: []byte("value"), AllowGet: ptr(true), AllowExec: ptr(true)},
+	} {
+		if _, err := s.Put("api", c); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+}
+
 func TestTypesExpiryAndTOTP(t *testing.T) {
 	s, _ := newTestStore(t)
 	past := time.Now().Add(-time.Second)

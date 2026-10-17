@@ -162,8 +162,7 @@ Notes for agents:
     Never use options whose names start with --dangerously.
   - If you see a password in plain text anyway, run "agsecret report ID" and
     tell the user.
-  - Only exact copies are hidden. Encoded copies, files and output written
-    straight to the terminal are not.`
+  - Only exact copies are hidden. Encoded copies and files are not.`
 
 func newRoot(o *options) *cobra.Command {
 	r := &cobra.Command{
@@ -180,7 +179,7 @@ func newRoot(o *options) *cobra.Command {
 	r.SetOut(o.out)
 	r.SetErr(o.errOut)
 	r.PersistentFlags().StringVar(&o.db, "db", "", "vault file (default $AGSECRET_DB or $XDG_DATA_HOME/agsecret/secrets.db)")
-	r.PersistentFlags().StringVar(&o.passFile, "pass-file", "", "file with the vault passphrase (default $AGSECRET_PASS_FILE or the vault path ending in .pass)")
+	r.PersistentFlags().StringVar(&o.passFile, "pass-file", "", "file with the vault passphrase (default $AGSECRET_PASS_FILE or the vault path with its extension changed to .pass)")
 	r.CompletionOptions.DisableDefaultCmd = true
 	r.SetHelpCommand(&cobra.Command{Use: "help [COMMAND]", Short: "Show help for a command", RunE: func(_ *cobra.Command, args []string) error {
 		target, rest, err := r.Find(args)

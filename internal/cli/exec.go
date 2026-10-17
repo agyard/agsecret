@@ -37,17 +37,21 @@ Any stored value that shows up in the command's output is replaced with
 are caught: encoded values, files, network connections and writes straight to
 the terminal are not.
 
-The command runs without a shell. If you need one, pass the ID in an
-environment variable rather than in the shell code, so the shell does not
-interpret the value:
+The command runs without a shell. A shell or interpreter would run a value
+placed in its code, so IDs in code such as sh -c or python -c are refused, as
+are IDs given to tmux or screen (use send for those). Pass the ID in an
+environment variable instead:
 
   TOKEN=ID agsecret exec -- sh -c 'curl -H "Authorization: Bearer $TOKEN" URL'
 
 Environment variables are also safer than arguments, which other users can
 see with ps.
 
-The command's output goes through a pipe, not the terminal, so programs that
-behave differently in a terminal (pagers, REPLs) may look different.
+The command's input and output go through pipes, and it runs without a
+controlling terminal, so it cannot write to the terminal past the filter.
+Programs that prompt on the terminal, such as ssh or sudo asking for a
+password, cannot prompt; use send for those. Pagers and REPLs may behave
+differently.
 
 The exit status is the command's own, or 128+N if signal N killed it. If the
 command cannot be run, agsecret exits with 126, or 127 if it is not found. For
@@ -111,26 +115,32 @@ func expandTokens(value string, records map[string]store.Record, now time.Time, 
 	return b.String(), nil
 }
 
-var shells = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish"}
+// codeRunners parse their options and first operand as code, so a secret
+// placed there would run instead of being passed as data.
+var codeRunners = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "python", "python3", "node", "perl", "ruby", "php"}
 
-// shellCode returns the arguments a known shell parses as code: its options
-// and first operand, which is the -c command string or a script path. The
-// shell may follow wrappers such as env, timeout or sudo, so every argument
-// that names a shell starts a check.
-func shellCode(args []string) []string {
-	start := slices.IndexFunc(args, func(a string) bool { return slices.Contains(shells, filepath.Base(a)) })
-	if start < 0 {
-		return nil
-	}
-	for i := start + 1; i < len(args); i++ {
-		switch arg := args[i]; {
-		case slices.Contains([]string{"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, arg):
-			i++ // The next argument is this option's value.
-		case !strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "+"):
-			return args[start+1 : i+1]
+// unsafeArgs returns the arguments in which an ID is refused: the code given
+// to a code runner, which may follow wrappers such as env, timeout or sudo,
+// and everything given to tmux or screen, which could type it into a pane
+// where send would refuse.
+func unsafeArgs(args []string) []string {
+	for i, arg := range args {
+		switch name := filepath.Base(arg); {
+		case name == "tmux" || name == "screen":
+			return args[i:]
+		case slices.Contains(codeRunners, name):
+			for j := i + 1; j < len(args); j++ {
+				switch a := args[j]; {
+				case slices.Contains([]string{"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, a):
+					j++ // The next argument is this option's value.
+				case !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+"):
+					return args[i+1 : j+1]
+				}
+			}
+			return args[i+1:]
 		}
 	}
-	return args[start+1:]
+	return nil
 }
 
 // protectedValues lists what output filtering removes: unexpired passwords of
@@ -166,10 +176,14 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 	if tokenPattern.MatchString(args[0]) {
 		return errors.New("the command name cannot contain a secret ID; pass IDs as separate arguments")
 	}
-	for _, code := range shellCode(args) {
-		if tokenPattern.MatchString(code) {
-			return errors.New(`the shell would read the secret as code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -- sh -c '... "$TOKEN" ...'`)
+	for _, arg := range unsafeArgs(args) {
+		if !tokenPattern.MatchString(arg) {
+			continue
 		}
+		if name := filepath.Base(args[0]); name == "tmux" || name == "screen" {
+			return errors.New("use agsecret send to type a secret into a terminal pane")
+		}
+		return errors.New(`the secret would be read as code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -- sh -c '... "$TOKEN" ...'`)
 	}
 	var records []store.Record
 	err := o.withStore(func(s *store.Store) error {
@@ -239,11 +253,18 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 	defer stderr.redactor.Close()
 	child := exec.Command(expanded[0], expanded[1:]...)
 	child.Env = env
-	child.Stdin = cmd.InOrStdin()
 	child.Stdout, child.Stderr = stdout, stderr
+	// Give the command a pipe, never the terminal itself, which it could
+	// write to past the filter. Wait does not wait for this copy: a read
+	// from the terminal may block until exit, which is harmless.
+	stdin, err := child.StdinPipe()
+	if err != nil {
+		return err
+	}
 	// Bound inherited pipes held open by grandchildren after the command
 	// exits. Normal output is still fully drained first.
 	child.WaitDelay = 2 * time.Second
+	detach(child)
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer func() {
@@ -263,14 +284,14 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 		}
 		return &exitError{code: 126, err: fmt.Errorf("cannot run %s: %w", args[0], err)}
 	}
-	// Relay signals so the command can shut down cleanly. A terminal already
-	// sends Ctrl-C to the whole foreground process group, including the child.
-	interactive := isTerminal(cmd.InOrStdin())
+	go func() {
+		_, _ = io.Copy(stdin, cmd.InOrStdin())
+		stdin.Close()
+	}()
+	// The command has its own session, so relay signals such as Ctrl-C to it.
 	go func() {
 		for sig := range signals {
-			if sig != os.Interrupt || !interactive {
-				_ = child.Process.Signal(sig)
-			}
+			_ = signalGroup(child.Process, sig)
 		}
 	}()
 	waitErr := child.Wait()

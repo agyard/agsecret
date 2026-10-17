@@ -77,7 +77,7 @@ The flag is for people. The help tells agents never to use options that start wi
 
 ## Configuration
 
-By default the vault is `$XDG_DATA_HOME/agsecret/secrets.db` (`~/.local/share/agsecret/secrets.db` if that is unset). `init` puts a random passphrase in a pass file beside it, with the same name ending in `.pass`. Anyone who can read the pass file can open the vault.
+By default the vault is `$XDG_DATA_HOME/agsecret/secrets.db` (`~/.local/share/agsecret/secrets.db` if that is unset). `init` puts a random passphrase in a pass file beside it, named `secrets.pass`. Anyone who can read the pass file can open the vault.
 
 | Setting | Flag | Environment variable |
 | --- | --- | --- |
@@ -86,17 +86,19 @@ By default the vault is `$XDG_DATA_HOME/agsecret/secrets.db` (`~/.local/share/ag
 
 Flags override environment variables. On Unix, the pass file must be private to you (`chmod 600`); on Windows, keep it in a private directory.
 
-`put` also sets options for each secret. You can change them later without entering the value again:
+`put` also sets options for each secret:
 
 - `--type totp` stores a TOTP seed (Base32 or an `otpauth://totp/` URI) instead of a password.
 - `--ttl 7d` makes the secret expire after seven days. `90m`, `12h` and `2w` also work; `0` means never.
 - `--access exec` lets agents use the secret only through `exec` and `send`. The other choices are `get,exec` (the default), `get` and `none`.
 
+You can narrow access or bring the expiry closer without the value. Widening access or extending the expiry needs the value (`put` asks for it in a terminal), so an agent cannot lift limits you set. If you don't have the value at hand, add `--dangerously-skip-check`.
+
 ## Security
 
 The vault is an SQLite database encrypted with Adiantum. Its key is encrypted with XChaCha20-Poly1305, under a key derived from the passphrase with Argon2id. The encryption hides your data, but it does not detect tampering or rollback.
 
-`exec` hides only exact copies of stored values. Encoded copies, files, network traffic and output written straight to the terminal are not hidden. If your agent runs commands in a pseudo-terminal, that terminal is the agent's view, so anything a program writes straight to it reaches the agent. AG-Secret is not a sandbox: any program that can read the pass file or agsecret's memory can get the secrets.
+`exec` hides only exact copies of stored values. Encoded copies, files and network traffic are not hidden. The command gets no terminal, so it cannot write past the filter, but it also cannot prompt; use `send` for password prompts. AG-Secret is not a sandbox: any program that can read the pass file or agsecret's memory can get the secrets.
 
 `send` types only into a pane that is waiting at a password prompt, so a password is not typed into a shell by mistake.
 

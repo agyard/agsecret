@@ -62,9 +62,9 @@ func readValue(in io.Reader) ([]byte, error) {
 // promptSecret reads a line without echo; callers check isTerminal(in).
 func promptSecret(in io.Reader, errOut io.Writer, label string) ([]byte, error) {
 	_, _ = fmt.Fprint(errOut, label)
-	b, err := term.ReadPassword(int(in.(*os.File).Fd()))
+	b, err := readHidden(in.(*os.File))
 	_, _ = fmt.Fprintln(errOut)
-	if err == nil && len(b) == 0 {
+	if err == io.EOF || err == nil && len(b) == 0 {
 		err = errors.New("nothing was entered")
 	}
 	if err != nil {

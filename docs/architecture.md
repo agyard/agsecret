@@ -46,9 +46,10 @@ Each process opens one connection with a 5-second busy timeout and
 read never write.
 
 - **put** reads the existing secret and applies only the changes it was given,
-  so two people changing different options at once do not undo each other. If
-  the value or type changed, it assigns a new ID and clears the leak reports in
-  the same transaction. If the same password is stored under other names,
+  so two people changing different options at once do not undo each other.
+  Without the value, it refuses changes that widen access or extend the expiry,
+  unless given `--dangerously-skip-check`. If the value or type changed, it
+  assigns a new ID and clears the leak reports in the same transaction. If the same password is stored under other names,
   including expired or disabled ones, put prints a note naming them.
 - **report** looks up the password for an ID and adds the report to every
   password with that value, in a single transaction. Expired and disabled
@@ -87,9 +88,10 @@ database tamper-proof. Protect the vault, the pass file and any backups with
 file permissions. Anyone who can read the pass file can decrypt the vault, so
 programs running as the same user are trusted.
 
-Access options are a convention for agents, as is the rule that only people
-change them and use `--dangerously` options: AG-Secret cannot tell a person
-from an agent running as the same user. Hiding TOTP seeds from the CLI's output
+Requiring the value to loosen limits means an agent cannot renew or re-enable
+a secret it is not allowed to use, since it cannot get the value through the
+CLI. `--dangerously` options bypass such checks and are meant for people only;
+AG-Secret cannot tell a person from an agent running as the same user. Hiding TOTP seeds from the CLI's output
 likewise does not protect them from code that can read the database or process
 memory. On Windows, use a private directory; the Unix permission checks do not
 audit ACLs.
@@ -100,10 +102,11 @@ exec replaces IDs in the command's arguments and environment in a single pass,
 so an ID that appears inside a secret's value is never expanded. Text that
 looks like a mistyped ID (`ags_` plus eight or more hex digits in any case that
 do not form a valid ID) is an error rather than being passed through as literal
-text. IDs are also refused in the command name, and in the options and first
-operand of a shell (the `-c` code or a script path), because the shell would
-parse the value as code. The shell can follow wrappers such as `env`, `timeout`
-or `sudo`. Other arguments and environment variables carry the value as data.
+text. IDs are also refused in the command name; in the options and first operand of
+a shell or interpreter such as `sh`, `python` or `node` (the `-c` or `-e` code,
+or a script path), because it would run the value as code; and in arguments to
+`tmux` or `screen`, which could type the value into a pane that `send` would
+refuse. The program can follow wrappers such as `env`, `timeout` or `sudo`. Other arguments and environment variables carry the value as data.
 Unknown, expired and disabled IDs fail before the command starts, with exit
 status 125. When nothing is filled in, exec says so, which catches a name used
 where an ID belongs.
@@ -120,15 +123,20 @@ canonical Base32, and every value this run injected. When several secrets share
 a value, one ID labels the match, and reporting that ID reaches all of them.
 After both streams finish, a note on standard error lists the hidden IDs; the
 note passes through the filter too. Exact matching cannot catch encoded or
-transformed copies, a value split across the two streams, files, network
-traffic or output written straight to the terminal.
+transformed copies, a value split across the two streams, files or network
+traffic.
 
-exec forwards SIGTERM and SIGHUP to the command. It forwards SIGINT only when
-standard input is not a terminal, because a terminal already sends Ctrl-C to
-the whole foreground process group. The exit status is the command's own, or
-128+N if signal N killed it. After the command exits, exec waits at most two
-seconds for grandchildren still holding its output pipes. exec is not a
-sandbox.
+The command never holds the terminal: it runs in a new session without a
+controlling terminal, and its standard input is a pipe that exec fills from its
+own. This matters when an agent runs commands in a pseudo-terminal, where
+anything written to the terminal reaches the agent; password prompts from git,
+ssh or sudo could otherwise show a URL with a filled-in token. Wait does not
+wait for the input copy, because a read from a terminal can block until the
+user types. exec relays SIGINT, SIGTERM and SIGHUP to the command's process
+group.
+The exit status is the command's own, or 128+N if signal N killed it. After the
+command exits, exec waits at most two seconds for grandchildren still holding
+its output pipes. exec is not a sandbox.
 
 ## get and send
 

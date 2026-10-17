@@ -146,7 +146,7 @@ esac
 	}
 	assertNoSend()
 	c.put("expired", "expired-password", "--ttl", "1ns")
-	if code, _, errText := c.call("", "send", "tmux:dev:0.1", "expired"); code == 0 || !strings.Contains(errText, "has expired; ask the user to renew it") {
+	if code, _, errText := c.call("", "send", "tmux:dev:0.1", "expired"); code == 0 || !strings.Contains(errText, "has expired") {
 		t.Fatalf("expiry check: code=%d err=%q", code, errText)
 	}
 	assertNoSend()
@@ -211,5 +211,38 @@ exit 42
 				}
 			}
 		})
+	}
+}
+
+// In an agent's pseudo-terminal, anything written to the terminal reaches
+// the agent unfiltered, so the command must not hold the terminal at all.
+func TestExecCommandCannotWriteToTheTerminal(t *testing.T) {
+	master, ttyPath := testPTY(t)
+	tty, err := os.OpenFile(ttyPath, os.O_RDWR|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tty.Close()
+	c := newTestCLI(t)
+	id := c.put("api", "terminal-secret")["id"].(string)
+	t.Setenv("T", id)
+	var out, errOut strings.Builder
+	script := `import os
+for open_fd in (lambda: 0, lambda: os.open("/dev/tty", os.O_WRONLY)):
+    try:
+        os.write(open_fd(), os.environ["T"].encode())
+    except OSError:
+        pass`
+	code := Execute([]string{"--db", c.db, "--pass-file", c.pass, "exec", "--", "python3", "-I", "-c", script}, tty, &out, &errOut)
+	if code != 0 {
+		t.Skipf("python3 unavailable: %d %s", code, errOut.String())
+	}
+	if err := unix.SetNonblock(master, true); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 4096)
+	n, _ := unix.Read(master, buf)
+	if strings.Contains(string(buf[:max(n, 0)]), "terminal-secret") {
+		t.Fatal("the command wrote the secret to the terminal")
 	}
 }

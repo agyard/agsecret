@@ -31,10 +31,11 @@ prompt when you run it in a terminal. Never type the value itself into a
 command line, because shell history keeps it. With --type totp, the value is
 a Base32 seed or an otpauth://totp/ URI.
 
-To change only the options of an existing secret, pass them without a value,
-for example --ttl 30d or --access exec. Options you leave out keep their
-current values. Changing the value or type gives the secret a new ID, and the
-old ID stops working.`,
+Options you leave out keep their current values. You can narrow access or
+bring the expiry closer without the value, for example with --access exec.
+Widening access or extending the expiry needs the value, so that an agent
+cannot lift limits the user set. Changing the value or type gives the secret a
+new ID, and the old ID stops working.`,
 		Example: `  # Store a token from an environment variable
   printf '%s' "$GITHUB_TOKEN" | agsecret put github --stdin
 
@@ -72,30 +73,37 @@ old ID stops working.`,
 				return err
 			}
 			// Without a value source, only options change, so prompt only
-			// when there is nothing else to do.
+			// when there is nothing else to do. A terminal always gets the
+			// hidden prompt, even with --stdin, so the value is never echoed.
 			in := cmd.InOrStdin()
 			var err error
 			switch {
+			case !fromStdin && c.Type == nil && (c.ExpiresAt != nil || c.AllowGet != nil):
+			case isTerminal(in):
+				c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "Value for "+args[0]+" (hidden): ")
 			case fromStdin:
 				c.Secret, err = readValue(in)
-			case c.Type != nil || c.ExpiresAt == nil && c.AllowGet == nil:
-				if !isTerminal(in) {
-					return fmt.Errorf("give the value with --stdin, or run put in a terminal to type it")
-				}
-				c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "Value for "+args[0]+": ")
+			default:
+				return fmt.Errorf("give the value with --stdin, or run put in a terminal to type it")
 			}
 			if err != nil {
 				return err
 			}
-			defer clear(c.Secret)
+			defer func() { clear(c.Secret) }()
 			return o.withStore(func(s *store.Store) error {
 				result, err := s.Put(args[0], c)
+				if errors.Is(err, store.ErrNeedsValue) && isTerminal(in) {
+					if c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "This loosens the limits of "+args[0]+"; enter its value: "); err != nil {
+						return err
+					}
+					result, err = s.Put(args[0], c)
+				}
 				if err != nil {
 					return err
 				}
 				r := result.Record
 				if len(result.Duplicates) > 0 {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agsecret: note: %s has the same value; a leak report on one marks both\n", strings.Join(result.Duplicates, ", "))
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agsecret: note: the same value is also stored as %s; a leak report on one marks them all\n", strings.Join(result.Duplicates, ", "))
 				}
 				if o.json {
 					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
@@ -114,8 +122,9 @@ old ID stops working.`,
 	}
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "read the value from standard input (a trailing newline is dropped)")
 	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password or totp")
-	cmd.Flags().StringVar(&ttlText, "ttl", "", "time until the secret expires, such as 12h, 7d or 2w, or 0 for never (default never)")
-	cmd.Flags().StringVar(&accessText, "access", "", "what agents may do: get,exec (the default), exec, get or none")
+	cmd.Flags().StringVar(&ttlText, "ttl", "", "time until the secret expires, such as 12h, 7d or 2w, or 0 for never")
+	cmd.Flags().StringVar(&accessText, "access", "", "what agents may do: get,exec (the default), exec (which includes send), get or none")
+	cmd.Flags().BoolVar(&c.SkipCheck, "dangerously-skip-check", false, "widen access or extend the expiry without the value (for people only, never for agents)")
 	return addJSONFlag(cmd, o)
 }
 
@@ -176,18 +185,18 @@ func access(r store.Record) string {
 }
 
 // useValue returns the value that action ("get", "exec" or "send") hands out,
-// which is the current code for a TOTP secret. Refusals name the exact fix so
-// a person can apply it, and so an agent knows to ask for it.
+// which is the current code for a TOTP secret. Refusals point people to the
+// fix without handing agents a command to lift the limit themselves.
 func useValue(r store.Record, now time.Time, action string) ([]byte, error) {
 	allowed := r.AllowExec
 	if action == "get" {
 		allowed = r.AllowGet
 	}
 	if r.Expired(now) {
-		return nil, fmt.Errorf("%s (%s) has expired; ask the user to renew it with agsecret put %s --ttl DURATION", r.Name, r.ID, r.Name)
+		return nil, fmt.Errorf("%s (%s) has expired; renewing it is up to the user (see agsecret put --help)", r.Name, r.ID)
 	}
 	if !allowed {
-		return nil, fmt.Errorf("%s is turned off for %s (%s); ask the user to allow it with agsecret put %s --access get,exec", action, r.Name, r.ID, r.Name)
+		return nil, fmt.Errorf("%s is turned off for %s (%s); turning it on is up to the user (see agsecret put --help)", action, r.Name, r.ID)
 	}
 	if r.Type == "totp" {
 		code, err := totp.Generate(string(r.Secret), now)
@@ -205,9 +214,7 @@ func newGet(o *options) *cobra.Command {
 
 get does not print passwords, because the output may end up in front of an
 agent. Programs should receive passwords through exec or send. To see a
-password yourself, add --dangerously-skip-check, for example:
-
-  agsecret get github --dangerously-skip-check | pbcopy`,
+password yourself, add --dangerously-skip-check.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {
@@ -216,14 +223,14 @@ password yourself, add --dangerously-skip-check, for example:
 					return err
 				}
 				defer clear(r.Secret)
+				if r.Type == "password" && !skipCheck {
+					return fmt.Errorf("%s is a password, and get does not print passwords; use agsecret exec or send to pass it to a program (people: see agsecret get --help)", r.Name)
+				}
 				value, err := useValue(r, time.Now(), "get")
 				if err != nil {
 					return err
 				}
 				defer clear(value)
-				if r.Type == "password" && !skipCheck {
-					return fmt.Errorf("%s is a password, and get does not print passwords; use agsecret exec or send to pass it to a program", r.Name)
-				}
 				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", value)
 				return err
 			})

@@ -38,7 +38,11 @@ const (
 	maxUnlockDescriptorBytes = 4096
 )
 
-var ErrNotFound = errors.New("not found")
+var (
+	ErrNotFound = errors.New("not found")
+	// ErrNeedsValue means a change without the value would loosen limits.
+	ErrNeedsValue = errors.New("put needs the value")
+)
 
 // Record is a stored secret. Secret holds the value only when a caller asks
 // for it.
@@ -365,14 +369,16 @@ func now() time.Time { return time.Now().UTC().Truncate(time.Second) }
 func encodeTime(t time.Time) string          { return t.UTC().Format(time.RFC3339) }
 func decodeTime(s string) (time.Time, error) { return time.Parse(time.RFC3339, s) }
 
-// Change describes an update. Nil fields keep their stored values; a new
-// secret must set them all.
+// Change describes an update. Nil fields keep their stored values. Without
+// Secret, a change may only narrow access or bring the expiry closer, unless
+// SkipCheck is set: knowing the value shows the caller could already use it.
 type Change struct {
 	Secret    []byte
 	Type      *string
 	ExpiresAt **time.Time
 	AllowGet  *bool
 	AllowExec *bool
+	SkipCheck bool
 }
 
 // PutResult describes a committed put. Record.Secret is not set.
@@ -440,6 +446,9 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		expires := r.ExpiresAt.UTC().Truncate(time.Second)
 		r.ExpiresAt = &expires
 	}
+	if c.Secret == nil && !c.SkipCheck && loosens(previous, r) {
+		return PutResult{}, fmt.Errorf("%w of %s to widen its access or extend its expiry", ErrNeedsValue, r.Name)
+	}
 	result := PutResult{Created: created}
 	r.UpdatedAt = now()
 	if created || !bytes.Equal(previous.Secret, r.Secret) || previous.Type != r.Type {
@@ -480,6 +489,13 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	r.Secret = nil
 	result.Record = r
 	return result, nil
+}
+
+// loosens reports whether after allows more than before: more access, or a
+// later expiry.
+func loosens(before, after Record) bool {
+	return after.AllowGet && !before.AllowGet || after.AllowExec && !before.AllowExec ||
+		before.ExpiresAt != nil && (after.ExpiresAt == nil || after.ExpiresAt.After(*before.ExpiresAt))
 }
 
 func queryStrings(tx *sql.Tx, query string, args ...any) ([]string, error) {
