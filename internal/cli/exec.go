@@ -125,6 +125,9 @@ var codeRunners = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "f
 // where send would refuse.
 func unsafeArgs(args []string) []string {
 	for i, arg := range args {
+		if strings.Contains(arg, "=") {
+			continue
+		}
 		switch name := filepath.Base(arg); {
 		case name == "tmux" || name == "screen":
 			return args[i:]

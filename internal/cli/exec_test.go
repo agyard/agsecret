@@ -203,6 +203,7 @@ func TestUnsafeArgs(t *testing.T) {
 		{[]string{"fish", "--command=echo"}, "--command=echo"},
 		{[]string{"env", "sh", "-c", "script"}, "-c|script"},
 		{[]string{"timeout", "5", "/bin/bash", "-lc", "script", "arg"}, "-lc|script"},
+		{[]string{"env", "SHELL=/bin/sh", "bash", "-c", "script"}, "-c|script"},
 		{[]string{"python3", "-c", "code", "arg"}, "-c|code"},
 		{[]string{"node", "-e", "code"}, "-e|code"},
 		{[]string{"tmux", "send-keys", "-t", "0", "x"}, "tmux|send-keys|-t|0|x"},
