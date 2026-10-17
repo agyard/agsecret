@@ -4,6 +4,6 @@ package cli
 
 import "errors"
 
-func targetEchoEnabled(string) (bool, error) {
-	return false, errors.New("send tmux requires a platform with supported TTY echo inspection")
+func atPasswordPrompt(string) (bool, error) {
+	return false, errors.New("send requires Linux, macOS or BSD terminal inspection")
 }

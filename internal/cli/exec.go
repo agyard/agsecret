@@ -1,110 +1,167 @@
 package cli
 
 import (
-	"context"
 	"encoding/base32"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/url"
 	"os"
 	"os/exec"
-	"reflect"
+	"os/signal"
+	"path/filepath"
 	"regexp"
-	"runtime"
-	"sort"
-	"strconv"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/agyard/agsecret/internal/redact"
 	"github.com/agyard/agsecret/internal/store"
 	"github.com/agyard/agsecret/internal/totp"
 	"github.com/spf13/cobra"
-	"golang.org/x/term"
 )
 
 func newExec(o *options) *cobra.Command {
 	c := &cobra.Command{
-		Use:   "exec -- COMMAND [ARGUMENTS...]",
-		Short: "Expand credential IDs and run a command with output redaction",
-		Long: `COMMAND is executed directly. Every ags_ followed by 16 lowercase hex
-characters in arguments and environment values is replaced with its credential.
-For TOTP records this is the current code. The executable name must stay fixed.
+		Use:   "exec -- COMMAND [ARG...]",
+		Short: "Run a command with secrets filled in by ID",
+		Long: `Run a command, replacing each secret ID in its arguments and environment
+variables with the secret's value (for a TOTP secret, its current code).
 
-The child's stdout and stderr are streamed through exact-byte redaction of all
-unexpired passwords of at least four bytes and TOTP seeds, plus every injected value.
-Matches split across reads are protected. A note is appended to stderr only
-when a replacement occurred. The command's exit status is preserved.
+Any stored value that shows up in the command's output is replaced with
+[REDACTED:ID], and a note on standard error lists the IDs. Only exact copies
+are caught: encoded values, files, network connections and writes straight to
+the terminal are not.
 
-Use a program-specific environment interface when available: secrets in argv
-can be visible to process inspectors. Output written directly to a terminal,
-file, or network connection bypasses this wrapper.`,
-		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
-				return usage("exec requires COMMAND after --")
-			}
-			return nil
-		},
+The command runs without a shell. If you need one, pass the ID in an
+environment variable rather than in the shell code, so the shell does not
+interpret the value:
+
+  TOKEN=ID agsecret exec -- sh -c 'curl -H "Authorization: Bearer $TOKEN" URL'
+
+Environment variables are also safer than arguments, which other users can
+see with ps.
+
+The exit status is the command's own (128+N if signal N killed it). If
+agsecret itself fails, it exits with 125, or with 126 or 127 when the command
+cannot be run or is not found.`,
+		Annotations: noJSON,
+		Args:        cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if o.json {
-				return usage("exec preserves the command's stdout/stderr and cannot use --json")
+			err := runExpanded(o, cmd, args)
+			if _, ok := errors.AsType[*exitError](err); err != nil && !ok {
+				err = &exitError{code: 125, err: err}
 			}
-			return runExpandedCommand(cmd.Context(), o, cmd, args)
+			return err
 		},
 	}
 	c.Flags().SetInterspersed(false)
 	return c
 }
 
-var tokenPattern = regexp.MustCompile(`ags_[0-9a-f]{16}`)
+// tokenPattern also matches near-miss IDs so that a mistyped ID fails loudly
+// instead of reaching the command as literal text.
+var tokenPattern = regexp.MustCompile(`\bags_[0-9A-Fa-f]{8,}`)
 
 // expandTokens performs a single pass so a secret that happens to contain a
 // different record ID is never interpreted recursively.
-func expandTokens(value string, records map[string]store.Record, now time.Time, injectedValues map[string][]byte) (string, error) {
-	indices := tokenPattern.FindAllStringIndex(value, -1)
-	if len(indices) == 0 {
-		return value, nil
+func expandTokens(value string, records map[string]store.Record, now time.Time, injected map[string][]byte) (string, error) {
+	if !strings.Contains(value, "ags_") {
+		return value, nil // Skips the regexp for most environment values.
 	}
 	var b strings.Builder
-	b.Grow(len(value))
 	last := 0
-	for _, idx := range indices {
+	for _, idx := range tokenPattern.FindAllStringIndex(value, -1) {
 		id := value[idx[0]:idx[1]]
+		if err := store.CheckID(id); err != nil {
+			return "", err
+		}
 		r, found := records[id]
 		if !found {
-			return "", fmt.Errorf("credential %s: %w", id, store.ErrNotFound)
+			return "", fmt.Errorf("secret %s %w", id, store.ErrNotFound)
 		}
-		if r.Expired(now) {
-			return "", fmt.Errorf("credential %s: %w", id, store.ErrExpired)
-		}
-		if !r.AllowExec {
-			return "", fmt.Errorf("exec is disabled for credential %s", id)
-		}
-		secret, resolved := injectedValues[id]
+		secret, resolved := injected[id]
 		if !resolved {
 			var err error
-			secret, err = credentialValue(r, now)
-			if err != nil {
+			if secret, err = useValue(r, now, "exec"); err != nil {
 				return "", err
 			}
-			injectedValues[id] = secret
+			injected[id] = secret
 		}
 		b.WriteString(value[last:idx[0]])
 		b.Write(secret)
 		last = idx[1]
 	}
+	if last == 0 {
+		return value, nil
+	}
 	b.WriteString(value[last:])
 	return b.String(), nil
 }
 
-func runExpandedCommand(ctx context.Context, o *options, cmd *cobra.Command, args []string) (resultErr error) {
+// shellCode returns the arguments a known shell parses as code: its options
+// and first operand, which is the -c command string or a script path.
+func shellCode(args []string) []string {
+	switch strings.TrimPrefix(filepath.Base(args[0]), "-") {
+	case "sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish":
+	default:
+		return nil
+	}
+	for i := 1; i < len(args); i++ {
+		switch arg := args[i]; {
+		case slices.Contains([]string{"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, arg):
+			i++ // The next argument is this option's value.
+		case !strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "+"):
+			return args[1 : i+1]
+		}
+	}
+	return args[1:]
+}
+
+// protectedValues lists what output filtering removes: unexpired passwords of
+// at least four bytes and every encoding of TOTP seeds. Injected values are
+// added by the caller.
+func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, error) {
+	var protected []redact.Secret
+	for _, r := range records {
+		if r.Expired(now) || (r.Type == "pass" && len(r.Secret) < 4) {
+			continue
+		}
+		protected = append(protected, redact.Secret{ID: r.ID, Value: r.Secret})
+		if r.Type != "totp" {
+			continue
+		}
+		config, err := totp.Parse(string(r.Secret))
+		if err != nil {
+			return nil, err
+		}
+		canonical := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(config.Key)
+		padded := base32.StdEncoding.EncodeToString(config.Key)
+		config.Clear()
+		for _, v := range []string{canonical, padded, strings.ToLower(canonical), strings.ToLower(padded)} {
+			protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(v)})
+		}
+		if uri, err := url.Parse(string(r.Secret)); err == nil && strings.EqualFold(uri.Scheme, "otpauth") {
+			protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(uri.Query().Get("secret"))})
+		}
+	}
+	return protected, nil
+}
+
+func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 	if tokenPattern.MatchString(args[0]) {
-		return errors.New("credential tokens are not allowed in COMMAND; keep the executable name fixed")
+		return errors.New("the command name cannot contain a secret ID; pass IDs as separate arguments")
+	}
+	for _, code := range shellCode(args) {
+		if tokenPattern.MatchString(code) {
+			return errors.New(`the shell would read the secret as code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -- sh -c '... "$TOKEN" ...'`)
+		}
 	}
 	var records []store.Record
-	err := o.withStore(false, func(s *store.Store) error {
+	err := o.withStore(func(s *store.Store) error {
 		var err error
 		records, err = s.ListWithSecrets()
 		return err
@@ -117,66 +174,29 @@ func runExpandedCommand(ctx context.Context, o *options, cmd *cobra.Command, arg
 			clear(r.Secret)
 		}
 	}()
-	byID := make(map[string]store.Record, len(records))
-	var protected []redact.Secret
+	now := nowUTC()
+	protected, err := protectedValues(records, now)
 	defer func() {
 		for _, secret := range protected {
 			clear(secret.Value)
 		}
 	}()
-	// Wrapper diagnostics can contain credentials too (for example in an
-	// executable path). Include report's prefix in the protected output, then
-	// return only the exit code so Execute does not print the error a second time.
-	defer func() {
-		if resultErr == nil {
-			return
-		}
-		// Child exit statuses and cancellation are already represented by
-		// their dedicated process codes; printing a wrapper diagnostic would
-		// add noise and change the command's observable behavior.
-		var childExit *exitError
-		if errors.As(resultErr, &childExit) || errors.Is(resultErr, context.Canceled) || errors.Is(resultErr, context.DeadlineExceeded) {
-			return
-		}
-		diagnostic := newFilteredOutput(cmd.ErrOrStderr(), &sync.Mutex{}, protected)
-		defer diagnostic.redactor.Close()
-		code := report(resultErr, diagnostic)
-		_ = diagnostic.flush()
-		resultErr = &exitError{code: code}
-	}()
-	now := nowUTC()
+	if err != nil {
+		return err
+	}
+	byID := make(map[string]store.Record, len(records))
 	for _, r := range records {
 		byID[r.ID] = r
-		if !r.Expired(now) && (r.Type == "totp" || len(r.Secret) >= 4) {
-			protected = append(protected, redact.Secret{ID: r.ID, Value: r.Secret})
-			if r.Type == "totp" {
-				config, err := totp.Parse(string(r.Secret))
-				if err != nil {
-					return err
-				}
-				canonical := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(config.Key)
-				padded := base32.StdEncoding.EncodeToString(config.Key)
-				config.Clear()
-				protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(canonical)})
-				protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(padded)})
-				protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(strings.ToLower(canonical))})
-				protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(strings.ToLower(padded))})
-				if uri, err := url.Parse(string(r.Secret)); err == nil && strings.EqualFold(uri.Scheme, "otpauth") {
-					protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(uri.Query().Get("secret"))})
-				}
-			}
-		}
 	}
-	injectedValues := make(map[string][]byte)
+	injected := make(map[string][]byte)
 	defer func() {
-		for _, value := range injectedValues {
+		for _, value := range injected {
 			clear(value)
 		}
 	}()
 	expanded := make([]string, len(args))
 	for i, arg := range args {
-		expanded[i], err = expandTokens(arg, byID, now, injectedValues)
-		if err != nil {
+		if expanded[i], err = expandTokens(arg, byID, now, injected); err != nil {
 			return err
 		}
 	}
@@ -186,13 +206,12 @@ func runExpandedCommand(ctx context.Context, o *options, cmd *cobra.Command, arg
 		if !found {
 			continue
 		}
-		value, err = expandTokens(value, byID, now, injectedValues)
-		if err != nil {
+		if value, err = expandTokens(value, byID, now, injected); err != nil {
 			return err
 		}
 		env[i] = key + "=" + value
 	}
-	for id, value := range injectedValues {
+	for id, value := range injected {
 		protected = append(protected, redact.Secret{ID: id, Value: value})
 	}
 
@@ -204,67 +223,75 @@ func runExpandedCommand(ctx context.Context, o *options, cmd *cobra.Command, arg
 	stderr := newFilteredOutput(cmd.ErrOrStderr(), &outputMu, protected)
 	defer stdout.redactor.Close()
 	defer stderr.redactor.Close()
-	child := exec.CommandContext(ctx, expanded[0], expanded[1:]...)
+	child := exec.Command(expanded[0], expanded[1:]...)
 	child.Env = env
 	child.Stdin = cmd.InOrStdin()
 	child.Stdout, child.Stderr = stdout, stderr
 	// Bound inherited pipes held open by grandchildren after the command
-	// exits or is canceled. Normal output is still fully drained first.
+	// exits. Normal output is still fully drained first.
 	child.WaitDelay = 2 * time.Second
-	if err = child.Start(); err != nil {
-		return fmt.Errorf("cannot start command: %w", err)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	defer func() {
+		signal.Stop(signals) // No sends after Stop returns, so closing is safe.
+		close(signals)
+	}()
+	if err := child.Start(); err != nil {
+		code := 126
+		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
+			code = 127
+		}
+		return &exitError{code: code, err: fmt.Errorf("cannot run %s: %w", args[0], err)}
 	}
-	waitErr := child.Wait()
-	stdoutErr, stderrErr := stdout.flush(), stderr.flush()
-	markers := append(stdout.redactor.Replacements(), stderr.redactor.Replacements()...)
-	if len(markers) > 0 {
-		sort.Strings(markers)
-		unique := markers[:0]
-		for _, marker := range markers {
-			if len(unique) == 0 || marker != unique[len(unique)-1] {
-				unique = append(unique, marker)
+	// Relay signals so the command can shut down cleanly. A terminal already
+	// sends Ctrl-C to the whole foreground process group, including the child.
+	interactive := isTerminal(cmd.InOrStdin())
+	go func() {
+		for sig := range signals {
+			if sig != os.Interrupt || !interactive {
+				_ = child.Process.Signal(sig)
 			}
 		}
+	}()
+	waitErr := child.Wait()
+	stdoutErr, stderrErr := stdout.flush(), stderr.flush()
+	if ids := slices.Concat(stdout.redactor.Used(), stderr.redactor.Used()); len(ids) > 0 {
+		slices.Sort(ids)
 		prefix := ""
-		if stderr.wrote && stderr.last != '\n' {
+		if stderr.last != '\n' {
 			prefix = "\n"
 		}
-		description := strings.Join(unique, ", ")
-		if description == "" {
-			description = "matching bytes removed"
-		}
-		note := fmt.Sprintf("%sagsecret: redacted secret output (%s); see \"agsecret help --agent\" for details.\n", prefix, description)
-		err = stderr.emit(stderr.redactor.Feed([]byte(note), true))
-		if stderrErr == nil {
-			stderrErr = err
-		}
+		note := fmt.Sprintf("%sagsecret: hid the values of %s in the output above; nothing leaked\n", prefix, strings.Join(slices.Compact(ids), ", "))
+		stderrErr = errors.Join(stderrErr, stderr.emit(stderr.redactor.Feed([]byte(note), true)))
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	var processErr *exec.ExitError
-	if errors.As(waitErr, &processErr) {
-		return &exitError{code: processExitCode(processErr)}
+	if state := child.ProcessState; state != nil && !state.Success() {
+		return &exitError{code: exitCode(state)}
 	}
 	if waitErr != nil {
-		return &exitError{code: 125}
+		return waitErr
 	}
 	if stdoutErr != nil || stderrErr != nil {
-		return errors.New("cannot write protected command output")
+		return errors.New("cannot write the command's output")
 	}
 	return nil
+}
+
+func exitCode(state *os.ProcessState) int {
+	if ws, ok := state.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
+	}
+	return max(state.ExitCode(), 1)
 }
 
 type filteredOutput struct {
 	out      io.Writer
 	mu       *sync.Mutex
 	redactor *redact.Redactor
-	wrote    bool
-	last     byte
+	last     byte // last byte written, so a note can start on a new line
 }
 
 func newFilteredOutput(out io.Writer, mu *sync.Mutex, secrets []redact.Secret) *filteredOutput {
-	return &filteredOutput{out: out, mu: mu, redactor: redact.NewWithSecrets(secrets...)}
+	return &filteredOutput{out: out, mu: mu, redactor: redact.New(secrets...), last: '\n'}
 }
 
 func (w *filteredOutput) emit(value []byte) error {
@@ -276,7 +303,7 @@ func (w *filteredOutput) emit(value []byte) error {
 	defer w.mu.Unlock()
 	n, err := w.out.Write(value)
 	if n > 0 {
-		w.wrote, w.last = true, value[n-1]
+		w.last = value[n-1]
 	}
 	if err == nil && n != len(value) {
 		err = io.ErrShortWrite
@@ -291,162 +318,4 @@ func (w *filteredOutput) Write(chunk []byte) (int, error) {
 
 func (w *filteredOutput) flush() error {
 	return w.emit(w.redactor.Feed(nil, true))
-}
-
-func processExitCode(err *exec.ExitError) int {
-	code := err.ProcessState.ExitCode()
-	if code >= 0 {
-		return code
-	}
-	v := reflect.ValueOf(err.ProcessState.Sys())
-	if v.IsValid() {
-		m := v.MethodByName("Signal")
-		if m.IsValid() && m.Type().NumIn() == 0 && m.Type().NumOut() == 1 {
-			out := m.Call(nil)
-			if len(out) == 1 && out[0].Kind() >= reflect.Int && out[0].Kind() <= reflect.Int64 {
-				return 128 + int(out[0].Int())
-			}
-		}
-	}
-	return 1
-}
-
-const capturedOutputRefusal = `refused to print secret directly to captured stdout. Use exec or send; run "agsecret help --agent" for safe usage.`
-
-func trustedTerminal(out, _ io.Writer) error {
-	if runtime.GOOS == "linux" {
-		pid, err := shellCommandAncestor(os.Getppid(), os.ReadFile)
-		if err != nil {
-			return usage(capturedOutputRefusal)
-		}
-		if pid != 0 {
-			if isIndirectOutput(out, pid) {
-				return nil
-			}
-			return usage(capturedOutputRefusal)
-		}
-	}
-	if isTerminalWriter(out) {
-		return nil
-	}
-	return usage(capturedOutputRefusal)
-}
-
-func isTerminalWriter(w io.Writer) bool {
-	f, ok := w.(*os.File)
-	return ok && term.IsTerminal(int(f.Fd()))
-}
-
-func isIndirectOutput(out io.Writer, shellPID int) bool {
-	f, ok := out.(*os.File)
-	if !ok {
-		return false
-	}
-	current, err := f.Stat()
-	// A regular-file redirect cannot be distinguished from a shell child whose
-	// parent kept its original stdout: the shell's fd 1/2 then differ even though
-	// the child is a top-level redirect. Accept pipes only; this fails closed for
-	// ambiguous files while keeping command substitution and pipelines useful.
-	if err != nil || current.Mode()&os.ModeNamedPipe == 0 {
-		return false
-	}
-	for _, fd := range []int{1, 2} {
-		ancestor, err := os.Stat(fmt.Sprintf("/proc/%d/fd/%d", shellPID, fd))
-		if err != nil || os.SameFile(current, ancestor) {
-			return false
-		}
-	}
-	return true
-}
-
-func suspiciousShellParent() bool {
-	pid, err := shellCommandAncestor(os.Getppid(), os.ReadFile)
-	return err != nil || pid != 0
-}
-
-// proc stat's comm field may contain spaces and parentheses. The final ')'
-// closes it; the following fields begin at state, then PPID.
-func parseParentPID(stat string) (int, error) {
-	end := strings.LastIndexByte(stat, ')')
-	if end < 0 {
-		return 0, errors.New("invalid process stat")
-	}
-	fields := strings.Fields(stat[end+1:])
-	if len(fields) < 2 {
-		return 0, errors.New("invalid process stat")
-	}
-	pid, err := strconv.Atoi(fields[1])
-	if err != nil || pid < 0 {
-		return 0, errors.New("invalid process parent PID")
-	}
-	return pid, nil
-}
-
-func shellCommandAncestor(pid int, readFile func(string) ([]byte, error)) (int, error) {
-	seen := make(map[int]bool)
-	for pid > 0 {
-		if seen[pid] || len(seen) >= 4096 {
-			return 0, errors.New("cyclic process ancestry")
-		}
-		seen[pid] = true
-		cmdline, err := readFile(fmt.Sprintf("/proc/%d/cmdline", pid))
-		if err != nil {
-			return 0, err
-		}
-		if isShellCommand(strings.Split(string(cmdline), "\x00")) {
-			return pid, nil
-		}
-		if pid == 1 {
-			return 0, nil
-		}
-		stat, err := readFile(fmt.Sprintf("/proc/%d/stat", pid))
-		if err != nil {
-			return 0, err
-		}
-		pid, err = parseParentPID(string(stat))
-		if err != nil {
-			return 0, err
-		}
-	}
-	return 0, nil
-}
-
-func isShellCommand(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	name := strings.TrimPrefix(strings.ToLower(filepathBase(args[0])), "-")
-	if name == "busybox" && len(args) > 1 {
-		args = args[1:]
-		name = strings.ToLower(filepathBase(args[0]))
-	}
-	switch name {
-	case "sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish":
-	default:
-		return false
-	}
-	for i := 1; i < len(args); i++ {
-		arg := args[i]
-		if arg == "--command" || strings.HasPrefix(arg, "--command=") {
-			return true
-		}
-		if arg == "-o" || arg == "+o" || arg == "-O" || arg == "+O" || arg == "--rcfile" || arg == "--init-file" {
-			i++ // Shell options that consume a separate option name or file.
-			continue
-		}
-		if arg == "--" || !strings.HasPrefix(arg, "-") || arg == "-" {
-			return false
-		}
-		if !strings.HasPrefix(arg, "--") && strings.ContainsRune(arg[1:], 'c') {
-			return true
-		}
-	}
-	return false
-}
-
-func filepathBase(s string) string {
-	if i := strings.LastIndexAny(s, "/\\"); i >= 0 {
-		return s[i+1:]
-	}
-	return s
 }

@@ -65,8 +65,16 @@ while not (root / 'prompt-stop').exists():
         wait_file(root / 'prompt-ready')
         bad = json.loads(run('put', 'multiline', '--secret-stdin', '--json', data='first\nsecond').stdout)
         result = run('send', 'tmux:selfcheck:0.0', bad['id'], '--force-echo', check=False, child_env=tmux_env)
-        assert result.returncode != 0 and 'terminal control characters' in result.stderr
+        assert result.returncode != 0 and 'contains control characters' in result.stderr
         assert not (root / 'prompt-result').exists()
+        bash = shutil.which('bash')
+        if bash:
+            # Line editors turn ECHO off but echo keys themselves; a shell is not a prompt.
+            subprocess.run([tmux, '-S', socket, 'new-window', '-d', '-t', 'selfcheck:1', bash, '--norc', '--noprofile', '-i'],
+                           env=tmux_env, capture_output=True, check=True, timeout=5)
+            time.sleep(0.5)
+            result = run('send', 'tmux:selfcheck:1', credential_id, check=False, child_env=tmux_env)
+            assert result.returncode == 1 and 'not waiting at a password prompt' in result.stderr
         result = run('send', 'tmux:selfcheck:0.0', credential_id, child_env=tmux_env)
         assert result.stdout == result.stderr == ''
         wait_file(root / 'prompt-result')
@@ -74,7 +82,7 @@ while not (root / 'prompt-stop').exists():
         capture = subprocess.run([tmux, '-S', socket, 'capture-pane', '-p', '-t', 'selfcheck:0.0'],
                                  capture_output=True, text=True, check=True, timeout=5).stdout
         assert PASSWORD not in capture
-        print('PASS: isolated real tmux password prompt; control characters rejected; no echoed password')
+        print('PASS: real tmux password prompt; shell pane and control characters refused; no echoed password')
     finally:
         (root / 'prompt-stop').touch()
         subprocess.run([tmux, '-S', socket, 'kill-server'], capture_output=True, timeout=5)
@@ -98,7 +106,7 @@ def main():
         second = json.loads(duplicate.stdout)
         assert first['id'] in duplicate.stderr and PASSWORD not in duplicate.stderr
         code = json.loads(run('put', 'otp', '--type', 'totp', '--secret-stdin', '--json', data=SEED).stdout)
-        view = run('view', code['id'], '--dangerously-show-secret', '--json', '--quiet')
+        view = run('view', code['id'], '--json')
         assert 'secret' not in json.loads(view.stdout) and SEED not in view.stdout+view.stderr
         assert run('report', code['id'], check=False).returncode != 0
 
@@ -123,7 +131,7 @@ def main():
             assert normal.stdout == 'authenticated\n' and normal.stderr == ''
             debug = run('exec', '--', sys.executable, '-c', client, url+'/debug', first['id'])
             assert PASSWORD not in debug.stdout+debug.stderr
-            assert '[REDACTED:' in debug.stdout and debug.stderr.count('redacted secret output') == 1
+            assert '[REDACTED:' in debug.stdout and debug.stderr.count('nothing leaked') == 1
             print('PASS: local HTTP authentication and response redaction')
         finally:
             server.shutdown()
@@ -162,7 +170,7 @@ def main():
         new = json.loads(run('put', first['id'], '--secret-stdin', '--json', data='synthetic-replacement').stdout)
         assert new['id'] != first['id'] and new['leaks'] == []
         assert run('report', first['id'], check=False).returncode != 0
-        assert len(json.loads(run('view', second['id'], '--json', '--quiet').stdout)['leaks']) == 1
+        assert len(json.loads(run('view', second['id'], '--json').stdout)['leaks']) == 1
         print('PASS: report fanout, unchanged permissions, ID rotation and stale-report rejection')
 
 

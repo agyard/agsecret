@@ -8,9 +8,9 @@ import (
 
 func TestReportFansOutWithoutPolicyChangeAndPutRefreshesID(t *testing.T) {
 	c := newTestCLI(t)
-	a := c.record("put", "api", "shared-password")
+	a := c.put("api", "shared-password")
 	id := a["id"].(string)
-	output, warning := c.ok("", "put", "backup", "shared-password", "--json", "--allow-exec=false")
+	output, warning := c.ok("shared-password", "put", "backup", "--secret-stdin", "--json", "--allow-exec=false")
 	var b map[string]any
 	if err := json.Unmarshal([]byte(output), &b); err != nil {
 		t.Fatal(err)
@@ -18,14 +18,7 @@ func TestReportFansOutWithoutPolicyChangeAndPutRefreshesID(t *testing.T) {
 	if !strings.Contains(warning, id) || strings.Contains(warning, "shared-password") {
 		t.Fatal("duplicate warning must contain ID but no secret", warning)
 	}
-	c.ok("", "put", "otp", "shared-password", "--type", "pass") // all pass duplicates are intentional
-	if code, _, _ := c.call("", "report", id, "--revoke"); code == 0 {
-		t.Fatal("removed revoke flag still accepted")
-	}
-	before := c.record("view", id)
-	if len(before["leaks"].([]any)) != 0 {
-		t.Fatal("invalid flag wrote a report")
-	}
+	c.put("otp", "shared-password", "--type", "pass") // all pass duplicates are intentional
 	output, _ = c.ok("", "report", id, "--reason", "unexpected output", "--json")
 	var reported []map[string]any
 	if err := json.Unmarshal([]byte(output), &reported); err != nil || len(reported) != 3 {
@@ -39,11 +32,11 @@ func TestReportFansOutWithoutPolicyChangeAndPutRefreshesID(t *testing.T) {
 			t.Fatal("report changed disabled permission")
 		}
 	}
-	same := c.record("put", id, "shared-password", "--mask", "fixed:configured")
+	same := c.put(id, "shared-password", "--mask", "fixed:configured")
 	if same["id"] != id || len(same["leaks"].([]any)) != 1 {
 		t.Fatal("same-value put lost history or ID")
 	}
-	rotated := c.record("put", id, "replacement-password")
+	rotated := c.put(id, "replacement-password")
 	if rotated["id"] == id || len(rotated["leaks"].([]any)) != 0 {
 		t.Fatal("rotation result stale")
 	}
@@ -68,7 +61,7 @@ func TestReportFansOutWithoutPolicyChangeAndPutRefreshesID(t *testing.T) {
 func TestTOTPReportsRejectedAndNoStoredSeedDisclosed(t *testing.T) {
 	c := newTestCLI(t)
 	const seed = "JBSWY3DPEHPK3PXP"
-	r := c.record("put", "login", seed, "--type", "totp")
+	r := c.put("login", seed, "--type", "totp")
 	for _, ref := range []string{"login", r["id"].(string)} {
 		if code, out, _ := c.call("", "report", ref, "--json"); code == 0 || out != "" {
 			t.Fatal("TOTP report accepted")

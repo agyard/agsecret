@@ -4,128 +4,121 @@
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
-A local credential vault for AI agent workflows. Store passwords and TOTP seeds in encrypted SQLite, then let agents use credential IDs instead of handling raw secrets. `agsecret exec` resolves those IDs when starting a command and redacts matching values from its output.
+AG-Secret keeps passwords and TOTP secrets in an encrypted local vault and lets AI agents use them without seeing them. An agent refers to a secret by its ID. `agsecret exec` fills in the real value when it starts a command and hides that value if it shows up in the command's output.
 
 ## Installation
 
-Requires **Go 1.26+**. No C compiler or native SQLite installation is needed.
+Download an archive for Linux, macOS or Windows from [GitHub releases](https://github.com/agyard/agsecret/releases), or build it with Go 1.26 or later (no C compiler needed):
 
 ```sh
 CGO_ENABLED=0 go install github.com/agyard/agsecret/cmd/agsecret@latest
 ```
 
-Add your Go binary directory to `PATH` if needed. Builds are verified for Linux, macOS, and Windows; indirect `get` detection requires Linux, and `send` requires tmux and supported Unix TTY inspection.
+`agsecret send` also needs tmux, on Linux, macOS or BSD.
 
 ## Quick start
 
-Initialize the vault and store a password from an existing environment variable:
+Create a vault and store a token:
 
 ```sh
 agsecret init
-printf '%s' "$API_TOKEN" | agsecret put api --secret-stdin --json
+agsecret put api              # type the token at a hidden prompt
 ```
 
-By default, `init` creates an encrypted database and a random pass file (`0600` on Unix). `put --json` returns the credential's `id`. Replace the example ID below with that value:
+`put` prints the secret's ID; `agsecret list` shows it again later. Use the ID wherever the command needs the token:
 
 ```sh
-agsecret view ags_0123456789abcdef --json
-agsecret exec -- curl \
-  -H 'Authorization: Bearer ags_0123456789abcdef' \
-  https://api.example.test/resource
+agsecret exec -- curl -H 'Authorization: Bearer ags_0123456789abcdef' https://api.example.com/
 ```
 
-The child process receives the password. Matching output is replaced with `[REDACTED:<id>]`; a note appears on stderr only when redaction occurs. Prefer arguments or environment values over embedding IDs in shell source.
+curl receives the real token. If the token appears in the output, it is replaced with `[REDACTED:ags_0123456789abcdef]`.
 
-## Agent usage
+In scripts, pipe the value in instead of typing it:
 
 ```sh
-agsecret help --agent     # Concise credential usage guide
-agsecret list --json      # Discover current credential IDs
-agsecret help exec        # Full help for a command
-agsecret exec --help      # Equivalent command help
+printf '%s' "$API_TOKEN" | agsecret put api --secret-stdin
 ```
 
-- Use current IDs (`ags_` followed by 16 lowercase hex characters) for credential references, especially incident reports.
-- Prefer `exec` for commands and `send tmux:<PANE> ID` for password prompts. `get` can return a current TOTP code or a password through an allowed output path.
-- Keep JSON stdout separate from stderr. `--quiet` suppresses the periodic usage tip.
-- Report unexpected password exposure with `agsecret report ID --reason 'unexpected plaintext output'`. A redaction marker alone does not mean plaintext escaped.
+## Using it with an agent
 
-Changing a credential's secret or type with `put` assigns a new ID and clears its leak history. Resubmitting the same secret and type preserves both. An old ID stops resolving: never retry a delayed incident report by name, which could attribute it to the replacement secret.
+Tell your agent to run `agsecret --help`. The top of that page is written for agents: how to use IDs, a few examples, and what to do when something is refused or leaks. Each command's `--help` has the details.
 
-Reports are appended to every password record with the same exact value, including expired or disabled records. They never change permissions; people decide access policy. `report --json` always returns an array. TOTP credentials are not reportable, and the CLI never prints their stored seeds.
+In short:
+
+- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints TOTP codes, but prints passwords only to a terminal.
+- If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
+- When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret list --json` rather than remember them.
+- `--json` puts JSON on standard output. Warnings and notes go to standard error.
+- Exit codes: `0` success, `1` error, `2` usage error. `exec` returns the command's own exit code, or `125`, `126` or `127` if agsecret fails or the command cannot be run.
 
 ## Commands
 
-Run `agsecret help` for the command list, or `agsecret COMMAND --help` for options.
-
-| Command | Purpose |
+| Command | Description |
 | --- | --- |
-| `init` | Create the encrypted vault and default pass file. |
-| `put NAME\|ID` | Store or rotate a credential from an argument, stdin, or file. |
-| `list` / `ls` | List credential metadata and current IDs. |
-| `view NAME\|ID` | Show metadata, masked value, and leak history. |
-| `get NAME\|ID` | Return a password through an allowed output path, or a current TOTP code. |
-| `exec -- COMMAND [ARGS...]` | Expand IDs in arguments and environment values; redact stdout and stderr. |
-| `send tmux:<PANE> NAME\|ID` | Type a credential into a tmux password prompt. |
-| `report ID\|NAME` | Append a password leak report; supports context and attachment references. |
-| `delete` / `rm NAME\|ID` | Delete a credential. |
-| `doctor` | Check vault access and list credentials with reported leaks. |
-| `version` | Print the version. |
+| `init` | Create the vault, or check that an existing vault opens |
+| `put NAME\|ID` | Add or update a secret |
+| `list` | List secrets and their IDs |
+| `view NAME\|ID` | Show details about a secret, but not its value |
+| `get NAME\|ID` | Print a TOTP code, or a password in a terminal |
+| `exec -- COMMAND [ARG...]` | Run a command with secrets filled in by ID |
+| `send tmux:PANE NAME\|ID` | Type a secret into a tmux password prompt |
+| `report ID` | Report that a password was exposed |
+| `delete NAME\|ID` | Delete a secret |
+| `doctor` | Check the vault and list leaked secrets |
+| `version` | Print the version |
 
 ## Configuration
 
-The default directory is `$XDG_DATA_HOME/agsecret` or `~/.local/share/agsecret`.
+By default the vault is `~/.local/share/agsecret/secrets.db` (or under `$XDG_DATA_HOME`), and the random passphrase that unlocks it is in `session.pass` in the same directory. Anyone who can read that file can open the vault.
 
-| Setting | Flag | Environment variable | Default |
-| --- | --- | --- | --- |
-| Database path | `--db` | `AGSECRET_DB` | `secrets.db` in the default directory |
-| Passphrase file | `--pass-file` | `AGSECRET_PASS_FILE` | `session.pass` in the default directory |
+| Setting | Flag | Environment variable |
+| --- | --- | --- |
+| Vault | `--db` | `AGSECRET_DB` |
+| Pass file | `--pass-file` | `AGSECRET_PASS_FILE` |
 
-Explicit flags take precedence over environment variables. An external pass file must already exist; on Unix, pass files and secret input files must be regular, owner-only files (`0600` or stricter). On Windows, use a private directory with appropriate ACLs. Protect the pass file as carefully as the credentials it unlocks.
+Flags override environment variables. On Unix, pass files and files given to `put --secret-file` must be readable only by you; on Windows, keep them in a private directory.
 
-Credential options are set with `put`:
+`put` also sets options for each secret:
 
-- **Type:** `pass` (default) or `totp`. TOTP accepts Base32 seeds or `otpauth://totp/...` URIs; defaults are SHA-1, 6 digits, and a 30-second period.
-- **Lifetime:** `--ttl 1h30m`, `--ttl 7d`, or `--ttl 1w`. `0` means no expiry and is the default. Day/week values cannot be mixed with Go duration units.
-- **Mask:** `fixed:[set]` by default. Passwords also support `prefix:N`, `suffix:N`, `both:N,M`, `length`, and `hash`. TOTP values always display as `[set]`.
-- **Access:** `--allow-get` and `--allow-exec` default to `true`; `allow-exec` also controls `send`. Updates preserve options that were not explicitly supplied.
+- `--type totp` stores a TOTP seed (Base32 or an `otpauth://totp/` URI) instead of a password.
+- `--ttl 7d` makes the secret expire (`90m`, `12h`, `2w` and so on; `0` means never).
+- `--mask` controls how `view` displays a password, such as `suffix:4`.
+- `--allow-get=false` and `--allow-exec=false` stop `get`, or `exec` and `send`, from using the secret.
 
-Use `--secret-stdin` or `--secret-file` to avoid putting secrets in command arguments. `put` removes one final LF, CRLF, or CR from stdin/file input; `report --secret-stdin` matches exact bytes. Both reject inputs larger than 1 MiB.
+When you update a secret, options you leave out keep their current values.
 
-## Security boundaries
+## Security
 
-AG-Secret uses the pure-Go Adiantum VFS with SQLite, Argon2id for key derivation, and XChaCha20-Poly1305 to wrap the database key. Database and WAL data are encrypted at rest. Storage encryption does not provide database tamper or rollback protection.
+The vault is SQLite encrypted with the Adiantum VFS. Its database key is protected by your passphrase through Argon2id and XChaCha20-Poly1305. The encryption hides your data, but it does not detect tampering or rollback.
 
-`exec` uses exact-byte matching for unexpired passwords of at least four bytes, TOTP seeds, and every injected value. Encoded or transformed output, cross-stream splits, files, sockets, and direct terminal writes can bypass it. Secrets in arguments may be visible to process inspectors. Processes that can read the pass file or process memory remain trusted; this tool is not a sandbox.
+`exec` only hides exact copies of stored values. Encoded or transformed output, files, network traffic and direct terminal writes get through. AG-Secret is not a sandbox: anything that can read the pass file or the memory of agsecret can get the secrets.
 
-Password `get` refuses captured stdout and regular-file redirects by default. Linux permits detected indirect pipes and command substitutions, but their consumers can still expose the value. `send` checks that terminal ECHO is disabled before injection; the receiving process remains trusted. Disclosure and echo overrides are documented in command help.
+`send` only types into a pane that is waiting at a password prompt, so a password is never typed into a shell by mistake.
 
-See [Architecture and concurrency](docs/architecture.md) for the storage design, locking, migrations, and detailed security boundaries.
+[docs/architecture.md](docs/architecture.md) covers the storage format, locking and design decisions.
 
 ## Development
 
-Requires Go 1.26+ and Make. Standard checks need no C compiler, service manager, Python, or real tmux server.
+You need Go 1.26 or later and Make. The standard checks do not need a C compiler, Python or tmux.
 
 ```sh
-make build        # Build bin/agsecret with CGO disabled
-make test         # Run unit and subprocess tests
-make check        # Run go vet
-make integration  # Optional end-to-end checks on Linux with Python 3
+make build        # build bin/agsecret
+make test         # run unit and subprocess tests
+make check        # check formatting and run go vet
+make integration  # end-to-end tests with Python 3 (and tmux, if installed)
 ```
 
-Checks limit Go concurrency and memory, with a 2 GiB per-process virtual-memory cap on Linux and a 2-minute Go test timeout. Integration tests use synthetic credentials, a temporary vault, a loopback HTTP server, and a private tmux socket; tmux checks are skipped when it is unavailable.
+The checks run with memory, CPU and time limits (see `scripts/bounded-check.sh`). Issues and pull requests are welcome at [agyard/agsecret](https://github.com/agyard/agsecret). Please use made-up secrets in bug reports and run `make test check` before sending code.
 
-Issues and pull requests are welcome at [agyard/agsecret](https://github.com/agyard/agsecret). Include a minimal reproduction using synthetic credentials and run `make test` and `make check` before submitting code changes.
-
-CI runs on pushes to `main` and pull requests. After CI passes on the commit to release, push an annotated version tag:
+To publish a release, wait until CI passes on `main`, then push an annotated tag:
 
 ```sh
-git tag -a vX.Y.Z -m 'Release vX.Y.Z'
-git push origin vX.Y.Z
+git tag -a v1.2.3 -m 'Release v1.2.3'
+git push origin v1.2.3
 ```
 
-The release workflow builds Linux, macOS, and Windows archives for amd64 and arm64, with SHA-256 checksums and generated release notes. Prerelease tags such as `v1.0.0-rc.1` do not become `latest`. Never reuse a published tag.
+The release workflow builds archives for Linux, macOS and Windows on amd64 and arm64, with SHA-256 checksums. Tags such as `v1.3.0-rc.1` are published as prereleases. Never reuse a tag.
 
 ## License
 
-[Apache License 2.0](LICENSE). The license text is sourced from the [Apache Software Foundation](https://www.apache.org/licenses/LICENSE-2.0.txt).
+[Apache License 2.0](LICENSE). The license text is from the [Apache Software Foundation](https://www.apache.org/licenses/LICENSE-2.0.txt).

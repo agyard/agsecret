@@ -37,7 +37,7 @@ func Parse(seed string) (Config, error) {
 	if strings.Contains(seed, "://") {
 		u, err := url.Parse(seed)
 		if err != nil || !strings.EqualFold(u.Scheme, "otpauth") || !strings.EqualFold(u.Host, "totp") || u.User != nil || u.Fragment != "" {
-			return Config{}, errors.New("TOTP must use a valid otpauth://totp URI")
+			return Config{}, errors.New("invalid TOTP URI; expected otpauth://totp/LABEL?secret=SEED")
 		}
 		q, err := url.ParseQuery(u.RawQuery)
 		if err != nil || len(q["secret"]) != 1 {
@@ -78,7 +78,7 @@ func Parse(seed string) (Config, error) {
 	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(seed)
 	if err != nil || len(key) == 0 {
 		clear(key)
-		return Config{}, errors.New("TOTP secret must be a nonempty valid Base32 seed")
+		return Config{}, errors.New("the TOTP seed must be non-empty Base32 text")
 	}
 	c.Key = key
 	return c, nil

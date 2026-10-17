@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -41,7 +40,7 @@ func TestEncryptedStoreRoundTripAndWrongPassphrase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = s.Put(Record{Name: "api", Type: "pass", Mask: "fixed:[set]", Secret: []byte("super-secret"), AllowGet: true, AllowExec: true}); err != nil {
+	if _, err = s.Put(Record{Name: "api", Type: "pass", Mask: "fixed:[set]", Secret: []byte("super-secret"), AllowGet: true, AllowExec: true}, nil); err != nil {
 		t.Fatal(err)
 	}
 	r, err := s.GetByNameOrID("api", false)
@@ -118,7 +117,7 @@ func TestIDsAndLookup(t *testing.T) {
 	s := newTestStore(t)
 	ids := map[string]bool{}
 	for _, name := range []string{"api", "mail", "database"} {
-		if err := s.Put(Record{Name: name, Secret: []byte("test-value")}); err != nil {
+		if _, err := s.Put(Record{Name: name, Secret: []byte("test-value")}, nil); err != nil {
 			t.Fatal(err)
 		}
 		r, err := s.GetByNameOrID(name, false)
@@ -130,21 +129,21 @@ func TestIDsAndLookup(t *testing.T) {
 		if err != nil || byID.Name != name {
 			t.Fatal("ID lookup failed")
 		}
-		if err := s.PutWithOptions(Record{Name: r.ID, Secret: []byte("rotated-value")}, nil); err != nil {
+		if _, err := s.Put(Record{Name: r.ID, Secret: []byte("rotated-value")}, nil); err != nil {
 			t.Fatal(err)
 		}
 		rotated, err := s.GetByNameOrID(name, false)
-		if err != nil || rotated.ID == r.ID || rotated.CreatedAt.Equal(r.CreatedAt) {
+		if err != nil || rotated.ID == r.ID {
 			t.Fatal("secret rotation did not replace identity")
 		}
 		if _, err := s.GetByNameOrID(r.ID, false); !errors.Is(err, ErrNotFound) {
 			t.Fatal("old ID still resolves after secret rotation")
 		}
 	}
-	if err := s.Put(Record{Name: "ags_ffffffffffffffff", Secret: []byte("bad")}); !errors.Is(err, ErrNotFound) {
+	if _, err := s.Put(Record{Name: "ags_ffffffffffffffff", Secret: []byte("bad")}, nil); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("new ID used as a name: %v", err)
 	}
-	if err := s.Put(Record{Name: "ags_reserved", Secret: []byte("bad")}); err == nil {
+	if _, err := s.Put(Record{Name: "ags_reserved", Secret: []byte("bad")}, nil); err == nil {
 		t.Fatal("reserved name allowed")
 	}
 	for _, bad := range []string{"ags_123", "ags_0123456789abcdeF", "agsecret://v1/api", "{{agsecret:api}}"} {
@@ -167,21 +166,21 @@ func TestIDsAndLookup(t *testing.T) {
 func TestStoreExpiryAndTOTPValidation(t *testing.T) {
 	s := newTestStore(t)
 	expires := time.Now().UTC().Add(-time.Second)
-	if err := s.Put(Record{Name: "old", Type: "totp", Secret: []byte("JBSWY3DPEHPK3PXP"), ExpiresAt: &expires}); err != nil {
+	if _, err := s.Put(Record{Name: "old", Type: "totp", Secret: []byte("JBSWY3DPEHPK3PXP"), ExpiresAt: &expires}, nil); err != nil {
 		t.Fatal(err)
 	}
-	r, err := s.Get("old", false)
+	r, err := s.GetByNameOrID("old", false)
 	if err != nil || !r.Expired(time.Now().UTC()) {
 		t.Fatalf("expiry not preserved: %v", err)
 	}
 	if _, err := s.ReportLeak("old", Leak{}); err == nil {
 		t.Fatal("TOTP leak report was accepted")
 	}
-	if _, err := s.ReportSecret([]byte("JBSWY3DPEHPK3PXP"), Leak{}); !errors.Is(err, ErrNotFound) {
+	if _, err := s.ReportSecret([]byte("JBSWY3DPEHPK3PXP"), Leak{}); err == nil {
 		t.Fatalf("TOTP seed matched report: %v", err)
 	}
 	for _, r := range []Record{{Name: "invalid", Type: "totp", Secret: []byte("not-a-valid-seed!")}, {Name: "legacy", Type: "otp", Secret: []byte("123456")}} {
-		if err := s.Put(r); err == nil {
+		if _, err := s.Put(r, nil); err == nil {
 			t.Fatal("invalid credential accepted")
 		}
 	}
@@ -190,10 +189,10 @@ func TestStoreExpiryAndTOTPValidation(t *testing.T) {
 func TestLeakHistoryAndAtomicRotationOptions(t *testing.T) {
 	s := newTestStore(t)
 	expires := time.Now().UTC().Add(time.Hour)
-	if err := s.Put(Record{Name: "api", Type: "pass", Secret: []byte("original"), Mask: "fixed:configured", ExpiresAt: &expires, AllowGet: true, AllowExec: true}); err != nil {
+	if _, err := s.Put(Record{Name: "api", Type: "pass", Secret: []byte("original"), Mask: "fixed:configured", ExpiresAt: &expires, AllowGet: true, AllowExec: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	r, err := s.Get("api", false)
+	r, err := s.GetByNameOrID("api", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,29 +209,29 @@ func TestLeakHistoryAndAtomicRotationOptions(t *testing.T) {
 	if r.Leaks[0].Context != first.Context || len(r.Leaks[0].Attachments) != 2 || r.Leaks[1].Reason != "reported by agent" {
 		t.Fatal("leak metadata changed")
 	}
-	if err := s.PutWithOptions(Record{Name: r.ID, Secret: []byte("original"), AllowGet: false}, map[string]bool{"allow-get": true}); err != nil {
+	if _, err := s.Put(Record{Name: r.ID, Secret: []byte("original"), AllowGet: false}, map[string]bool{"allow-get": true}); err != nil {
 		t.Fatal(err)
 	}
-	policyOnly, err := s.Get("api", false)
+	policyOnly, err := s.GetByNameOrID("api", false)
 	if err != nil || policyOnly.ID != r.ID || len(policyOnly.Leaks) != 2 {
 		t.Fatal("policy-only put unexpectedly changed ID or cleared leaks")
 	}
 	r = policyOnly
 	oldID := r.ID
-	if err := s.PutWithOptions(Record{Name: r.ID, Secret: []byte("rotated"), AllowGet: true, AllowExec: true}, map[string]bool{}); err != nil {
+	if _, err := s.Put(Record{Name: r.ID, Secret: []byte("rotated"), AllowGet: true, AllowExec: true}, map[string]bool{}); err != nil {
 		t.Fatal(err)
 	}
-	rotated, err := s.Get("api", false)
+	rotated, err := s.GetByNameOrID("api", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rotated.Leaks) != 0 || rotated.ID == oldID || rotated.AllowGet || !rotated.AllowExec || rotated.Mask != "fixed:configured" || rotated.ExpiresAt == nil || !rotated.ExpiresAt.Equal(expires) {
+	if len(rotated.Leaks) != 0 || rotated.ID == oldID || rotated.AllowGet || !rotated.AllowExec || rotated.Mask != "fixed:configured" || rotated.ExpiresAt == nil || !rotated.ExpiresAt.Equal(expires.Truncate(time.Second)) {
 		t.Fatal("rotation failed to clear history, replace ID, or preserve omitted options")
 	}
-	if err := s.PutWithOptions(Record{Name: rotated.ID, Secret: []byte("rotated-again"), AllowGet: true}, map[string]bool{"allow-get": true, "ttl": true}); err != nil {
+	if _, err := s.Put(Record{Name: rotated.ID, Secret: []byte("rotated-again"), AllowGet: true}, map[string]bool{"allow-get": true, "ttl": true}); err != nil {
 		t.Fatal(err)
 	}
-	r, err = s.Get("api", false)
+	r, err = s.GetByNameOrID("api", false)
 	if err != nil || !r.AllowGet || !r.AllowExec || r.ExpiresAt != nil {
 		t.Fatal("explicit policy override not applied")
 	}
@@ -241,7 +240,7 @@ func TestLeakHistoryAndAtomicRotationOptions(t *testing.T) {
 func TestReportSecretMatchesAllExactValues(t *testing.T) {
 	s := newTestStore(t)
 	for _, name := range []string{"one", "two"} {
-		if err := s.Put(Record{Name: name, Secret: []byte("shared-secret")}); err != nil {
+		if _, err := s.Put(Record{Name: name, Secret: []byte("shared-secret")}, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -254,76 +253,8 @@ func TestReportSecretMatchesAllExactValues(t *testing.T) {
 			t.Fatal("invalid report result")
 		}
 	}
-	if _, err := s.ReportSecret([]byte("shared"), Leak{}); !errors.Is(err, ErrNotFound) {
+	if _, err := s.ReportSecret([]byte("shared"), Leak{}); err == nil {
 		t.Fatal("partial secret matched")
-	}
-}
-
-func TestConcurrentReportsAndLecture(t *testing.T) {
-	s := newTestStore(t)
-	if err := s.Put(Record{Name: "api", Secret: []byte("secret-value"), AllowGet: true, AllowExec: true}); err != nil {
-		t.Fatal(err)
-	}
-	second, err := Open(s.Path, []byte("test passphrase"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer second.Close()
-	stores := []*Store{s, second}
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	for _, current := range stores {
-		wg.Add(1)
-		go func(current *Store) {
-			defer wg.Done()
-			for range 5 {
-				if _, err := current.ReportLeak("api", Leak{Reason: "concurrent"}); err != nil {
-					errs <- err
-					return
-				}
-			}
-		}(current)
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
-	}
-	r, err := s.Get("api", false)
-	if err != nil || len(r.Leaks) != 10 {
-		t.Fatalf("concurrent reports were lost, count %d, err %v", len(r.Leaks), err)
-	}
-	now := time.Now().UTC()
-	claims := make(chan bool, 2)
-	errs = make(chan error, 2)
-	for _, current := range stores {
-		wg.Add(1)
-		go func(current *Store) {
-			defer wg.Done()
-			due, err := current.ClaimLecture(now, 12*time.Hour)
-			claims <- due
-			if err != nil {
-				errs <- err
-			}
-		}(current)
-	}
-	wg.Wait()
-	close(claims)
-	close(errs)
-	for err := range errs {
-		t.Fatal(err)
-	}
-	count := 0
-	for claimed := range claims {
-		if claimed {
-			count++
-		}
-	}
-	if count != 1 {
-		t.Fatalf("lecture claimed %d times", count)
-	}
-	if due, err := s.ClaimLecture(now.Add(12*time.Hour), 12*time.Hour); err != nil || !due {
-		t.Fatalf("lecture did not expire: %v", err)
 	}
 }
 
@@ -375,7 +306,7 @@ func TestCreatePreservesExistingParentPermissions(t *testing.T) {
 			t.Fatalf("store file permissions: %v", err)
 		}
 	}
-	if _, err := Create(s.Path, []byte("pass")); err == nil || !strings.Contains(err.Error(), "already exists") {
+	if _, err := Create(s.Path, []byte("pass")); !errors.Is(err, os.ErrExist) {
 		t.Fatal("existing database accepted")
 	}
 	if _, err := s.List(); err != nil {
@@ -403,7 +334,7 @@ func TestUnlockDescriptorReadLimit(t *testing.T) {
 
 // These helpers are real OS processes using independent SQLite/WASM runtimes.
 // Each is started with a deadline and is always waited, including failure paths.
-func runStoreHelpers(t *testing.T, path string, modes ...string) []string {
+func runStoreHelpers(t *testing.T, path string, modes ...string) {
 	t.Helper()
 	if len(modes) > 4 {
 		t.Fatal("at most four subprocesses are allowed")
@@ -450,16 +381,13 @@ func runStoreHelpers(t *testing.T, path string, modes ...string) []string {
 	if err := os.WriteFile(release, []byte("go"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	outputs := make([]string, 0, len(helpers))
 	for _, h := range helpers {
 		err := <-h.done
 		h.done = nil
 		if err != nil {
 			t.Fatalf("store subprocess failed: %v\n%s", err, h.output.String())
 		}
-		outputs = append(outputs, h.output.String())
 	}
-	return outputs
 }
 
 func waitForTestFile(ctx context.Context, path string) error {
@@ -490,7 +418,7 @@ func TestStoreSubprocess(t *testing.T) {
 	}
 	defer s.Close()
 	// Both put helpers deliberately read the same old policy before the barrier.
-	// PutWithOptions must retain the other writer's subsequent policy update.
+	// Put must retain the other writer's subsequent policy update.
 	r, err := s.GetByNameOrID("api", false)
 	if err != nil {
 		t.Fatal(err)
@@ -510,21 +438,14 @@ func TestStoreSubprocess(t *testing.T) {
 				t.Fatal(err)
 			}
 		}
-		due, err := s.ClaimLecture(time.Date(2026, 10, 16, 0, 0, 0, 0, time.UTC), 12*time.Hour)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if due {
-			fmt.Fprintln(os.Stdout, "lecture-claimed")
-		}
 	case "put-get":
 		r.Name, r.Secret, r.AllowGet = "api", []byte("rotated-get"), false
-		if err := s.PutWithOptions(r, map[string]bool{"allow-get": true}); err != nil {
+		if _, err := s.Put(r, map[string]bool{"allow-get": true}); err != nil {
 			t.Fatal(err)
 		}
 	case "put-exec":
 		r.Name, r.Secret, r.AllowExec = "api", []byte("rotated-exec"), false
-		if err := s.PutWithOptions(r, map[string]bool{"allow-exec": true}); err != nil {
+		if _, err := s.Put(r, map[string]bool{"allow-exec": true}); err != nil {
 			t.Fatal(err)
 		}
 	default:
@@ -532,28 +453,21 @@ func TestStoreSubprocess(t *testing.T) {
 	}
 }
 
-func TestCrossProcessReportsAndLecture(t *testing.T) {
+func TestCrossProcessReports(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.Put(Record{Name: "api", Secret: []byte("secret-value"), AllowGet: true, AllowExec: true}); err != nil {
+	if _, err := s.Put(Record{Name: "api", Secret: []byte("secret-value"), AllowGet: true, AllowExec: true}, nil); err != nil {
 		t.Fatal(err)
 	}
-	outputs := runStoreHelpers(t, s.Path, "report", "report")
+	runStoreHelpers(t, s.Path, "report", "report")
 	r, err := s.GetByNameOrID("api", false)
 	if err != nil || len(r.Leaks) != 12 {
 		t.Fatalf("cross-process reports lost: count %d, err %v", len(r.Leaks), err)
-	}
-	claims := 0
-	for _, output := range outputs {
-		claims += strings.Count(output, "lecture-claimed\n")
-	}
-	if claims != 1 {
-		t.Fatalf("lecture claimed by %d processes, want one", claims)
 	}
 }
 
 func TestConcurrentPutPreservesDifferentPolicyUpdates(t *testing.T) {
 	s := newTestStore(t)
-	if err := s.Put(Record{Name: "api", Secret: []byte("original"), AllowGet: true, AllowExec: true}); err != nil {
+	if _, err := s.Put(Record{Name: "api", Secret: []byte("original"), AllowGet: true, AllowExec: true}, nil); err != nil {
 		t.Fatal(err)
 	}
 	before, err := s.GetByNameOrID("api", false)

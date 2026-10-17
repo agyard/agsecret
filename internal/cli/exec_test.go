@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,8 +19,8 @@ import (
 
 func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 	c := newTestCLI(t)
-	id := c.record("put", "used", "used-secret")["id"].(string)
-	otherID := c.record("put", "unused", "other-secret")["id"].(string)
+	id := c.put("used", "used-secret")["id"].(string)
+	otherID := c.put("unused", "other-secret")["id"].(string)
 	t.Setenv("AGSECRET_EXEC_HELPER", "1")
 	t.Setenv("AGSECRET_EXEC_VALUE", id)
 	executable, err := os.Executable()
@@ -35,29 +35,28 @@ func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 	if code != 0 || out != "[REDACTED:"+id+"]|[REDACTED:"+id+"]\n" {
 		t.Fatalf("environment expansion: code=%d out=%q err=%q", code, out, errOut)
 	}
-	if !strings.HasPrefix(errOut, "[REDACTED:"+otherID+"]\nagsecret: redacted secret output (") || strings.Count(errOut, "redacted secret output") != 1 {
-		t.Fatalf("unused stored credential or footer not protected: %q", errOut)
-	}
-	if !strings.Contains(errOut, "[REDACTED:"+id+"]") || !strings.Contains(errOut, "[REDACTED:"+otherID+"]") {
-		t.Fatalf("actual markers missing from footer: %q", errOut)
+	ids := []string{id, otherID}
+	slices.Sort(ids)
+	if errOut != "[REDACTED:"+otherID+"]\nagsecret: hid the values of "+ids[0]+", "+ids[1]+" in the output above; nothing leaked\n" {
+		t.Fatalf("unused stored credential or note not protected: %q", errOut)
 	}
 	code, out, errOut = call("silent")
 	if code != 0 || out != "safe output\n" || errOut != "" {
 		t.Fatalf("no-hit output should have no footer: code=%d out=%q err=%q", code, out, errOut)
 	}
 	code, out, errOut = call("large")
-	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "see \"agsecret help --agent\" for details.\n") {
+	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "nothing leaked\n") {
 		t.Fatalf("trailing output lost: code=%d output bytes=%d stderr=%q", code, len(out), errOut)
 	}
 	code, out, errOut = call("exit")
-	if code != 7 || !strings.Contains(out, "[REDACTED:"+id+"]") || !strings.Contains(errOut, "redacted secret output") {
+	if code != 7 || !strings.Contains(out, "[REDACTED:"+id+"]") || !strings.Contains(errOut, "hid the values of "+id) {
 		t.Fatalf("exit status or footer: code=%d out=%q err=%q", code, out, errOut)
 	}
-	shortID := c.record("put", "short", "xy")["id"].(string)
-	seedID := c.record("put", "seed", "otpauth://totp/demo?secret=gezdgnbvgy3tqojqgezdgnbvgy3tqojq", "--type", "totp")["id"].(string)
+	shortID := c.put("short", "xy")["id"].(string)
+	seedID := c.put("seed", "otpauth://totp/demo?secret=gezdgnbvgy3tqojqgezdgnbvgy3tqojq", "--type", "totp")["id"].(string)
 	code, out, errOut = c.call("", append(append([]string(nil), args...), "seed", shortID)...)
 	want := "[REDACTED:" + shortID + "]|[REDACTED:" + seedID + "]|[REDACTED:" + seedID + "]"
-	if code != 0 || out != want || !strings.Contains(errOut, "redacted secret output") {
+	if code != 0 || out != want || !strings.Contains(errOut, "hid the values of") || !strings.Contains(errOut, shortID) {
 		t.Fatalf("short injected pass or URI seed leaked: code=%d out=%q err=%q", code, out, errOut)
 	}
 }
@@ -117,7 +116,7 @@ func (p *promptOutput) Write(b []byte) (int, error) {
 
 func TestExecPromptCanBeAnsweredBeforeChildExits(t *testing.T) {
 	c := newTestCLI(t)
-	id := c.record("put", "api", "synthetic-password-long-enough")["id"].(string)
+	id := c.put("api", "synthetic-password-long-enough")["id"].(string)
 	t.Setenv("AGSECRET_EXEC_HELPER", "1")
 	executable, err := os.Executable()
 	if err != nil {
@@ -132,7 +131,7 @@ func TestExecPromptCanBeAnsweredBeforeChildExits(t *testing.T) {
 	var stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Execute(ctx, []string{"--db", c.db, "--pass-file", c.pass, "exec", "--", executable, "-test.run=^TestExecHelperProcess$", "--", "prompt", id}, in, out, &stderr)
+		done <- Execute([]string{"--db", c.db, "--pass-file", c.pass, "exec", "--", executable, "-test.run=^TestExecHelperProcess$", "--", "prompt", id}, in, out, &stderr)
 	}()
 	select {
 	case <-out.seen:
@@ -159,7 +158,7 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	if err != nil || got != "prefix=literal ags_fedcba9876543210:suffix" {
 		t.Fatalf("single-pass expansion: %q %v", got, err)
 	}
-	for _, old := range []string{"agsecret://v1/name", "{{agsecret:name}}"} {
+	for _, old := range []string{"agsecret://v1/name", "{{agsecret:name}}", "flags_deadbeefcafe", "ags_project", "x" + id} {
 		got, err := expandTokens(old, records, now, make(map[string][]byte))
 		if err != nil || got != old {
 			t.Fatalf("removed syntax was interpreted: %q %v", got, err)
@@ -167,6 +166,11 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	}
 	if _, err := expandTokens("ags_fedcba9876543210", records, now, make(map[string][]byte)); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("missing ID: %v", err)
+	}
+	for _, typo := range []string{"ags_0123456789abcde", "ags_0123456789ABCDEF", id + "0"} {
+		if _, err := expandTokens("Bearer "+typo, records, now, make(map[string][]byte)); err == nil || !strings.Contains(err.Error(), "not a valid ID") {
+			t.Fatalf("near-miss ID %q: %v", typo, err)
+		}
 	}
 	r := records[id]
 	r.AllowExec = false
@@ -176,7 +180,7 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	}
 	r.AllowExec, r.ExpiresAt = true, &now
 	records[id] = r
-	if _, err := expandTokens(id, records, now, make(map[string][]byte)); !errors.Is(err, store.ErrExpired) {
+	if _, err := expandTokens(id, records, now, make(map[string][]byte)); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expired ID: %v", err)
 	}
 	r.Type, r.ExpiresAt, r.Secret = "totp", nil, []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
@@ -188,69 +192,19 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	}
 }
 
-func TestProcessStatAndNearestCommandShell(t *testing.T) {
-	for _, stat := range []string{"82 (worker name) S 23 0 0", "82 (odd) comm (name)) S 23 0 0"} {
-		pid, err := parseParentPID(stat)
-		if err != nil || pid != 23 {
-			t.Fatalf("stat %q: %d %v", stat, pid, err)
-		}
-	}
-	for _, stat := range []string{"82 no closing parenthesis", "82 (comm) S", "82 (comm) S bad"} {
-		if _, err := parseParentPID(stat); err == nil {
-			t.Fatalf("accepted malformed stat %q", stat)
-		}
-	}
-	files := map[string]string{
-		"/proc/82/cmdline": "/usr/bin/wrapper\x00",
-		"/proc/82/stat":    "82 (odd) wrapper (name)) S 23 0 0",
-		"/proc/23/cmdline": "/bin/bash\x00-o\x00pipefail\x00-lc\x00run task\x00",
-	}
-	pid, err := shellCommandAncestor(82, func(path string) ([]byte, error) {
-		data, found := files[path]
-		if !found {
-			return nil, os.ErrNotExist
-		}
-		return []byte(data), nil
-	})
-	if err != nil || pid != 23 {
-		t.Fatalf("nearest shell: %d %v", pid, err)
-	}
-}
-
-func TestShellCommandFlags(t *testing.T) {
-	for _, args := range [][]string{
-		{"sh", "-c", "echo hello"}, {"/bin/bash", "-lc", "true"},
-		{"bash", "--noprofile", "-c", "true"}, {"busybox", "sh", "-c", "true"},
-		{"fish", "--command=echo hello"}, {"zsh", "-o", "errexit", "-c", "true"},
+func TestShellCode(t *testing.T) {
+	for _, tc := range []struct {
+		args []string
+		code string
+	}{
+		{[]string{"sh", "-c", "curl $1", "sh", "ags_x"}, "-c|curl $1"},
+		{[]string{"/bin/bash", "-o", "pipefail", "-ec", "script"}, "-o|pipefail|-ec|script"},
+		{[]string{"zsh", "script.sh", "ags_x"}, "script.sh"},
+		{[]string{"fish", "--command=echo"}, "--command=echo"},
+		{[]string{"env", "sh", "-c", "script"}, ""},
 	} {
-		if !isShellCommand(args) {
-			t.Fatalf("missed command shell: %q", args)
+		if got := strings.Join(shellCode(tc.args), "|"); got != tc.code {
+			t.Fatalf("%v: got %q, want %q", tc.args, got, tc.code)
 		}
-	}
-	for _, args := range [][]string{{"-bash"}, {"bash", "-i"}, {"python", "-c", "print(1)"}, {"bash", "script.sh", "-c"}} {
-		if isShellCommand(args) {
-			t.Fatalf("incorrect command shell: %q", args)
-		}
-	}
-}
-
-func TestIndirectOutputIdentity(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("requires /proc descriptor identities")
-	}
-	if isIndirectOutput(os.Stdout, os.Getpid()) {
-		t.Fatal("accepted captured command-group stdout")
-	}
-	pipe, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pipe.Close()
-	defer writer.Close()
-	if !isIndirectOutput(writer, os.Getpid()) {
-		t.Fatal("rejected a separate inner pipe")
-	}
-	if isIndirectOutput(&bytes.Buffer{}, os.Getpid()) {
-		t.Fatal("accepted a writer with no descriptor identity")
 	}
 }

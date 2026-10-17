@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/agyard/agsecret/internal/store"
@@ -9,40 +10,34 @@ import (
 
 func newReport(o *options) *cobra.Command {
 	var secretStdin bool
-	var reason, context string
-	var attachments []string
+	var leak store.Leak
 	c := &cobra.Command{
-		Use: "report [ID|NAME]", Short: "Record an accidental plaintext leak",
-		Long: `Append a leak event to a credential's history. Prefer the current ags_ ID;
-the human-readable NAME is also accepted. --secret-stdin matches an exact
-stored passphrase. TOTP credentials do not support leak reports; the CLI exposes
-their generated codes and never offers a seed-reveal operation.
-Attachments are stored as path references. Reporting does not change access
-policy; a human decides policy separately. All pass records with the same exact
-value receive the report, including expired or disabled records. --json always
-returns an array of affected records. Changing the secret with put clears history
-and assigns a new ID; an old ID cannot report a replacement secret.`,
+		Use:   "report ID",
+		Short: "Report that a password was exposed",
+		Long: `Record that a password was exposed in plain text, for example printed by a
+debug endpoint or written to a log. The report is added to every password with
+the same value.
+
+Reporting does not change what agents may do with the secret; the user decides
+whether to replace it. With --secret-stdin, report finds the passwords by the
+leaked value instead of by ID. TOTP secrets cannot be reported.`,
+		Example: "  agsecret report ID --reason 'printed by a debug endpoint' --attachment run.log",
 		Args: func(cmd *cobra.Command, args []string) error {
-			if secretStdin && len(args) != 0 {
-				return usage("use either NAME|ID or --secret-stdin")
+			if secretStdin && len(args) == 0 || !secretStdin && len(args) == 1 && store.ValidID(args[0]) {
+				return nil
 			}
-			if !secretStdin && len(args) != 1 {
-				return usage("report requires ID|NAME or --secret-stdin")
-			}
-			return nil
+			return errors.New("report needs a secret ID (see agsecret list) or --secret-stdin")
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var secret []byte
 			if secretStdin {
 				var err error
-				secret, err = readExactSecretInput(cmd.InOrStdin())
-				if err != nil {
+				if secret, err = readSecretInput(cmd.InOrStdin(), false); err != nil {
 					return err
 				}
 				defer clear(secret)
 			}
-			return o.withStore(false, func(s *store.Store) error {
-				leak := store.Leak{ReportedAt: nowUTC(), Reason: reason, Context: context, Attachments: append([]string{}, attachments...)}
+			return o.withStore(func(s *store.Store) error {
 				var records []store.Record
 				var err error
 				if secretStdin {
@@ -50,18 +45,17 @@ and assigns a new ID; an old ID cannot report a replacement secret.`,
 				} else {
 					records, err = s.ReportLeak(args[0], leak)
 				}
+				if errors.Is(err, store.ErrNotFound) {
+					return fmt.Errorf("%w (a replaced or deleted secret needs no report)", err)
+				}
 				if err != nil {
 					return err
 				}
 				if o.json {
-					out := make([]map[string]any, 0, len(records))
-					for _, r := range records {
-						out = append(out, recordJSON(r))
-					}
-					return encodeJSON(cmd.OutOrStdout(), out)
+					return encodeJSON(cmd.OutOrStdout(), recordsJSON(records))
 				}
 				for _, r := range records {
-					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "reported leak for %s (%s) (total leaks: %d)\n", r.Name, r.ID, len(r.Leaks)); err != nil {
+					if _, err := fmt.Fprintf(cmd.OutOrStdout(), "Reported a leak of %s (%s); it now has %d leak report(s)\n", r.Name, r.ID, len(r.Leaks)); err != nil {
 						return err
 					}
 				}
@@ -69,9 +63,9 @@ and assigns a new ID; an old ID cannot report a replacement secret.`,
 			})
 		},
 	}
-	c.Flags().BoolVar(&secretStdin, "secret-stdin", false, "match a stored passphrase from stdin")
-	c.Flags().StringVar(&reason, "reason", "reported by agent", "reason for reporting the leak")
-	c.Flags().StringVar(&context, "context", "", "additional context or log excerpt")
-	c.Flags().StringArrayVar(&attachments, "attachment", nil, "attachment path reference (repeatable)")
+	c.Flags().BoolVar(&secretStdin, "secret-stdin", false, "find the passwords by the leaked value on standard input")
+	c.Flags().StringVar(&leak.Reason, "reason", "reported by agent", "how the password was exposed")
+	c.Flags().StringVar(&leak.Context, "context", "", "more detail, such as a log excerpt")
+	c.Flags().StringArrayVar(&leak.Attachments, "attachment", nil, "path to a related file, recorded but not copied (repeatable)")
 	return c
 }

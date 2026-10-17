@@ -1,7 +1,7 @@
 package cli
 
 import (
-	"context"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,84 +19,74 @@ import (
 var Version = "dev"
 
 type options struct {
-	db       string
-	passFile string
-	json     bool
-	quiet    bool
-	in       io.Reader
-	out      io.Writer
-	errOut   io.Writer
+	db          string
+	passFile    string
+	defaultPass bool // passFile is the default path, not chosen by the user
+	json        bool
+	started     bool // a command began running; earlier errors are usage errors
+	in          io.Reader
+	out         io.Writer
+	errOut      io.Writer
 }
 
-type usageError struct{ message string }
-
-func (e *usageError) Error() string { return e.message }
-
-type exitError struct{ code int }
-
-func (e *exitError) Error() string { return "command exited" }
-
-func dataHome() string {
-	if v := os.Getenv("XDG_DATA_HOME"); filepath.IsAbs(v) {
-		return v
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return "."
-	}
-	return filepath.Join(home, ".local", "share")
+// exitError sets the process exit code. A nil err prints nothing.
+type exitError struct {
+	code int
+	err  error
 }
 
-func defaultDBPath() string {
-	if v := os.Getenv("AGSECRET_DB"); v != "" {
-		return v
+func (e *exitError) Error() string { return fmt.Sprint(e.err) }
+
+// noJSON marks commands whose output is the value or a child's output.
+var noJSON = map[string]string{"json": "none"}
+
+func dataDir() string {
+	base := os.Getenv("XDG_DATA_HOME")
+	if !filepath.IsAbs(base) {
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			home = "."
+		}
+		base = filepath.Join(home, ".local", "share")
 	}
-	return filepath.Join(dataHome(), "agsecret", "secrets.db")
+	return filepath.Join(base, "agsecret")
 }
 
-func defaultPassFile() string {
-	if v := os.Getenv("AGSECRET_PASS_FILE"); v != "" {
-		return v
-	}
-	path := filepath.Join(dataHome(), "agsecret", "session.pass")
-	if _, err := os.Stat(path); err == nil {
-		return path
-	}
-	return ""
+// resolve applies flags, then environment variables, then XDG defaults.
+func (o *options) resolve() error {
+	envPass := os.Getenv("AGSECRET_PASS_FILE")
+	o.defaultPass = o.passFile == "" && envPass == ""
+	o.passFile = cmp.Or(o.passFile, envPass, filepath.Join(dataDir(), "session.pass"))
+	var err error
+	o.db, err = filepath.Abs(cmp.Or(o.db, os.Getenv("AGSECRET_DB"), filepath.Join(dataDir(), "secrets.db")))
+	return err
 }
 
-// Execute runs the CLI and returns its process exit code.
-func Execute(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer) int {
-	o := &options{db: defaultDBPath(), passFile: defaultPassFile(), in: in, out: out, errOut: errOut}
+// Execute runs the CLI and returns its process exit code: 0 success, 1 error,
+// 2 for a command line rejected before running, or a code chosen by exec.
+func Execute(args []string, in io.Reader, out, errOut io.Writer) int {
+	o := &options{in: in, out: out, errOut: errOut}
 	root := newRoot(o)
 	root.SetArgs(args)
-	if err := root.ExecuteContext(ctx); err != nil {
-		return report(err, errOut)
-	}
-	return 0
-}
-
-func report(err error, out io.Writer) int {
-	if err == nil {
-		return 0
-	}
-	var ex *exitError
-	if errors.As(err, &ex) {
-		return ex.code
-	}
-	if errors.Is(err, context.Canceled) {
-		return 130
-	}
+	err := root.Execute()
 	code := 1
-	var ue *usageError
-	if errors.As(err, &ue) {
+	ex, isExit := errors.AsType[*exitError](err)
+	switch {
+	case err == nil:
+		return 0
+	case isExit:
+		code, err = ex.code, ex.err
+	case !o.started:
 		code = 2
 	}
-	message := err.Error()
-	if message == "" {
-		message = "operation failed"
+	if err != nil {
+		message := err.Error()
+		if errors.Is(err, store.ErrNotFound) {
+			message += "; run agsecret list to see current names and IDs"
+		}
+		// Fields joins cobra's multi-line suggestions into one line.
+		_, _ = fmt.Fprintln(errOut, "agsecret:", safeText(strings.Join(strings.Fields(message), " ")))
 	}
-	_, _ = fmt.Fprintln(out, "agsecret:", safeText(message))
 	return code
 }
 
@@ -118,109 +108,78 @@ func safeText(s string) string {
 	return b.String()
 }
 
-const agentHelpText = `Agent workflow
+const guide = `Store passwords and TOTP secrets in an encrypted local vault, and let AI
+agents use them without seeing them. Agents refer to each secret by an ID such
+as ags_3f2a9c0b7d1e4f60. Run "agsecret list" to see the IDs.
 
-Discover credentials with agsecret list --json and agsecret view ID --json.
-Replace ID below with the current ags_<16 lowercase hex> ID from those results.
+Examples:
+  # Call an API with a token; the token never appears in the output
+  agsecret exec -- curl -H 'Authorization: Bearer ID' https://api.example.com
 
-  agsecret exec -- curl -H 'Authorization: Bearer ID' URL
-  agsecret send tmux:<PANE> ID
-  agsecret get TOTP_ID
-  agsecret report ID --reason 'unexpected plaintext output'
+  # Need a shell? Pass the ID in an environment variable
+  TOKEN=ID agsecret exec -- sh -c 'curl -H "Authorization: Bearer $TOKEN" URL | jq'
 
-exec expands IDs in argv/environment and filters stdout/stderr. Pass IDs as
-arguments or environment values, not shell source. Filtering matches exact
-bytes; transformed output, files and direct terminal writes bypass it.
-[REDACTED:ID] marks removed bytes; it does not mean plaintext escaped.
-send requires a password prompt with TTY ECHO disabled.
+  # Type a password into a tmux pane that is waiting at a password prompt
+  agsecret send tmux:PANE ID
 
-Pass get refuses captured stdout. On Linux, indirect use such as
-consumer "$(agsecret get ID)" or agsecret get ID | consumer is allowed;
-the consumer must not echo the value. Prefer exec or send. TOTP get returns a
-current code; TOTP seeds are never printed and TOTP is not reportable.
+  # Print the current code of a TOTP secret
+  agsecret get ID
 
-If plaintext escapes, report its ID before rotation. All matching pass records
-receive the report; permissions never change. report --json returns an array;
-report --secret-stdin matches exact pass bytes. A changed secret/type gets a new
-ID. Never retry an old-ID report by name: it could blame a replacement secret.
-
-Keep JSON stdout separate from stderr; --quiet suppresses the periodic tip.
-For command options: agsecret COMMAND --help or agsecret help COMMAND`
+Notes for agents:
+  - [REDACTED:ID] in output means the value was hidden from you. That is not
+    a leak, and there is nothing to report.
+  - If a secret is refused because it expired or is disabled, ask the user.
+    Do not look for a way around it.
+  - If you see a password in plain text anyway, run "agsecret report ID" and
+    tell the user.
+  - Only exact copies are hidden. Encoded values, files and writes straight to
+    the terminal are not.`
 
 func newRoot(o *options) *cobra.Command {
-	var showVersion bool
 	r := &cobra.Command{
 		Use:           "agsecret",
-		Short:         "Keep Agent credentials out of model-visible command output",
+		Short:         "Let AI agents use secrets without seeing them",
+		Long:          guide,
+		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Long: `Encrypted local credentials for Agent workflows.
-Use list/view to discover current IDs, put --json to capture an ID, and exec to
-expand IDs while filtering child output. Use "agsecret help --agent" for the
-short Agent workflow guide.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if showVersion {
-				if o.json {
-					return encodeJSON(cmd.OutOrStdout(), map[string]any{"version": Version, "schema_version": store.SchemaVersion})
-				}
-				_, err := fmt.Fprintln(cmd.OutOrStdout(), "agsecret "+safeText(Version))
-				return err
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if o.json && cmd.Annotations["json"] == "none" {
+				return fmt.Errorf("%s has no JSON output", cmd.Name())
 			}
-			return cmd.Help()
+			return o.resolve()
 		},
 	}
+	r.SetVersionTemplate("agsecret {{.Version}}\n")
 	r.SetIn(o.in)
 	r.SetOut(o.out)
 	r.SetErr(o.errOut)
-	r.PersistentFlags().StringVar(&o.db, "db", o.db, "encrypted database path (AGSECRET_DB or XDG data default)")
-	r.PersistentFlags().StringVar(&o.passFile, "pass-file", o.passFile, "owner-only passphrase file (AGSECRET_PASS_FILE or secure default)")
-	r.PersistentFlags().BoolVar(&o.json, "json", false, "emit structured JSON where supported")
-	r.PersistentFlags().BoolVar(&o.quiet, "quiet", false, "suppress the periodic agent-safety tip on stderr")
-	r.PersistentFlags().BoolVarP(&showVersion, "version", "v", false, "print version")
+	flags := r.PersistentFlags()
+	flags.StringVar(&o.db, "db", "", "path to the vault (default: $AGSECRET_DB, then ~/.local/share/agsecret/secrets.db)")
+	flags.StringVar(&o.passFile, "pass-file", "", "file holding the vault passphrase (default: $AGSECRET_PASS_FILE, then session.pass next to the default vault)")
+	flags.BoolVar(&o.json, "json", false, "print results as JSON")
 	r.CompletionOptions.DisableDefaultCmd = true
-	r.AddCommand(newInit(o))
-	r.AddCommand(newPut(o))
-	r.AddCommand(newGet(o))
-	r.AddCommand(newView(o))
-	r.AddCommand(newSend(o))
-	r.AddCommand(newReport(o))
-	r.AddCommand(newExec(o))
-	r.AddCommand(newList(o))
-	r.AddCommand(newDelete(o))
-	r.AddCommand(newDoctor(o))
-	r.AddCommand(&cobra.Command{Use: "version", Short: "Print version", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+	r.AddCommand(newInit(o), newPut(o), newList(o), newView(o), newGet(o), newExec(o), newSend(o), newReport(o), newDelete(o), newDoctor(o))
+	r.AddCommand(&cobra.Command{Use: "version", Short: "Print the version", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		if o.json {
 			return encodeJSON(cmd.OutOrStdout(), map[string]any{"version": Version, "schema_version": store.SchemaVersion})
 		}
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), "agsecret "+safeText(Version))
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), "agsecret", Version)
 		return err
 	}})
-	var agentOnly bool
-	help := &cobra.Command{Use: "help [COMMAND]", Short: "Show command help", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		if agentOnly {
-			if len(args) != 0 {
-				return usage("--agent cannot be combined with COMMAND; use agsecret COMMAND --help for command flags")
+	// Cobra validates flag groups after the pre-run hooks, so only the start
+	// of RunE reliably separates usage errors from runtime errors.
+	for _, c := range r.Commands() {
+		if run := c.RunE; run != nil {
+			c.RunE = func(cmd *cobra.Command, args []string) error {
+				o.started = true
+				return run(cmd, args)
 			}
-			_, err := io.WriteString(cmd.OutOrStdout(), agentHelpText+"\n")
-			return err
 		}
-		target, rest, err := r.Find(args)
-		if err != nil || len(rest) != 0 {
-			return usage("unknown command %q; use agsecret help --agent for Agent workflow guidance", strings.Join(args, " "))
-		}
-		target.InitDefaultHelpFlag()
-		return target.Help()
-	}}
-	help.Flags().BoolVar(&agentOnly, "agent", false, "show the concise Agent workflow guide")
-	r.SetHelpCommand(help)
+	}
 	return r
 }
 
 func encodeJSON(out io.Writer, value any) error {
 	return json.NewEncoder(out).Encode(value)
-}
-
-func usage(format string, args ...any) error {
-	return &usageError{message: fmt.Sprintf(format, args...)}
 }

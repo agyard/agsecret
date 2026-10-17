@@ -29,35 +29,41 @@ func testPTY(t *testing.T) (int, string) {
 	return master, fmt.Sprintf("/dev/pts/%d", number)
 }
 
-func setPTYEcho(t *testing.T, master int, enabled bool) {
+func setPTYMode(t *testing.T, master int, echo, canonical bool) {
 	t.Helper()
 	state, err := unix.IoctlGetTermios(master, unix.TCGETS)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enabled {
+	state.Lflag &^= unix.ECHO | unix.ICANON
+	if echo {
 		state.Lflag |= unix.ECHO
-	} else {
-		state.Lflag &^= unix.ECHO
+	}
+	if canonical {
+		state.Lflag |= unix.ICANON
 	}
 	if err := unix.IoctlSetTermios(master, unix.TCSETS, state); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestTargetTTYDetectsEcho(t *testing.T) {
+func TestPasswordPromptNeedsNoEchoAndLineInput(t *testing.T) {
 	master, path := testPTY(t)
-	for _, enabled := range []bool{true, false} {
-		setPTYEcho(t, master, enabled)
-		got, err := targetEchoEnabled(path)
+	for _, tc := range []struct{ echo, canonical, prompt bool }{
+		{true, true, false},   // ordinary cooked terminal
+		{false, false, false}, // shell line editor or REPL
+		{false, true, true},   // getpass-style password prompt
+	} {
+		setPTYMode(t, master, tc.echo, tc.canonical)
+		got, err := atPasswordPrompt(path)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got != enabled {
-			t.Fatalf("echo=%v, want %v", got, enabled)
+		if got != tc.prompt {
+			t.Fatalf("echo=%v canonical=%v: prompt=%v", tc.echo, tc.canonical, got)
 		}
 	}
-	if _, err := targetEchoEnabled(t.TempDir() + "/not-a-tty"); err == nil {
+	if _, err := atPasswordPrompt(t.TempDir() + "/not-a-tty"); err == nil {
 		t.Fatal("accepted a non-TTY path")
 	}
 }
@@ -117,8 +123,8 @@ esac
 	}
 	literal := "send-keys\n-t\ndev:0.1\n-l\n--\n" + secret + "\n"
 	enter := "send-keys\n-t\ndev:0.1\nEnter\n"
-	setPTYEcho(t, master, true)
-	if code, out, errText := c.call("", "send", "tmux:dev:0.1", id); code == 0 || out != "" || !strings.Contains(errText, "TTY has ECHO enabled") {
+	setPTYMode(t, master, false, false)
+	if code, out, errText := c.call("", "send", "tmux:dev:0.1", id); code == 0 || out != "" || !strings.Contains(errText, "not waiting at a password prompt") {
 		t.Fatalf("echo check: code=%d out=%q err=%q", code, out, errText)
 	}
 	assertNoSend()
@@ -129,19 +135,19 @@ esac
 		t.Fatalf("literal send: %q, want %q", got, literal)
 	}
 	resetLog()
-	setPTYEcho(t, master, false)
+	setPTYMode(t, master, false, true)
 	c.ok("", "send", "tmux:dev:0.1", "send-test")
 	if got := readLog(); got != literal+enter {
 		t.Fatalf("send with Enter: %q, want %q", got, literal+enter)
 	}
 	resetLog()
-	c.ok("", "put", "send-test", "--allow-exec=false", "--", secret)
+	c.put("send-test", secret, "--allow-exec=false")
 	if code, _, errText := c.call("", "send", "tmux:dev:0.1", id, "--force-echo"); code == 0 || !strings.Contains(errText, "send is disabled") {
 		t.Fatalf("policy check: code=%d err=%q", code, errText)
 	}
 	assertNoSend()
-	c.ok("", "put", "expired", "expired-password", "--ttl", "1ns")
-	if code, _, errText := c.call("", "send", "tmux:dev:0.1", "expired"); code == 0 || !strings.Contains(errText, "has expired") {
+	c.put("expired", "expired-password", "--ttl", "1ns")
+	if code, _, errText := c.call("", "send", "tmux:dev:0.1", "expired"); code == 0 || !strings.Contains(errText, "has expired; only its owner can renew it") {
 		t.Fatalf("expiry check: code=%d err=%q", code, errText)
 	}
 	assertNoSend()
@@ -190,11 +196,11 @@ exit 42
 		t.Run(tc.name, func(t *testing.T) {
 			secret := "prefix" + tc.control + "suffix"
 			name := "unsafe-" + tc.name
-			c.ok("", "put", name, secret)
+			c.put(name, secret)
 			for _, flags := range [][]string{nil, {"--force-echo"}, {"--force-echo", "--enter=false"}} {
 				args := append([]string{"send", "tmux:dev:0.1", name}, flags...)
 				code, out, errText := c.call("", args...)
-				if code == 0 || out != "" || !strings.Contains(errText, "terminal control characters") || !strings.Contains(errText, "use agsecret exec") {
+				if code == 0 || out != "" || !strings.Contains(errText, "contains control characters") || !strings.Contains(errText, "use agsecret exec") {
 					t.Fatalf("unsafe send: flags=%v code=%d out=%q err=%q", flags, code, out, errText)
 				}
 				if strings.Contains(out+errText, secret) {

@@ -9,8 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/agyard/agsecret/internal/store"
 )
 
 type testCLI struct {
@@ -33,7 +31,7 @@ func (c testCLI) call(input string, args ...string) (int, string, string) {
 	c.t.Helper()
 	var out, errOut bytes.Buffer
 	all := append([]string{"--db", c.db, "--pass-file", c.pass}, args...)
-	code := Execute(c.t.Context(), all, strings.NewReader(input), &out, &errOut)
+	code := Execute(all, strings.NewReader(input), &out, &errOut)
 	return code, out.String(), errOut.String()
 }
 
@@ -48,8 +46,12 @@ func (c testCLI) ok(input string, args ...string) (string, string) {
 
 func (c testCLI) record(args ...string) map[string]any {
 	c.t.Helper()
-	args = append(args, "--json")
-	out, _ := c.ok("", args...)
+	return c.recordWithInput("", args...)
+}
+
+func (c testCLI) recordWithInput(input string, args ...string) map[string]any {
+	c.t.Helper()
+	out, _ := c.ok(input, append(args, "--json")...)
 	var record map[string]any
 	if err := json.Unmarshal([]byte(out), &record); err != nil {
 		c.t.Fatalf("invalid JSON %q: %v", out, err)
@@ -57,14 +59,19 @@ func (c testCLI) record(args ...string) map[string]any {
 	return record
 }
 
+// put stores secret through stdin, which removes one final newline.
+func (c testCLI) put(name, secret string, flags ...string) map[string]any {
+	c.t.Helper()
+	return c.recordWithInput(secret, append([]string{"put", name, "--secret-stdin"}, flags...)...)
+}
+
 func TestHelpEntrypoints(t *testing.T) {
 	call := func(args ...string) (int, string, string) {
 		var out, errOut bytes.Buffer
-		code := Execute(t.Context(), args, strings.NewReader(""), &out, &errOut)
+		code := Execute(args, strings.NewReader(""), &out, &errOut)
 		return code, out.String(), errOut.String()
 	}
-
-	for _, command := range []string{"", "init", "put", "view", "get", "send", "exec", "report", "list", "ls", "delete", "rm", "doctor", "version", "help"} {
+	for _, command := range []string{"", "init", "put", "view", "get", "send", "exec", "report", "list", "ls", "delete", "rm", "doctor", "version"} {
 		helpArgs, flagArgs := []string{"help"}, []string{"--help"}
 		if command != "" {
 			helpArgs = append(helpArgs, command)
@@ -76,24 +83,25 @@ func TestHelpEntrypoints(t *testing.T) {
 			t.Fatalf("help mismatch for %q: code=%d/%d out=%q/%q err=%q/%q", command, code, flagCode, out, flagOut, errOut, flagErr)
 		}
 	}
-	if code, out, errOut := call("help", "--agent"); code != 0 || errOut != "" ||
-		!strings.Contains(out, "Agent workflow") || strings.Contains(out, "Available Commands:") {
-		t.Fatalf("agent help: code=%d out=%q err=%q", code, out, errOut)
+	if _, out, _ := call(); !strings.Contains(out, "agsecret exec -- curl") || !strings.Contains(out, "ask the user") {
+		t.Fatalf("root help lacks the workflow guide: %q", out)
 	}
-	for _, args := range [][]string{{"--agent"}, {"view", "--agent"}, {"help", "agent"}, {"help", "missing-command"}} {
-		if code, out, errOut := call(args...); code == 0 || out != "" || errOut == "" {
-			t.Fatalf("invalid help %v: code=%d out=%q err=%q", args, code, out, errOut)
+	if code, out, _ := call("--version"); code != 0 || out != "agsecret dev\n" {
+		t.Fatalf("version: code=%d out=%q", code, out)
+	}
+	if code, out, errOut := call("lst"); code != 2 || out != "" || !strings.Contains(errOut, "list") || strings.Count(errOut, "\n") != 1 {
+		t.Fatalf("unknown command: code=%d out=%q err=%q", code, out, errOut)
+	}
+	for _, args := range [][]string{{"--agent"}, {"view"}, {"list", "extra"}, {"put", "a", "b"}, {"put", "a", "--secret-stdin", "--secret-file", "f"}, {"get", "a", "--json"}, {"send", "screen:0", "a"}} {
+		if code, out, errOut := call(args...); code != 2 || out != "" || errOut == "" {
+			t.Fatalf("usage error %v: code=%d out=%q err=%q", args, code, out, errOut)
 		}
-	}
-	if code, out, errOut := call("help", "--agent", "view"); code != 2 || out != "" ||
-		!strings.Contains(errOut, "--agent cannot be combined with COMMAND") {
-		t.Fatalf("agent help with command: code=%d out=%q err=%q", code, out, errOut)
 	}
 }
 
 func TestWorkflowAndOutputProtection(t *testing.T) {
 	c := newTestCLI(t)
-	stored := c.record("put", "api", "secret-value")
+	stored := c.put("api", "secret-value\n")
 	id, ok := stored["id"].(string)
 	if !ok || len(id) != 20 || !strings.HasPrefix(id, "ags_") {
 		t.Fatalf("invalid ID: %v", stored)
@@ -106,97 +114,108 @@ func TestWorkflowAndOutputProtection(t *testing.T) {
 		t.Fatalf("view: %v", view)
 	}
 	if _, ok := view["secret"]; ok {
-		t.Fatal("default view exposes secret")
+		t.Fatal("view exposes secret")
 	}
-	if got := c.record("view", "api", "--dangerously-show-secret")["secret"]; got != "secret-value" {
-		t.Fatalf("secret: %v", got)
-	}
-	if code, out, errText := c.call("", "get", id); code != 2 || out != "" || !strings.Contains(errText, "refused to print secret directly to captured stdout") {
+	if code, out, errText := c.call("", "get", id); code != 1 || out != "" || !strings.Contains(errText, "not printing password api") {
 		t.Fatalf("get safety: code=%d out=%q err=%s", code, out, errText)
 	}
 	if out, errText := c.ok("", "get", id, "--dangerously-skip-check"); out != "secret-value\n" || errText != "" {
 		t.Fatalf("get: out=%q err=%q", out, errText)
+	}
+	if code, _, errText := c.call("", "put", "api"); code != 2 || !strings.Contains(errText, "--secret-stdin") {
+		t.Fatalf("put without a secret source: code=%d err=%q", code, errText)
 	}
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGSECRET_CLI_OUTPUT_HELPER", "1")
-	if out, errText := c.ok("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", "--", id); out != "[REDACTED:"+id+"]\n" || !strings.Contains(errText, "redacted secret output") {
+	if out, errText := c.ok("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", "--", id); out != "[REDACTED:"+id+"]\n" || !strings.Contains(errText, "hid the values of "+id+" in the output above; nothing leaked") {
 		t.Fatalf("exec: out=%q err=%q", out, errText)
 	}
 	c.ok("", "report", id, "--reason", "unexpected output", "--context", "terminal log", "--attachment", "screen.png", "--attachment", "debug.log")
-	c.ok("", "report", "api")
+	if code, _, _ := c.call("", "report", "api"); code != 2 {
+		t.Fatal("report accepted a name")
+	}
+	c.ok("", "report", id)
 	leaked := c.record("view", "api")
-	if leaked["status"] != "leaked (2 times)" || leaked["allow_get"] != true || leaked["allow_exec"] != true {
+	if _, ok := leaked["status"]; ok || leaked["allow_get"] != true || leaked["allow_exec"] != true {
 		t.Fatalf("leaked record: %v", leaked)
 	}
 	leaks := leaked["leaks"].([]any)
 	first := leaks[0].(map[string]any)
-	if first["reason"] != "unexpected output" || first["context"] != "terminal log" || len(first["attachments"].([]any)) != 2 {
-		t.Fatalf("leak details: %v", first)
+	if len(leaks) != 2 || first["reason"] != "unexpected output" || first["context"] != "terminal log" || len(first["attachments"].([]any)) != 2 {
+		t.Fatalf("leak details: %v", leaks)
 	}
-	if _, err := time.Parse(time.RFC3339Nano, first["reported_at"].(string)); err != nil {
+	if _, err := time.Parse(time.RFC3339, first["reported_at"].(string)); err != nil {
 		t.Fatal(err)
 	}
-	doctor := c.record("doctor")
-	if doctor["leaked_credentials"] != float64(1) {
+	if text, _ := c.ok("", "list"); !strings.Contains(text, "leaked (2)") || !strings.Contains(text, "get,exec") {
+		t.Fatalf("list text: %q", text)
+	}
+	if doctor := c.record("doctor"); len(doctor["leaked"].([]any)) != 1 {
 		t.Fatalf("doctor: %v", doctor)
 	}
-	rotated := c.record("put", id, "new-secret-value")
+	rotated := c.put(id, "new-secret-value")
 	newID, ok := rotated["id"].(string)
-	if !ok || newID == id || rotated["name"] != "api" || rotated["status"] != "active" || len(rotated["leaks"].([]any)) != 0 || rotated["allow_get"] != true || rotated["allow_exec"] != true {
+	if !ok || newID == id || rotated["name"] != "api" || len(rotated["leaks"].([]any)) != 0 || rotated["allow_get"] != true || rotated["allow_exec"] != true {
 		t.Fatalf("rotation: %v", rotated)
 	}
-	c.ok("", "put", "api", "next-secret-value", "--allow-get", "--allow-exec")
-	latest := c.record("view", "api")["id"].(string)
-	if out, _ := c.ok("", "get", latest, "--dangerously-skip-check"); out != "next-secret-value\n" {
-		t.Fatalf("rotation value: %q", out)
+	if code, _, errText := c.call("", "report", id); code != 1 || !strings.Contains(errText, "needs no report") {
+		t.Fatalf("stale report: code=%d err=%q", code, errText)
 	}
-	c.ok("", "rm", latest)
-	if code, _, _ := c.call("", "view", "api"); code == 0 {
-		t.Fatal("deleted credential still available")
+	c.put("api", "next-secret-value", "--allow-get=false")
+	if code, _, errText := c.call("", "get", "api"); code != 1 || !strings.Contains(errText, "get is disabled for api") || !strings.Contains(errText, "only its owner can enable it") {
+		t.Fatalf("disabled get: code=%d err=%q", code, errText)
 	}
-	for _, removed := range []string{"tokenize", "redact"} {
-		if code, _, _ := c.call("", removed, "api"); code == 0 {
-			t.Fatalf("removed command %q still available", removed)
-		}
+	deleted := c.record("rm", "api")
+	if deleted["name"] != "api" {
+		t.Fatalf("delete: %v", deleted)
+	}
+	if code, _, errText := c.call("", "view", "api"); code != 1 || !strings.Contains(errText, "secret api not found; run agsecret list") {
+		t.Fatalf("deleted credential: code=%d err=%q", code, errText)
+	}
+	if code, _, errText := c.call("", "view", "ags_123"); code != 1 || !strings.Contains(errText, "not a valid ID") {
+		t.Fatalf("malformed ID: code=%d err=%q", code, errText)
 	}
 }
 
 func TestTOTPPutViewGetAndPreservedPolicies(t *testing.T) {
 	c := newTestCLI(t)
 	seed := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-	c.ok("", "put", "otp", seed, "--type", "totp", "--mask", "fixed:configured", "--ttl", "1h", "--allow-exec=false")
-	value, errOut := c.ok("", "get", "otp")
-	if len(strings.TrimSpace(value)) != 6 || errOut != "" {
-		t.Fatalf("TOTP get: %q %q", value, errOut)
-	}
-	view := c.record("view", "otp", "--dangerously-show-secret")
-	if _, exists := view["secret"]; exists || len(view["current_otp"].(string)) != 6 {
-		t.Fatalf("TOTP view: %v", view)
+	// A revealing mask must not apply to a TOTP seed.
+	c.put("otp", seed, "--type", "totp", "--mask", "prefix:4", "--ttl", "1h", "--allow-exec=false")
+	out, errOut := c.ok("", "get", "otp")
+	if code := strings.TrimSpace(out); len(code) != 6 || strings.Trim(code, "0123456789") != "" || errOut != "" {
+		t.Fatalf("TOTP get: %q %q", out, errOut)
 	}
 	previous := c.record("view", "otp")
-	updated := c.record("put", "otp", seed)
+	if previous["value"] != "[set]" {
+		t.Fatalf("TOTP view exposed part of the seed: %v", previous)
+	}
+	if text, _ := c.ok("", "view", "otp"); strings.Contains(text, seed[:4]) {
+		t.Fatalf("TOTP text view exposed part of the seed: %q", text)
+	}
+	updated := c.put("otp", seed)
 	for _, key := range []string{"id", "type", "mask", "expires_at", "allow_exec"} {
 		if previous[key] != updated[key] {
 			t.Fatalf("omitted %s changed: %v -> %v", key, previous[key], updated[key])
 		}
 	}
-	if code, _, _ := c.call("", "put", "invalid", "not-a-seed!", "--type", "totp"); code == 0 {
+	if code, _, _ := c.call("not-a-seed!", "put", "invalid", "--secret-stdin", "--type", "totp"); code == 0 {
 		t.Fatal("invalid TOTP seed accepted")
 	}
-	if code, _, _ := c.call("", "put", "invalid", "123456", "--type", "otp"); code == 0 {
+	if code, _, _ := c.call("123456", "put", "invalid", "--secret-stdin", "--type", "otp"); code == 0 {
 		t.Fatal("old otp type accepted")
 	}
 }
 
-func TestReportSecretAndLecture(t *testing.T) {
+func TestReportSecretAndInit(t *testing.T) {
 	c := newTestCLI(t)
-	first := c.record("put", "first", "same-secret")
-	_, warning := c.ok("", "put", "second", "same-secret")
-	if !strings.Contains(warning, first["id"].(string)) {
-		t.Fatalf("shared passphrase warning missing first ID: %q", warning)
+	first := c.put("first", "same-secret")
+	_, warning := c.ok("same-secret", "put", "second", "--secret-stdin")
+	if !strings.Contains(warning, first["id"].(string)) || strings.Contains(warning, "same-secret") {
+		t.Fatalf("duplicate warning: %q", warning)
 	}
 	out, _ := c.ok("same-secret", "report", "--secret-stdin", "--json", "--reason", "shared password")
 	var reported []map[string]any
@@ -206,40 +225,23 @@ func TestReportSecretAndLecture(t *testing.T) {
 	if len(reported) != 2 {
 		t.Fatalf("matched %d records", len(reported))
 	}
-	if _, errText := c.ok("", "list"); !strings.Contains(errText, "agsecret help --agent") {
-		t.Fatalf("first lecture missing: %q", errText)
-	}
-	if _, errText := c.ok("", "view", "first"); errText != "" {
-		t.Fatalf("lecture repeated: %q", errText)
-	}
-	s, err := store.Open(c.db, []byte("test-passphrase"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.SetMeta("lecture_shown_at", time.Now().UTC().Add(-13*time.Hour).Format(time.RFC3339Nano)); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, errText := c.ok("", "doctor"); !strings.Contains(errText, "agsecret help --agent") {
-		t.Fatalf("expired lecture missing: %q", errText)
-	}
 	if code, _, _ := c.call("unmatched", "report", "--secret-stdin"); code == 0 {
 		t.Fatal("unmatched secret report succeeded")
+	}
+	if out, errText := c.ok("", "init"); !strings.Contains(out, c.db) || errText != "" {
+		t.Fatalf("repeated init: out=%q err=%q", out, errText)
+	}
+	missing := filepath.Join(t.TempDir(), "missing.db")
+	if code, _, errText := c.call("", "--db", missing, "list"); code != 1 || !strings.Contains(errText, "no vault at "+missing+"; run agsecret init") {
+		t.Fatalf("missing vault: code=%d err=%q", code, errText)
 	}
 }
 
 func TestTmuxTargetsAndTTL(t *testing.T) {
-	for _, value := range []string{"tmux:0", "tmux:dev:0.1", "tmux:%1"} {
-		got, err := parseTmuxTarget(value)
-		if err != nil || got != strings.TrimPrefix(value, "tmux:") {
-			t.Fatalf("%q: %q %v", value, got, err)
-		}
-	}
-	for _, value := range []string{"", "0", "screen:0", "tmux:", "tmux:0\n"} {
-		if _, err := parseTmuxTarget(value); err == nil {
-			t.Fatalf("accepted %q", value)
+	c := newTestCLI(t)
+	for _, target := range []string{"0", "screen:0", "tmux:", "tmux:0\n"} {
+		if code, _, errText := c.call("", "send", target, "missing"); code != 2 || !strings.Contains(errText, "needs a tmux pane") {
+			t.Fatalf("accepted target %q: code=%d err=%q", target, code, errText)
 		}
 	}
 	for _, value := range []string{"0", "15m", "2h", "7d", "1.5w"} {
@@ -266,42 +268,48 @@ func TestCLIOutputHelper(t *testing.T) {
 	os.Exit(0)
 }
 
-func TestExecWrapperDiagnosticsAreRedacted(t *testing.T) {
+func TestExecNoteIsRedactedAndExitCodes(t *testing.T) {
 	c := newTestCLI(t)
-	stored := c.record("put", "details", "details")
-	id := stored["id"].(string)
+	// "nothing" also occurs in the redaction note itself.
+	id := c.put("details", "nothing")["id"].(string)
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGSECRET_CLI_OUTPUT_HELPER", "1")
-	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "details")
+	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "nothing")
 	code, out, errText := c.call("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", "--", id)
-	if code != 0 || out != "[REDACTED:"+id+"]\n" || strings.Contains(errText, "details") {
-		t.Fatalf("footer leaked diagnostic value: code=%d out=%q err=%q", code, out, errText)
+	if code != 0 || out != "[REDACTED:"+id+"]\n" || strings.Contains(errText, "nothing") {
+		t.Fatalf("note leaked a credential: code=%d out=%q err=%q", code, out, errText)
 	}
-	code, out, errText = c.call("", "exec", "--", "/missing/details/helper", id)
-	if code == 0 || out != "" || strings.Contains(errText, "details") {
-		t.Fatalf("start diagnostic leaked executable value: code=%d out=%q err=%q", code, out, errText)
-	}
-	if !strings.Contains(errText, "[REDACTED:"+id+"]") {
-		t.Fatalf("sanitized diagnostic marker missing: %q", errText)
+	for _, tc := range []struct {
+		args []string
+		code int
+		text string
+	}{
+		{[]string{"exec", "--", filepath.Join(t.TempDir(), "missing")}, 127, "cannot run"},
+		{[]string{"exec", "--", t.TempDir()}, 126, "cannot run"},
+		{[]string{"exec", "--", "echo", "ags_0123456789abcdef"}, 125, "secret ags_0123456789abcdef not found"},
+		{[]string{"exec", "--", "echo", "ags_0123456789abcde"}, 125, "not a valid ID"},
+		{[]string{"exec", "--", "sh", "-c", "echo " + id}, 125, "environment variable"},
+		{[]string{"exec", "--", id}, 125, "command name cannot contain"},
+		{[]string{"exec", "--json", "--", "echo"}, 2, "no JSON output"},
+	} {
+		code, out, errText := c.call("", tc.args...)
+		if code != tc.code || out != "" || !strings.Contains(errText, tc.text) {
+			t.Fatalf("%v: code=%d out=%q err=%q", tc.args, code, out, errText)
+		}
 	}
 }
 
 func TestMetadataEscapesTerminalControls(t *testing.T) {
 	c := newTestCLI(t)
 	mask := "fixed:\x1b]52;c;c2VjcmV0\a\t\u202evalue"
-	c.ok("", "put", "display", "secret-value", "--mask", mask)
-	c.ok("", "report", "display", "--reason", "reason\x1b[2J", "--context", "context\b\u009b2J", "--attachment", "log\x1b]0;title\a")
-	for _, command := range [][]string{{"view", "display"}, {"list"}} {
-		out, _ := c.ok("", command...)
-		if strings.ContainsAny(out, "\x1b\a\r\b\u009b\u202e") {
-			t.Fatalf("terminal control in %v output: %q", command, out)
-		}
-		if !strings.Contains(out, `\x1b`) {
-			t.Fatalf("escaped value missing from %v: %q", command, out)
-		}
+	id := c.put("display", "secret-value", "--mask", mask)["id"].(string)
+	c.ok("", "report", id, "--reason", "reason\x1b[2J", "--context", "context\b\u009b2J", "--attachment", "log\x1b]0;title\a")
+	out, _ := c.ok("", "view", "display")
+	if strings.ContainsAny(out, "\x1b\a\r\b\u009b\u202e") || !strings.Contains(out, `\x1b`) {
+		t.Fatalf("terminal control in view output: %q", out)
 	}
 	value := c.record("view", "display")["value"]
 	if value != strings.TrimPrefix(mask, "fixed:") {

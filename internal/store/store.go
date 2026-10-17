@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -35,15 +34,12 @@ import (
 
 const (
 	SchemaVersion            = 2
+	MaxSecretLen             = 1 << 20
 	maxNameBytes             = 128
-	maxSecretLen             = 1 << 20
 	maxUnlockDescriptorBytes = 4096
 )
 
-var (
-	ErrNotFound = errors.New("secret not found")
-	ErrExpired  = errors.New("secret has expired")
-)
+var ErrNotFound = errors.New("not found")
 
 // Record is the metadata returned for a credential. Secret is populated only
 // when a caller explicitly requests the secret and is never JSON encoded.
@@ -74,13 +70,12 @@ func (r Record) Expired(now time.Time) bool {
 	return r.ExpiresAt != nil && !now.Before(*r.ExpiresAt)
 }
 
-// Store is safe for one process using its database. SQLite provides the
-// cross-process locking needed when several short-lived CLI calls overlap.
+// Store is used by one process. SQLite provides the cross-process locking
+// needed when several short-lived CLI calls overlap.
 type Store struct {
 	DB   *sql.DB
 	Path string
 	key  []byte
-	mu   sync.Mutex
 }
 
 type unlockDescriptor struct {
@@ -91,16 +86,9 @@ type unlockDescriptor struct {
 }
 
 func wrapPassphrase(pass, key []byte) ([]byte, error) {
-	if len(pass) == 0 {
-		return nil, errors.New("empty passphrase")
-	}
 	u := unlockDescriptor{Version: 2, Salt: make([]byte, 16), Nonce: make([]byte, chacha20poly1305.NonceSizeX)}
-	if _, err := rand.Read(u.Salt); err != nil {
-		return nil, err
-	}
-	if _, err := rand.Read(u.Nonce); err != nil {
-		return nil, err
-	}
+	rand.Read(u.Salt)
+	rand.Read(u.Nonce)
 	k := argon2.IDKey(pass, u.Salt, 1, 16*1024, 2, 32)
 	defer clear(k)
 	aead, err := chacha20poly1305.NewX(k)
@@ -114,10 +102,10 @@ func wrapPassphrase(pass, key []byte) ([]byte, error) {
 func unwrapPassphrase(pass, b []byte) ([]byte, error) {
 	var u unlockDescriptor
 	if err := json.Unmarshal(b, &u); err != nil {
-		return nil, errors.New("invalid unlock descriptor")
+		return nil, errors.New("the vault's .unlock file is invalid")
 	}
 	if (u.Version != 1 && u.Version != 2) || len(u.Salt) != 16 || len(u.Nonce) != chacha20poly1305.NonceSizeX || len(u.Wrapped) != 32+chacha20poly1305.Overhead {
-		return nil, errors.New("invalid unlock descriptor")
+		return nil, errors.New("the vault's .unlock file is invalid")
 	}
 	var k []byte
 	if u.Version == 1 {
@@ -134,144 +122,116 @@ func unwrapPassphrase(pass, b []byte) ([]byte, error) {
 	}
 	key, err := aead.Open(nil, u.Nonce, u.Wrapped, []byte("agsecret-store-v1"))
 	if err != nil {
-		return nil, errors.New("wrong passphrase or damaged unlock descriptor")
+		return nil, errors.New("wrong passphrase, or the vault's .unlock file is damaged")
 	}
 	return key, nil
 }
 
+func validSize(b []byte) bool {
+	return len(b) > 0 && len(b) <= MaxSecretLen && bytes.IndexByte(b, 0) < 0
+}
+
 func validatePassphrase(pass []byte) error {
-	if len(pass) == 0 {
-		return errors.New("passphrase is empty")
-	}
-	if len(pass) > 1<<20 {
-		return errors.New("passphrase is too long")
-	}
-	if bytesContainsNUL(pass) {
-		return errors.New("passphrase contains NUL")
+	if !validSize(pass) {
+		return errors.New("the passphrase must be 1 byte to 1 MiB without NUL bytes")
 	}
 	return nil
 }
 
-func bytesContainsNUL(b []byte) bool {
-	for _, c := range b {
-		if c == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func ensureParent(name string) error {
-	dir := filepath.Dir(name)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+// WritePrivateFile creates an owner-only file, failing if the path exists.
+func WritePrivateFile(name string, data []byte) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
 		return err
 	}
-	return nil
-}
-
-// Create creates a new encrypted store. The database and unlock sidecar are
-// both created with owner-only permissions.
-func Create(name string, pass []byte) (*Store, error) {
-	var err error
-	if err := validatePassphrase(pass); err != nil {
-		return nil, err
-	}
-	if name == "" {
-		return nil, errors.New("database path is empty")
-	}
-	if !filepath.IsAbs(name) {
-		name, err = filepath.Abs(name)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if _, err := os.Lstat(name); err == nil {
-		return nil, errors.New("database already exists")
-	} else if !os.IsNotExist(err) {
-		return nil, err
-	}
-	if _, err := os.Lstat(name + ".unlock"); err == nil {
-		return nil, errors.New("unlock descriptor already exists")
-	} else if !os.IsNotExist(err) {
-		return nil, err
-	}
-	if err := ensureParent(name); err != nil {
-		return nil, err
-	}
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, err
-	}
-	descriptor, err := wrapPassphrase(pass, key)
-	if err != nil {
-		clear(key)
-		return nil, err
-	}
-	unlockPath := name + ".unlock"
-	f, err := os.OpenFile(unlockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		clear(key)
-		return nil, err
-	}
-	if _, err = f.Write(descriptor); err == nil {
+	if _, err = f.Write(data); err == nil {
 		err = f.Sync()
 	}
-	closeErr := f.Close()
-	if err == nil {
+	if closeErr := f.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
-		_ = os.Remove(unlockPath)
+		_ = os.Remove(name)
+	}
+	return err
+}
+
+// OpenPrivateFile opens a regular file that is not a symlink and, on Unix, is
+// accessible only by its owner. The opened file must be the one inspected.
+func OpenPrivateFile(name string) (*os.File, error) {
+	lst, err := os.Lstat(name)
+	if err != nil {
+		return nil, err
+	}
+	if !lst.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file, not a symlink", name)
+	}
+	f, err := os.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	switch {
+	case err != nil:
+	case !os.SameFile(lst, st):
+		err = fmt.Errorf("%s changed while opening", name)
+	case runtime.GOOS != "windows" && st.Mode().Perm()&0077 != 0:
+		err = fmt.Errorf("%s must be owner-only; run chmod 600 %s", name, name)
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// Create creates a new encrypted store at an absolute path. The database and
+// unlock sidecar are both created exclusively with owner-only permissions.
+func Create(name string, pass []byte) (*Store, error) {
+	if err := validatePassphrase(pass); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(filepath.Dir(name), 0700); err != nil {
+		return nil, err
+	}
+	key := make([]byte, 32)
+	rand.Read(key)
+	descriptor, err := wrapPassphrase(pass, key)
+	if err == nil {
+		err = WritePrivateFile(name+".unlock", descriptor)
+	}
+	if err != nil {
 		clear(key)
 		return nil, err
 	}
 	// Claim the database path exclusively before SQLite opens it. A failed
 	// concurrent creator must never remove another process's database.
-	databaseFile, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		_ = os.Remove(unlockPath)
-		clear(key)
-		return nil, err
-	}
-	if err := databaseFile.Close(); err != nil {
-		_ = os.Remove(name)
-		_ = os.Remove(unlockPath)
+	if err := WritePrivateFile(name, nil); err != nil {
+		_ = os.Remove(name + ".unlock")
 		clear(key)
 		return nil, err
 	}
 	s, err := connect(name, key, true)
 	if err != nil {
-		_ = os.Remove(name)
-		_ = os.Remove(name + "-wal")
-		_ = os.Remove(name + "-shm")
-		_ = os.Remove(unlockPath)
-		clear(key)
+		for _, suffix := range []string{"", "-wal", "-shm", ".unlock"} {
+			_ = os.Remove(name + suffix)
+		}
 		return nil, err
 	}
 	return s, nil
 }
 
-// Open opens an existing encrypted store.
+// Open opens an existing encrypted store at an absolute path.
 func Open(name string, pass []byte) (*Store, error) {
-	var err error
 	if err := validatePassphrase(pass); err != nil {
 		return nil, err
-	}
-	if name == "" {
-		return nil, errors.New("database path is empty")
-	}
-	if !filepath.IsAbs(name) {
-		name, err = filepath.Abs(name)
-		if err != nil {
-			return nil, err
-		}
 	}
 	lst, err := os.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
-	if !lst.Mode().IsRegular() || lst.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("database path must be a regular file")
+	if !lst.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file", name)
 	}
 	unlock, err := readUnlockDescriptor(name + ".unlock")
 	if err != nil {
@@ -281,52 +241,20 @@ func Open(name string, pass []byte) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if _, err = os.Stat(name); err != nil {
-		clear(key)
-		return nil, err
-	}
-	s, err := connect(name, key, false)
-	if err != nil {
-		clear(key)
-		return nil, err
-	}
-	return s, nil
+	return connect(name, key, false)
 }
 
 func readUnlockDescriptor(name string) ([]byte, error) {
-	lst, err := os.Lstat(name)
-	if err != nil {
-		return nil, err
-	}
-	if !lst.Mode().IsRegular() || lst.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("unlock descriptor must be a regular file")
-	}
-	if runtime.GOOS != "windows" && lst.Mode().Perm()&0077 != 0 {
-		return nil, fmt.Errorf("unlock descriptor %s must be owner-only", name)
-	}
-	if lst.Size() > maxUnlockDescriptorBytes {
-		return nil, errors.New("unlock descriptor exceeds 4096-byte limit")
-	}
-	f, err := os.Open(name)
+	f, err := OpenPrivateFile(name)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	opened, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if !opened.Mode().IsRegular() || !os.SameFile(lst, opened) {
-		return nil, errors.New("unlock descriptor changed while opening")
-	}
 	b, err := io.ReadAll(io.LimitReader(f, maxUnlockDescriptorBytes+1))
-	if err != nil {
-		return nil, err
+	if err == nil && len(b) > maxUnlockDescriptorBytes {
+		err = fmt.Errorf("%s exceeds the 4096-byte limit", name)
 	}
-	if len(b) > maxUnlockDescriptorBytes {
-		return nil, errors.New("unlock descriptor exceeds 4096-byte limit")
-	}
-	return b, nil
+	return b, err
 }
 
 func openDatabase(name string, key []byte, create bool) (*sql.DB, error) {
@@ -358,17 +286,16 @@ const secretsSchema = `CREATE TABLE secrets (
  allow_get INTEGER NOT NULL DEFAULT 1,
  allow_exec INTEGER NOT NULL DEFAULT 1,
  leaks TEXT NOT NULL DEFAULT '[]'
-);`
-
-const auxiliarySchema = `
-CREATE INDEX IF NOT EXISTS secrets_expires ON secrets(expires_at);
-CREATE TABLE IF NOT EXISTS meta_state (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-PRAGMA user_version=2;
+);
 `
 
+var setSchemaVersion = fmt.Sprintf("PRAGMA user_version=%d;", SchemaVersion)
+
+// connect takes ownership of key and erases it on failure or Close.
 func connect(name string, key []byte, create bool) (*Store, error) {
 	db, err := openDatabase(name, key, create)
 	if err != nil {
+		clear(key)
 		return nil, err
 	}
 	s := &Store{DB: db, Path: name, key: key}
@@ -381,7 +308,7 @@ func connect(name string, key []byte, create bool) (*Store, error) {
 		if err != nil {
 			return fail(err)
 		}
-		if _, err = tx.Exec(secretsSchema + auxiliarySchema); err != nil {
+		if _, err = tx.Exec(secretsSchema + setSchemaVersion); err != nil {
 			_ = tx.Rollback()
 			return fail(err)
 		}
@@ -400,17 +327,17 @@ func connect(name string, key []byte, create bool) (*Store, error) {
 func checkSchema(db *sql.DB) error {
 	var version int
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return errors.New("cannot unlock encrypted database")
+		return errors.New("cannot read the vault; it may be damaged or not an agsecret vault")
 	}
 	if version == 1 {
 		return migrateV1(db)
 	}
 	if version != SchemaVersion {
-		return fmt.Errorf("unsupported database schema version %d; expected %d", version, SchemaVersion)
+		return fmt.Errorf("the vault has schema version %d, but this agsecret supports version %d", version, SchemaVersion)
 	}
 	var count int
 	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('secrets') WHERE name IN ('id','secret','leaks')").Scan(&count); err != nil || count != 3 {
-		return errors.New("unsupported database layout")
+		return errors.New("the vault has an unexpected table layout")
 	}
 	return nil
 }
@@ -431,76 +358,34 @@ func migrateV1(db *sql.DB) error {
 		return tx.Commit()
 	}
 	if version != 1 {
-		return fmt.Errorf("unsupported database schema version %d", version)
+		return fmt.Errorf("the vault has unsupported schema version %d", version)
 	}
-	rows, err := tx.Query(`SELECT name FROM secrets ORDER BY name`)
+	names, err := queryStrings(tx, `SELECT name FROM secrets ORDER BY name`)
 	if err != nil {
-		return err
-	}
-	var names []string
-	for rows.Next() {
-		var name string
-		if err = rows.Scan(&name); err != nil {
-			_ = rows.Close()
-			return err
-		}
-		names = append(names, name)
-	}
-	if err = rows.Err(); err != nil {
-		_ = rows.Close()
-		return err
-	}
-	if err = rows.Close(); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(strings.Replace(secretsSchema, "CREATE TABLE secrets (", "CREATE TABLE secrets_v2 (", 1)); err != nil {
 		return err
 	}
 	for _, name := range names {
-		id, err := newID()
-		if err != nil {
-			return err
-		}
 		if _, err = tx.Exec(`INSERT INTO secrets_v2(name,id,type,secret,mask,created_at,updated_at,expires_at,allow_get,allow_exec)
-SELECT name,?,CASE type WHEN 'otp' THEN 'pass' ELSE type END,secret,mask,created_at,updated_at,expires_at,allow_get,allow_exec FROM secrets WHERE name=?`, id, name); err != nil {
+SELECT name,?,CASE type WHEN 'otp' THEN 'pass' ELSE type END,secret,mask,created_at,updated_at,expires_at,allow_get,allow_exec FROM secrets WHERE name=?`, newID(), name); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.Exec("DROP TABLE secrets; ALTER TABLE secrets_v2 RENAME TO secrets;" + auxiliarySchema); err != nil {
+	if _, err = tx.Exec("DROP TABLE secrets; ALTER TABLE secrets_v2 RENAME TO secrets;" + setSchemaVersion); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func (s *Store) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	// Close active connections before erasing the key used by their opener.
 	err := s.DB.Close()
-	if s.key != nil {
-		clear(s.key)
-		s.key = nil
-	}
+	clear(s.key)
+	s.key = nil
 	return err
 }
-
-func validateName(name string) error {
-	if name == "" || len(name) > maxNameBytes || !utf8.ValidString(name) {
-		return errors.New("name must be valid UTF-8 and 1-128 bytes")
-	}
-	if strings.HasPrefix(name, "ags_") {
-		return errors.New("names beginning with ags_ are reserved for credential IDs")
-	}
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || strings.ContainsRune("._/@+-", r) {
-			continue
-		}
-		return errors.New("name may contain only letters, digits, '.', '_', '/', '@', '+' and '-'")
-	}
-	return nil
-}
-
-func ValidateNameForCLI(name string) error { return validateName(name) }
 
 // ValidID recognizes the only credential token format.
 func ValidID(id string) bool {
@@ -515,40 +400,47 @@ func ValidID(id string) bool {
 	return true
 }
 
-func newID() (string, error) {
+// crypto/rand.Read cannot fail since Go 1.24; it aborts the program instead.
+func newID() string {
 	var random [8]byte
-	if _, err := rand.Read(random[:]); err != nil {
-		return "", err
-	}
-	return "ags_" + hex.EncodeToString(random[:]), nil
+	rand.Read(random[:])
+	return "ags_" + hex.EncodeToString(random[:])
 }
 
+// validateRef accepts a current ID or a credential name.
 func validateRef(ref string) error {
-	if ValidID(ref) {
+	switch {
+	case ValidID(ref):
+		return nil
+	case strings.HasPrefix(ref, "ags_"):
+		return fmt.Errorf("%w, and names cannot start with ags_", CheckID(ref))
+	case ref == "" || len(ref) > maxNameBytes:
+		return errors.New("name must be 1-128 bytes")
+	case strings.ContainsFunc(ref, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/@+-", r))
+	}):
+		return errors.New("name may contain only letters, digits, '.', '_', '/', '@', '+' and '-'")
+	}
+	return nil
+}
+
+// CheckID explains why text that looks like an ID is not a valid one.
+func CheckID(id string) error {
+	if ValidID(id) {
 		return nil
 	}
-	return validateName(ref)
+	return fmt.Errorf("%q is not a valid ID; IDs are ags_ followed by 16 lowercase hex digits", id)
 }
 
 func validateSecret(secret []byte) error {
-	if len(secret) == 0 {
-		return errors.New("secret is empty")
-	}
-	if len(secret) > maxSecretLen {
-		return fmt.Errorf("secret is too long (maximum %d bytes)", maxSecretLen)
-	}
-	if bytesContainsNUL(secret) || !utf8.Valid(secret) {
-		return errors.New("secret must be UTF-8 without NUL")
+	if !validSize(secret) || !utf8.Valid(secret) {
+		return errors.New("the value must be 1 byte to 1 MiB of UTF-8 text without NUL bytes")
 	}
 	return nil
 }
 
-func validateType(kind string) error {
-	if kind != "pass" && kind != "totp" {
-		return errors.New("type must be pass or totp")
-	}
-	return nil
-}
+// Stored timestamps have whole seconds so JSON output has one fixed width.
+func now() time.Time { return time.Now().UTC().Truncate(time.Second) }
 
 func encodeTime(t time.Time) string          { return t.UTC().Format(time.RFC3339Nano) }
 func decodeTime(s string) (time.Time, error) { return time.Parse(time.RFC3339Nano, s) }
@@ -559,108 +451,69 @@ type PutResult struct {
 	DuplicateIDs []string
 }
 
-// Put replaces the value and all supplied policies.
-func (s *Store) Put(r Record) error { return s.put(r, nil, nil) }
-
-// PutWithOptions preserves policies omitted by the caller. Passing an existing
-// ID is allowed; a changed value invalidates that ID in the same transaction.
-func (s *Store) PutWithOptions(r Record, changed map[string]bool) error {
-	if changed == nil {
-		changed = map[string]bool{}
-	}
-	return s.put(r, changed, nil)
-}
-
-func (s *Store) PutWithOptionsResult(r Record, changed map[string]bool) (PutResult, error) {
-	if changed == nil {
-		changed = map[string]bool{}
-	}
-	var result PutResult
-	err := s.put(r, changed, &result)
-	return result, err
-}
-
-func uniqueID(tx *sql.Tx) (string, error) {
-	for {
-		id, err := newID()
-		if err != nil {
-			return "", err
-		}
-		var count int
-		if err := tx.QueryRow("SELECT COUNT(*) FROM secrets WHERE id=?", id).Scan(&count); err != nil {
-			return "", err
-		}
-		if count == 0 {
-			return id, nil
-		}
-	}
-}
-
-func (s *Store) put(r Record, changed map[string]bool, result *PutResult) error {
+// Put stores r under its name or current ID. Options missing from changed
+// keep their previous values. A changed secret or type assigns a new ID and
+// clears leak history in the same transaction, invalidating the old ID.
+func (s *Store) Put(r Record, changed map[string]bool) (PutResult, error) {
 	if err := validateRef(r.Name); err != nil {
-		return err
+		return PutResult{}, err
 	}
 	if err := validateSecret(r.Secret); err != nil {
-		return err
+		return PutResult{}, err
 	}
 	tx, err := s.DB.Begin()
 	if err != nil {
-		return err
+		return PutResult{}, err
 	}
 	defer tx.Rollback()
 	previous, err := getRecord(tx, r.Name, true)
 	defer clear(previous.Secret)
 	exists := err == nil
-	if err != nil && !errors.Is(err, ErrNotFound) {
-		return err
+	if err != nil && (!errors.Is(err, ErrNotFound) || ValidID(r.Name)) {
+		return PutResult{}, err
 	}
 	if exists {
 		r.Name, r.ID, r.CreatedAt = previous.Name, previous.ID, previous.CreatedAt
-		if changed != nil {
-			if !changed["type"] {
-				r.Type = previous.Type
-			}
-			if !changed["mask"] {
-				r.Mask = previous.Mask
-			}
-			if !changed["ttl"] {
-				r.ExpiresAt = previous.ExpiresAt
-			}
-			if !changed["allow-get"] {
-				r.AllowGet = previous.AllowGet
-			}
-			if !changed["allow-exec"] {
-				r.AllowExec = previous.AllowExec
-			}
+		if !changed["type"] {
+			r.Type = previous.Type
 		}
-	} else {
-		if ValidID(r.Name) {
-			return ErrNotFound
+		if !changed["mask"] {
+			r.Mask = previous.Mask
 		}
-		if err := validateName(r.Name); err != nil {
-			return err
+		if !changed["ttl"] {
+			r.ExpiresAt = previous.ExpiresAt
+		}
+		if !changed["allow-get"] {
+			r.AllowGet = previous.AllowGet
+		}
+		if !changed["allow-exec"] {
+			r.AllowExec = previous.AllowExec
 		}
 	}
 	if r.Type == "" {
 		r.Type = "pass"
 	}
-	if err := validateType(r.Type); err != nil {
-		return err
+	if r.ExpiresAt != nil {
+		expires := r.ExpiresAt.UTC().Truncate(time.Second)
+		r.ExpiresAt = &expires
 	}
-	if r.Type == "totp" {
+	switch r.Type {
+	case "pass":
+	case "totp":
 		config, err := totp.Parse(string(r.Secret))
 		if err != nil {
-			return err
+			return PutResult{}, err
 		}
 		config.Clear()
+	default:
+		return PutResult{}, errors.New("type must be pass or totp")
 	}
-	rotated := !exists || !bytes.Equal(previous.Secret, r.Secret) || previous.Type != r.Type
-	if rotated {
-		r.ID, err = uniqueID(tx)
-		if err != nil {
-			return err
+	r.UpdatedAt = now()
+	if !exists || !bytes.Equal(previous.Secret, r.Secret) || previous.Type != r.Type {
+		if r.ID, err = uniqueID(tx); err != nil {
+			return PutResult{}, err
 		}
-		r.CreatedAt = time.Now().UTC()
+		r.CreatedAt = r.UpdatedAt
 		r.Leaks = []Leak{}
 	} else {
 		r.Leaks = previous.Leaks
@@ -668,62 +521,62 @@ func (s *Store) put(r Record, changed map[string]bool, result *PutResult) error 
 	if r.Mask == "" {
 		r.Mask = "fixed:[set]"
 	}
-	r.UpdatedAt = time.Now().UTC()
 	var expires any
 	if r.ExpiresAt != nil {
 		expires = encodeTime(*r.ExpiresAt)
 	}
 	leaks, err := json.Marshal(r.Leaks)
 	if err != nil {
-		return err
+		return PutResult{}, err
 	}
 	_, err = tx.Exec(`INSERT INTO secrets(name,id,type,secret,mask,created_at,updated_at,expires_at,allow_get,allow_exec,leaks)
  VALUES(?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(name) DO UPDATE SET id=excluded.id,type=excluded.type,secret=excluded.secret,mask=excluded.mask,created_at=excluded.created_at,updated_at=excluded.updated_at,expires_at=excluded.expires_at,
  allow_get=excluded.allow_get,allow_exec=excluded.allow_exec,leaks=excluded.leaks`,
-		r.Name, r.ID, r.Type, r.Secret, r.Mask, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt), expires, boolInt(r.AllowGet), boolInt(r.AllowExec), string(leaks))
+		r.Name, r.ID, r.Type, r.Secret, r.Mask, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt), expires, r.AllowGet, r.AllowExec, string(leaks))
 	if err != nil {
-		return err
+		return PutResult{}, err
 	}
 	duplicates := []string{}
 	if r.Type == "pass" {
 		// This query shares the write transaction. A concurrent put cannot
 		// create a duplicate between checking and committing without seeing us.
-		rows, err := tx.Query("SELECT id FROM secrets WHERE type='pass' AND secret=? AND id<>? ORDER BY id", r.Secret, r.ID)
-		if err != nil {
-			return err
-		}
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				rows.Close()
-				return err
-			}
-			duplicates = append(duplicates, id)
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		if err := rows.Close(); err != nil {
-			return err
+		if duplicates, err = queryStrings(tx, "SELECT id FROM secrets WHERE type='pass' AND secret=? AND id<>? ORDER BY id", r.Secret, r.ID); err != nil {
+			return PutResult{}, err
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return PutResult{}, err
 	}
-	if result != nil {
-		r.Secret = nil
-		*result = PutResult{Record: r, DuplicateIDs: duplicates}
-	}
-	return nil
+	r.Secret = nil
+	return PutResult{Record: r, DuplicateIDs: duplicates}, nil
 }
 
-func boolInt(v bool) int {
-	if v {
-		return 1
+func queryStrings(tx *sql.Tx, query string, args ...any) ([]string, error) {
+	rows, err := tx.Query(query, args...)
+	if err != nil {
+		return nil, err
 	}
-	return 0
+	defer rows.Close()
+	values := []string{}
+	for rows.Next() {
+		var v string
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
+	return values, rows.Err()
+}
+
+func uniqueID(tx *sql.Tx) (string, error) {
+	for {
+		id := newID()
+		var exists bool
+		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM secrets WHERE id=?)", id).Scan(&exists); err != nil || !exists {
+			return id, err
+		}
+	}
 }
 
 const recordColumns = `name,id,type,%s,mask,created_at,updated_at,expires_at,allow_get,allow_exec,leaks`
@@ -741,8 +594,7 @@ func scanRecord(scanner interface{ Scan(...any) error }, includeSecret bool) (Re
 	var secret []byte
 	var created, updated, leaks string
 	var expires sql.NullString
-	var get, exec int
-	if err := scanner.Scan(&r.Name, &r.ID, &r.Type, &secret, &r.Mask, &created, &updated, &expires, &get, &exec, &leaks); err != nil {
+	if err := scanner.Scan(&r.Name, &r.ID, &r.Type, &secret, &r.Mask, &created, &updated, &expires, &r.AllowGet, &r.AllowExec, &leaks); err != nil {
 		return r, err
 	}
 	defer clear(secret)
@@ -762,19 +614,10 @@ func scanRecord(scanner interface{ Scan(...any) error }, includeSecret bool) (Re
 		}
 		r.ExpiresAt = &t
 	}
-	if err := json.Unmarshal([]byte(leaks), &r.Leaks); err != nil {
-		return r, errors.New("invalid credential leak history")
+	// Writers always store a JSON array with non-null attachments.
+	if err := json.Unmarshal([]byte(leaks), &r.Leaks); err != nil || r.Leaks == nil {
+		return r, fmt.Errorf("the leak reports of %s are damaged", r.Name)
 	}
-	if r.Leaks == nil {
-		r.Leaks = []Leak{}
-	} else {
-		for i := range r.Leaks {
-			if r.Leaks[i].Attachments == nil {
-				r.Leaks[i].Attachments = []string{}
-			}
-		}
-	}
-	r.AllowGet, r.AllowExec = get != 0, exec != 0
 	if includeSecret {
 		r.Secret = append([]byte(nil), secret...)
 	}
@@ -790,7 +633,7 @@ func getRecord(db rowQuerier, ref string, includeSecret bool) (Record, error) {
 	}
 	r, err := scanRecord(db.QueryRow("SELECT "+selectedColumns(includeSecret)+" FROM secrets WHERE "+column+"=?", ref), includeSecret)
 	if errors.Is(err, sql.ErrNoRows) {
-		return Record{}, ErrNotFound
+		return Record{}, fmt.Errorf("secret %s %w", ref, ErrNotFound)
 	}
 	return r, err
 }
@@ -804,85 +647,50 @@ func (s *Store) GetByNameOrID(ref string, includeSecret bool) (Record, error) {
 	return getRecord(s.DB, ref, includeSecret)
 }
 
-func (s *Store) Get(ref string, includeSecret bool) (Record, error) {
-	return s.GetByNameOrID(ref, includeSecret)
-}
-
 func (s *Store) List() ([]Record, error)            { return s.list(false) }
 func (s *Store) ListWithSecrets() ([]Record, error) { return s.list(true) }
 
 func (s *Store) list(includeSecret bool) ([]Record, error) {
 	rows, err := s.DB.Query("SELECT " + selectedColumns(includeSecret) + " FROM secrets ORDER BY name")
+	return scanRecords(rows, err, includeSecret)
+}
+
+// scanRecords reads and closes rows. On failure it erases secrets already read.
+func scanRecords(rows *sql.Rows, err error, includeSecret bool) ([]Record, error) {
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Record{}
-	clearOut := func() {
-		for _, r := range out {
-			clear(r.Secret)
-		}
-	}
 	for rows.Next() {
-		r, err := scanRecord(rows, includeSecret)
-		if err != nil {
-			clearOut()
-			return nil, err
+		var r Record
+		if r, err = scanRecord(rows, includeSecret); err != nil {
+			break
 		}
 		out = append(out, r)
 	}
-	if err := rows.Err(); err != nil {
-		clearOut()
+	if err == nil {
+		err = rows.Err()
+	}
+	if err != nil {
+		for _, r := range out {
+			clear(r.Secret)
+		}
 		return nil, err
 	}
 	return out, nil
 }
 
-func (s *Store) Delete(ref string) error {
-	if err := validateRef(ref); err != nil {
-		return err
-	}
-	column := "name"
-	if ValidID(ref) {
-		column = "id"
-	}
-	res, err := s.DB.Exec("DELETE FROM secrets WHERE "+column+"=?", ref)
+func (s *Store) Delete(id string) error {
+	res, err := s.DB.Exec("DELETE FROM secrets WHERE id=?", id)
 	if err != nil {
 		return err
 	}
 	n, err := res.RowsAffected()
 	if err == nil && n == 0 {
-		return ErrNotFound
+		err = ErrNotFound
 	}
 	return err
-}
-
-func normalizeLeak(leak Leak) Leak {
-	if leak.ReportedAt.IsZero() {
-		leak.ReportedAt = time.Now().UTC()
-	} else {
-		leak.ReportedAt = leak.ReportedAt.UTC()
-	}
-	if leak.Reason == "" {
-		leak.Reason = "reported by agent"
-	}
-	if leak.Attachments == nil {
-		leak.Attachments = []string{}
-	} else {
-		leak.Attachments = append([]string{}, leak.Attachments...)
-	}
-	return leak
-}
-
-func appendLeak(tx *sql.Tx, r Record, leak Leak) (Record, error) {
-	r.Leaks = append(r.Leaks, leak)
-	b, err := json.Marshal(r.Leaks)
-	if err != nil {
-		return Record{}, err
-	}
-	r.UpdatedAt = time.Now().UTC()
-	_, err = tx.Exec("UPDATE secrets SET leaks=?,updated_at=? WHERE id=?", string(b), encodeTime(r.UpdatedAt), r.ID)
-	return r, err
 }
 
 // ReportLeak resolves the referenced pass and reports every pass with the same
@@ -915,37 +723,35 @@ func (s *Store) reportMatches(ref string, secret []byte, leak Leak) ([]Record, e
 		}
 		defer clear(r.Secret)
 		if r.Type != "pass" {
-			return nil, errors.New("TOTP credentials do not support leak reports")
+			return nil, errors.New("only passwords can be reported, not TOTP secrets")
 		}
 		secret = r.Secret
 	}
 	rows, err := tx.Query("SELECT "+selectedColumns(false)+" FROM secrets WHERE type='pass' AND secret=? ORDER BY id", secret)
+	records, err := scanRecords(rows, err, false)
 	if err != nil {
 		return nil, err
 	}
-	records := []Record{}
-	for rows.Next() {
-		r, err := scanRecord(rows, false)
+	if len(records) == 0 {
+		return nil, errors.New("no stored password has that value")
+	}
+	updated := now()
+	if leak.ReportedAt.IsZero() {
+		leak.ReportedAt = updated
+	}
+	leak.ReportedAt = leak.ReportedAt.UTC().Truncate(time.Second)
+	if leak.Reason == "" {
+		leak.Reason = "reported by agent"
+	}
+	leak.Attachments = append([]string{}, leak.Attachments...)
+	for i := range records {
+		records[i].Leaks = append(records[i].Leaks, leak)
+		records[i].UpdatedAt = updated
+		b, err := json.Marshal(records[i].Leaks)
 		if err != nil {
-			rows.Close()
 			return nil, err
 		}
-		records = append(records, r)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if len(records) == 0 {
-		return nil, ErrNotFound
-	}
-	leak = normalizeLeak(leak)
-	for i, r := range records {
-		records[i], err = appendLeak(tx, r, leak)
-		if err != nil {
+		if _, err := tx.Exec("UPDATE secrets SET leaks=?,updated_at=? WHERE id=?", string(b), encodeTime(updated), records[i].ID); err != nil {
 			return nil, err
 		}
 	}
@@ -953,46 +759,4 @@ func (s *Store) reportMatches(ref string, secret []byte, leak Leak) ([]Record, e
 		return nil, err
 	}
 	return records, nil
-}
-
-func (s *Store) GetMeta(key string) (string, error) {
-	var value string
-	err := s.DB.QueryRow("SELECT value FROM meta_state WHERE key=?", key).Scan(&value)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
-	}
-	return value, err
-}
-
-func (s *Store) SetMeta(key, value string) error {
-	_, err := s.DB.Exec("INSERT INTO meta_state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", key, value)
-	return err
-}
-
-// ClaimLecture atomically tests and records the reminder time across processes.
-func (s *Store) ClaimLecture(now time.Time, interval time.Duration) (bool, error) {
-	tx, err := s.DB.Begin()
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	var value string
-	err = tx.QueryRow("SELECT value FROM meta_state WHERE key='lecture_shown_at'").Scan(&value)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, err
-	}
-	if err == nil {
-		previous, parseErr := decodeTime(value)
-		if parseErr == nil && now.Sub(previous) < interval {
-			return false, nil
-		}
-	}
-	_, err = tx.Exec("INSERT INTO meta_state(key,value) VALUES('lecture_shown_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", encodeTime(now))
-	if err != nil {
-		return false, err
-	}
-	if err = tx.Commit(); err != nil {
-		return false, err
-	}
-	return true, nil
 }

@@ -1,12 +1,14 @@
-# Architecture and concurrency
+# Architecture
 
-AG-Secret is a short-lived Go/Cobra CLI. Each invocation unlocks one local SQLite
-vault. Commands receiving secrets hold plaintext in memory only as long as
-needed; pass disclosure requires an explicit option or an allowed output path.
-The CLI never renders a TOTP seed: default view uses `[set]`, even with a
-revealing mask, and the disclosure option only shows the current code. A name
-maps to a random ID that remains stable while its secret and type are unchanged;
-changing either creates a new ID and immediately invalidates the previous ID.
+AG-Secret is a short-lived Go CLI built with Cobra. Each run opens one local
+SQLite vault, does its work and exits. Secret values stay in memory only as
+long as a command needs them. A password is printed only to a terminal, or
+when the user passes an explicit override. The CLI never prints a TOTP seed,
+only its current code.
+
+Each secret has a name and a random ID. The ID stays the same while the value
+and type stay the same. Changing either one assigns a new ID, and the old ID
+stops working at once.
 
 ```mermaid
 flowchart LR
@@ -14,155 +16,159 @@ flowchart LR
   C --> U[Argon2id and authenticated key unwrap]
   U --> S[(Encrypted SQLite and WAL)]
   C --> X[Child command with expanded argv and env]
-  X --> R[Two streaming output filters]
-  R --> O[Output and conditional redaction note]
+  X --> R[Output filter per stream]
+  R --> O[Output, plus a note when values were hidden]
 ```
 
-## SQLite driver choice
+## SQLite driver
 
-| Consideration | Selected: ncruces SQLite + Adiantum, no CGO | C SQLite / SQLCipher via CGO |
+| | Chosen: ncruces SQLite + Adiantum, no CGO | Alternative: SQLCipher via CGO |
 | --- | --- | --- |
-| Developer setup | Go toolchain, no C compiler or native SQLite library | C compiler, native headers/libraries or bundled C sources |
-| Cross compilation | `CGO_ENABLED=0 GOOS=... GOARCH=... go build` | Per-target C toolchain and native library configuration |
-| SQLite transactions | WAL, locks, immediate transactions, busy timeout | Same SQLite primitives, mature native VFS |
-| Encryption | Adiantum VFS, deterministic encrypted disk blocks | SQLCipher can authenticate encrypted pages using HMAC |
-| Portability | Driver supports Linux/macOS/Windows; device integration needs OS code | Build and distribution depend on target native toolchains |
-| Main tradeoff | Go VFS is younger; storage encryption is not tamper authentication | More build and packaging complexity; useful when SQLCipher format/authentication is required |
+| Setup | Go toolchain only | C compiler and native libraries |
+| Cross-compiling | `CGO_ENABLED=0 GOOS=... GOARCH=... go build` | A C toolchain per target |
+| Transactions | WAL, locks, immediate transactions, busy timeout | The same SQLite features, with a more mature native VFS |
+| Encryption | Adiantum VFS; deterministic encrypted blocks | Can authenticate pages with HMAC |
+| Main drawback | Younger VFS; encryption does not detect tampering | More build and packaging work |
 
-This workload consists of small local records and short CLI operations. It does
-not require CGO to support concurrent writers. We retain one driver and one
-format rather than maintaining optional incompatible backends. Benchmark a
-real workload before choosing a different driver for throughput. Switching to
-SQLCipher would require an explicit data migration and additional distribution
-work; no performance or tamper-resistance equivalence is claimed.
+The vault holds a few small records and every operation is short, so CGO buys
+nothing here. We support one driver and one file format rather than several
+incompatible backends. Moving to SQLCipher would need a data migration and
+more release work, and we make no claims about how the two compare in speed or
+tamper resistance.
 
-The selected VFS uses OFD locks on Linux/macOS and LockFileEx on Windows, plus
-shared memory for WAL. Concurrent access must use compatible VFS locking; do
-not mix alternate `sqlite3_flock`/`sqlite3_dotlk` builds on the same database.
-Use a local filesystem with working SQLite locks and shared memory. Network
-filesystems are not a deployment target for this WAL vault.
+The VFS uses OFD locks on Linux and macOS, LockFileEx on Windows, and shared
+memory for the WAL. Every process that opens the vault must use the same
+locking, so do not mix in builds that use `sqlite3_flock` or `sqlite3_dotlk`.
+Keep the vault on a local filesystem; network filesystems are not supported.
 
 ## Transactions
 
-Each process uses `database/sql` with one open connection, a 5 second busy
-timeout and `synchronous=FULL`. Connections use immediate write transactions:
+Each process opens one connection with a 5-second busy timeout and
+`synchronous=FULL`. Writes use immediate transactions, and commands that only
+read never write.
 
-- Put reads the prior record, preserves omitted policies, validates the final
-  type/seed, and changes the ID and clears leak history atomically when the
-  secret or type changes. Submitting the same secret and type, including
-  policy-only updates, retains both the ID and leak history. A duplicate pass
-  value produces a warning identifying the other matching IDs without plaintext;
-  the check includes expired and disabled records.
-- Report resolves a name/ID to its pass value, or takes exact pass plaintext from
-  stdin, then appends the event to every matching pass record in one transaction.
-  Expired and disabled records are included; TOTP records are excluded. Reports
-  never change access policy. The JSON result is always an array of affected
-  records and their full leak histories, including for a single match.
-- Lecture checks and records `lecture_shown_at` together, so concurrent callers
-  do not all print the 12-hour reminder.
-- Reads return a consistent SQLite snapshot. Exec closes the database before
-  launching a child and uses the collected records for that execution.
+- **put** reads the existing secret, keeps the options the user left out, and
+  checks the type and TOTP seed. If the value or type changed, it assigns a new
+  ID and clears the leak reports in the same transaction; option-only changes
+  keep both. If the same password is stored under other IDs, including expired
+  or disabled ones, put warns and lists those IDs.
+- **report** looks up the password for an ID, or takes the leaked value from
+  standard input, and adds the report to every password with that value in a
+  single transaction. Expired and disabled secrets are included; TOTP secrets
+  are not. Reports never change access.
+- **exec** reads all secrets at once, closes the vault, and then starts the
+  command.
 
-Concurrent operations have a serial order. A report before rotation is cleared
-by that rotation for the rotated record. A report using an old ID after rotation
-fails as not found: there is no historical ID alias, generation counter, or
-fingerprint history. An Agent must not retry that report by name, which would
-attribute the old exposure to the new value. Name and plaintext reports match
-values present inside their transaction. All matching records receive the event
-or none do. Reporting has no revoke option; people decide policy changes. A
-policy decision cannot retract an already disclosed value or stop a running
-command.
+Concurrent commands are applied in some serial order. If a secret is replaced
+after a report, the replacement clears that report. A report that uses an old
+ID fails as not found, because old IDs are not kept. Reports accept only IDs,
+never names, so a retried report cannot land on the new value; the error tells
+the agent that a replaced value needs no report. A report reaches either all
+matching secrets or none.
 
-IDs contain 64 random bits; creation checks uniqueness while holding the write
-transaction, with a UNIQUE database constraint as the final guard. IDs identify
-the current value associated with a record and are not authentication capabilities.
-Clients must refresh stored references after a secret or type change.
+IDs are 64 random bits. New IDs are checked for uniqueness inside the write
+transaction, and a UNIQUE constraint backs that up. An ID names the current
+value of a secret; it is not a password or capability.
 
-## Formats and upgrades
+## File formats and upgrades
 
-Schema 2 has `secrets` with ID, type, secret, mask, timestamps, policies and a
-JSON `leaks` array, plus `meta_state`. Each leak has `reported_at`, `reason`,
-`context`, `attachments`. Attachments are path references, not imported files.
-Leak histories have no application-imposed count/size cap or automatic truncation;
-rotation clears the history for that record.
-Version 1 migration is transactional, assigns IDs and preserves data/policies.
-Legacy static `otp` becomes `pass`; a code is not a TOTP seed. A legacy name
-starting with the newly reserved `ags_` prefix remains accessible by its assigned
-ID. Unknown schema versions fail without rewriting them.
+Schema version 2 has a single `secrets` table: name, ID, type, value, mask,
+timestamps (whole seconds), access options, and the leak reports as a JSON
+array. Each report has `reported_at`, `reason`, `context` and `attachments`.
+Attachments are file paths, not copies. Reports are never trimmed, but
+replacing the value clears them. Vaults made by earlier builds may also have an
+unused `meta_state` table and `secrets_expires` index.
 
-New `.unlock` descriptors use version 2: Argon2id time=1, memory=16 MiB,
-parallelism=2; XChaCha20-Poly1305 authenticates the wrapped random database key.
-Version 1 descriptors retain time=3, memory=64 MiB, parallelism=4 to preserve
-access to old databases. Initialization uses exclusive file creation and never
-changes permissions on an existing parent directory.
+Version 1 vaults are migrated in one transaction. The migration assigns IDs
+and keeps values and options. A legacy `otp` secret becomes a password,
+because a stored one-time code is not a seed. A legacy name that starts with
+the now-reserved `ags_` prefix can still be reached through its new ID. Vaults
+with an unknown schema version are refused and left untouched.
 
-Adiantum encrypts database data, rollback/WAL journals and temporary data files.
-It does not authenticate every database page and reveals which blocks change
-between snapshots. `.unlock` authentication does not make the entire database
-tamper-proof. Protect the vault, pass file and backups with filesystem access
-controls. The pass file can decrypt the database, so same-UID access remains a
-trust boundary. Policy flags and reserving permission changes for people are
-workflow rules, not an enforced distinction between human and Agent identities.
-Keeping TOTP seeds out of CLI output does not protect them from same-UID code
-with database or process-memory access. On Windows, use an appropriate private
-directory ACL; Unix permission-bit checks are not an ACL audit.
+The `.unlock` file holds the random database key, encrypted with
+XChaCha20-Poly1305 under a key derived from the passphrase. Version 2 uses
+Argon2id with time 1, 16 MiB of memory and parallelism 2. Version 1 files keep
+their original settings (time 3, 64 MiB, parallelism 4) so older vaults still
+open. `init` creates files exclusively: it never replaces an existing vault or
+pass file, and it never changes the permissions of an existing directory.
 
-## Execution and input boundaries
+Adiantum encrypts the database, its journals and its temporary files. It does
+not authenticate pages, and an observer can see which blocks change between
+copies. The `.unlock` file is authenticated, but that does not make the whole
+database tamper-proof. Protect the vault, the pass file and any backups with
+file permissions. Anyone who can read the pass file can decrypt the vault, so
+programs running as the same user are trusted.
 
-Token expansion is a single pass over argv and environment values; plaintext
-containing another ID is not expanded recursively. An exec snapshots all records
-once and computes one current TOTP value per used credential. Unknown, expired
-or disabled tokens fail before child launch. Passing an ID inside shell source
-explicitly allows the shell to parse the substituted secret; positional
-arguments/environment values avoid that injection surface.
+Access options, and the rule that people rather than agents change them, are
+conventions that guide agents. AG-Secret cannot tell a person from an agent
+running as the same user. Hiding TOTP seeds from the CLI's output likewise does
+not protect them from code that can read the database or process memory. On
+Windows, use a private directory; the Unix permission checks do not audit ACLs.
 
-Each output stream has its own filter and retains only a suffix that could still
-complete a secret (at most the longest pattern minus one byte). Nonmatching short
-prompts are forwarded immediately so a child can wait for input without hiding
-its prompt. A match becomes `[REDACTED:<id>]`; a finite fallback handles the
-rare case where the marker itself contains a secret, ending with deletion if
-necessary. No retry loop grows a marker indefinitely. Filters protect all active
-passwords with at least four bytes, original/canonical TOTP seeds, and actual
-injected values. Short passwords not injected by this invocation are not globally
-filtered. If the same bytes belong to multiple records, one ID from the snapshot
-labels the replacement. For a pass ID, reporting resolves its value and reports
-every current matching pass record, so the label need not enumerate duplicates.
-TOTP IDs are not reportable. The label is not proof of which record was exposed,
-and old IDs cannot be resolved after rotation. Footer text is appended only after
-draining and flushing both streams.
-Exact matching cannot protect encodings, arbitrary transformations, cross-stream
-splits, files, sockets, or direct TTY writes. Exec bounds waiting for inherited
-pipes after direct-child exit with WaitDelay; it is not a process sandbox.
+## exec
 
-Get's Linux check finds the nearest command shell, parsing `/proc/PID/stat` after
-the final `)` to avoid spaces/parentheses in comm. It compares pipe output identity
-against that shell's fd 1 and fd 2. Only a distinct pipe is considered indirect:
-regular-file redirects are ambiguous because a shell child can inherit a redirected
-fd while its parent keeps the original fd, so they fail closed. A consumer can
-still print command-substitution output again; this is an output-routing heuristic,
-not information-flow tracking.
-Other platforms permit terminal output or require the explicit override for
-passwords. TOTP get outputs the short-lived code directly as specified.
+exec replaces IDs in the command's arguments and environment in a single pass,
+so an ID that appears inside a secret's value is never expanded. Text that
+looks like a mistyped ID (`ags_` plus eight or more hex digits that do not form
+a valid ID) is an error rather than being passed through as literal text. IDs
+are also refused in the command name, and in the options and first operand of
+a known shell (the `-c` code or a script path), because the shell would parse
+the value as code. Arguments and environment variables carry the value as
+data. Unknown, expired and disabled IDs fail before the command starts, with
+exit status 125.
 
-Send rejects password control characters before invoking tmux: literal send mode
-does not prevent a terminal from interpreting newlines or interrupt keys. It
-inspects the target tmux TTY with `O_NOCTTY`, rejects ECHO unless overridden,
-then sends literal text and optionally Enter. Echo state and pane identity can
-change between inspection and injection; the receiver is trusted. No real user
-pane is contacted during tests: unit tests use a private PTY and fake tmux
-executable; `make integration` uses a separate real tmux server and temporary
-socket when tmux is installed.
+Standard output and standard error each get their own filter. A filter holds
+back only the bytes that could still turn into a stored value, at most one byte
+less than the longest value, so a short prompt such as `Password:` appears at
+once. A match becomes `[REDACTED:<id>]`. If a secret's value itself contains
+that marker, the filter falls back to shorter markers and finally to removing
+the match entirely; it never loops building a longer marker. The filters cover
+every unexpired password of at least four bytes, every TOTP seed in its stored
+and canonical Base32 forms, and every value this run injected. When several
+secrets share a value, one ID labels the match, and reporting that ID reaches
+all of them. After both streams finish, a note on standard error lists the
+hidden IDs; the note passes through the filter too. Exact matching cannot catch
+encoded or transformed copies, a value split across the two streams, files,
+sockets or direct terminal writes.
 
-## Resource-bounded verification
+exec forwards SIGTERM and SIGHUP to the command. It forwards SIGINT only when
+standard input is not a terminal, because a terminal already sends Ctrl-C to
+the whole foreground process group. The exit status is the command's own, or
+128+N if signal N killed it. After the command exits, exec waits at most two
+seconds for grandchildren still holding its output pipes. exec is not a
+sandbox.
 
-`make test` and `make check` use `scripts/bounded-check.sh`. The wrapper sets
-Go's GC target to 512 MiB, limits concurrency with `GOMAXPROCS=2`, and on Linux
-adds a 2 GiB per-process virtual-memory cap. Compilation uses `-p 1`; tests
-have a 2 minute timeout. `GOMEMLIMIT` alone is not a hard limit, so keep the
-explicit timeout and address-space guard when running checks in CI or locally.
+## get and send
 
-Tests cover RFC vectors, migrations, atomic policy preservation and leak reports,
-process-level SQLite concurrency, pipe identity, real shell capture/substitution,
-private PTY echo flags and exact tmux arguments, streaming chunk boundaries and
-marker collisions. Builds on other target platforms verify compilation, not
-runtime device integration there.
+`get` prints a password only when standard output is a terminal, on every
+platform. Pipes and command substitution are refused, because the program on
+the other end can print the value again, as `echo "$(agsecret get ID)"` would.
+`exec` and `send` deliver a password without printing it. TOTP codes are
+short-lived and are printed anywhere.
+
+`send` refuses passwords with control characters before it runs tmux, because
+tmux's literal mode does not stop the terminal from acting on newlines or
+Ctrl-C. It opens the pane's terminal with `O_NOCTTY` and checks that echo is
+off and canonical (line) input is on. That is the mode password prompts from
+sudo, ssh, psql and getpass use. Shells and REPLs turn echo off too, but they
+read raw keys and echo them themselves, so they fail the check. The terminal
+mode or the pane could still change between the check and the typing, and the
+program reading the password is trusted.
+
+Tests never touch a real tmux session. Unit tests use a private pseudo-terminal
+and a fake tmux; `make integration` starts a separate tmux server on a
+temporary socket when tmux is installed.
+
+## Bounded checks
+
+`make test` and `make check` run through `scripts/bounded-check.sh`. It sets
+`GOMEMLIMIT=512MiB` and `GOMAXPROCS=2` and, on Linux, limits each process to
+2 GiB of virtual memory (override with `VMEM_KB`). Builds use `-p 1` and tests
+time out after 2 minutes. `GOMEMLIMIT` is only a target for the garbage
+collector, so keep the timeout and the memory limit in CI as well.
+
+The tests cover the RFC 6238 vectors, migrations, option handling and leak
+reports under concurrency (including separate processes), terminal modes on a
+private pseudo-terminal, the exact tmux arguments, chunk boundaries in the
+output filter and marker collisions. Cross-compiled builds for other platforms
+only show that the code compiles there.

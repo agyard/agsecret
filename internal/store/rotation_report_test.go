@@ -10,21 +10,21 @@ import (
 
 func TestPutReturnsNewIdentityAndPreservesUnchangedIncident(t *testing.T) {
 	s := newTestStore(t)
-	first, err := s.PutWithOptionsResult(Record{Name: "api", Secret: []byte("first-value"), AllowGet: true, AllowExec: true}, nil)
+	first, err := s.Put(Record{Name: "api", Secret: []byte("first-value"), AllowGet: true, AllowExec: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := s.ReportLeak(first.Record.ID, Leak{Reason: "exposed"}); err != nil {
 		t.Fatal(err)
 	}
-	same, err := s.PutWithOptionsResult(Record{Name: first.Record.ID, Secret: []byte("first-value"), AllowGet: false}, map[string]bool{"allow-get": true})
+	same, err := s.Put(Record{Name: first.Record.ID, Secret: []byte("first-value"), AllowGet: false}, map[string]bool{"allow-get": true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if same.Record.ID != first.Record.ID || len(same.Record.Leaks) != 1 || same.Record.AllowGet || !same.Record.AllowExec {
 		t.Fatal("same value lost identity, history or policy")
 	}
-	rotated, err := s.PutWithOptionsResult(Record{Name: same.Record.ID, Secret: []byte("replacement-value")}, nil)
+	rotated, err := s.Put(Record{Name: same.Record.ID, Secret: []byte("replacement-value")}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,11 +50,11 @@ func TestReportIDAndNameCoverEveryMatchingPass(t *testing.T) {
 	s := newTestStore(t)
 	seed := []byte("JBSWY3DPEHPK3PXP")
 	past := time.Now().Add(-time.Hour)
-	a, err := s.PutWithOptionsResult(Record{Name: "primary", Type: "pass", Secret: seed, AllowGet: true, AllowExec: true}, nil)
+	a, err := s.Put(Record{Name: "primary", Type: "pass", Secret: seed, AllowGet: true, AllowExec: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.PutWithOptionsResult(Record{Name: "retired", Type: "pass", Secret: seed, ExpiresAt: &past}, nil)
+	b, err := s.Put(Record{Name: "retired", Type: "pass", Secret: seed, ExpiresAt: &past}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ func TestReportIDAndNameCoverEveryMatchingPass(t *testing.T) {
 		t.Fatal("duplicate put missing committed matching ID", b.DuplicateIDs)
 	}
 	for _, r := range []Record{{Name: "otp", Type: "totp", Secret: seed}, {Name: "other", Type: "pass", Secret: []byte("unrelated")}} {
-		if err := s.Put(r); err != nil {
+		if _, err := s.Put(r, nil); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -97,7 +97,7 @@ func TestReportIDAndNameCoverEveryMatchingPass(t *testing.T) {
 	if _, err := s.ReportLeak("otp", leak); err == nil {
 		t.Fatal("TOTP report accepted")
 	}
-	if _, err := s.PutWithOptionsResult(Record{Name: a.Record.ID, Secret: []byte("rotated")}, nil); err != nil {
+	if _, err := s.Put(Record{Name: a.Record.ID, Secret: []byte("rotated")}, nil); err != nil {
 		t.Fatal(err)
 	}
 	r, err := s.GetByNameOrID(b.Record.ID, false)
@@ -122,7 +122,7 @@ func TestConcurrentDuplicatePutsObserveEachOther(t *testing.T) {
 		go func(i int, s *Store) {
 			defer wg.Done()
 			<-start
-			r, err := s.PutWithOptionsResult(Record{Name: []string{"first", "second"}[i], Secret: []byte("shared-value")}, nil)
+			r, err := s.Put(Record{Name: []string{"first", "second"}[i], Secret: []byte("shared-value")}, nil)
 			results <- r
 			errs <- err
 		}(i, s)

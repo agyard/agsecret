@@ -2,7 +2,7 @@ package redact
 
 import (
 	"bytes"
-	"sort"
+	"slices"
 )
 
 // Secret associates an exact byte sequence with its public credential ID.
@@ -12,6 +12,7 @@ type Secret struct {
 }
 
 type replacement struct {
+	id     string
 	needle []byte
 	marker []byte
 	used   bool
@@ -21,45 +22,22 @@ type replacement struct {
 // Its retained input is bounded by the longest secret. Each stream owns one
 // Redactor; callers may clear their input secrets after construction.
 type Redactor struct {
-	rules  []replacement
-	maxLen int
-	tail   []byte
+	rules   []replacement
+	byFirst [256][]int // rule indices by first needle byte
+	maxLen  int
+	tail    []byte
 }
 
-// New preserves the unlabelled redactor API for callers without credential IDs.
-func New(needles ...[]byte) *Redactor {
-	secrets := make([]Secret, len(needles))
-	for i, n := range needles {
-		secrets[i].Value = n
-	}
-	return NewWithSecrets(secrets...)
-}
-
-// NewWithSecrets labels replacements with the corresponding stable record ID.
-func NewWithSecrets(secrets ...Secret) *Redactor {
+// New labels replacements with the corresponding credential ID.
+func New(secrets ...Secret) *Redactor {
 	r := &Redactor{}
 	for _, secret := range secrets {
-		if len(secret.Value) == 0 {
+		if len(secret.Value) == 0 || slices.ContainsFunc(r.rules, func(rule replacement) bool { return bytes.Equal(rule.needle, secret.Value) }) {
 			continue
 		}
-		duplicate := false
-		for _, rule := range r.rules {
-			if bytes.Equal(rule.needle, secret.Value) {
-				duplicate = true
-				break
-			}
-		}
-		if duplicate {
-			continue
-		}
-		marker := "[REDACTED]"
-		if secret.ID != "" {
-			marker = "[REDACTED:" + secret.ID + "]"
-		}
-		r.rules = append(r.rules, replacement{needle: bytes.Clone(secret.Value), marker: []byte(marker)})
-		if len(secret.Value) > r.maxLen {
-			r.maxLen = len(secret.Value)
-		}
+		r.byFirst[secret.Value[0]] = append(r.byFirst[secret.Value[0]], len(r.rules))
+		r.rules = append(r.rules, replacement{id: secret.ID, needle: bytes.Clone(secret.Value), marker: []byte("[REDACTED:" + secret.ID + "]")})
+		r.maxLen = max(r.maxLen, len(secret.Value))
 	}
 	for i := range r.rules {
 		// Arbitrary credentials can themselves equal (or occur inside) a
@@ -93,22 +71,16 @@ func (r *Redactor) Close() {
 	r.tail = nil
 }
 
-// Replacements returns the unique markers actually emitted, in stable order.
-// An empty marker denotes the rare case where every visible marker collided
-// with a secret and the matching secret was removed entirely.
-func (r *Redactor) Replacements() []string {
-	seen := make(map[string]bool)
+// Used returns the sorted IDs whose values were replaced.
+func (r *Redactor) Used() []string {
+	var ids []string
 	for _, rule := range r.rules {
 		if rule.used {
-			seen[string(rule.marker)] = true
+			ids = append(ids, rule.id)
 		}
 	}
-	out := make([]string, 0, len(seen))
-	for marker := range seen {
-		out = append(out, marker)
-	}
-	sort.Strings(out)
-	return out
+	slices.Sort(ids)
+	return slices.Compact(ids)
 }
 
 // matchAt delays output only when the remaining input is a proper prefix of
@@ -116,7 +88,8 @@ func (r *Redactor) Replacements() []string {
 func (r *Redactor) matchAt(b []byte, at int, final bool) (best int, pending bool) {
 	best, length := -1, 0
 	remaining := b[at:]
-	for i, rule := range r.rules {
+	for _, i := range r.byFirst[remaining[0]] {
+		rule := r.rules[i]
 		if !final && len(remaining) < len(rule.needle) && bytes.HasPrefix(rule.needle, remaining) {
 			pending = true
 		}
@@ -140,8 +113,9 @@ func (r *Redactor) Feed(chunk []byte, final bool) []byte {
 	clear(r.tail)
 	r.tail = nil
 	defer clear(all)
-	var out []byte
+	out := make([]byte, 0, len(all))
 	start, at := 0, 0
+	replaced := false
 	for at < len(all) {
 		idx, pending := r.matchAt(all, at, final)
 		if pending {
@@ -154,7 +128,7 @@ func (r *Redactor) Feed(chunk []byte, final bool) []byte {
 		rule := &r.rules[idx]
 		out = append(out, all[start:at]...)
 		out = append(out, rule.marker...)
-		rule.used = true
+		rule.used, replaced = true, true
 		at += len(rule.needle)
 		start = at
 	}
@@ -164,8 +138,9 @@ func (r *Redactor) Feed(chunk []byte, final bool) []byte {
 	// different stored secret (for example marker `]` + following `tail`). Drop
 	// the affected output conservatively; this rare pathological case is safer
 	// than emitting a newly constructed credential. The next chunks remain
-	// protected by the same rules.
-	if r.outputContainsNeedle(out, r.tail) {
+	// protected by the same rules. Without a replacement, any needle in out or
+	// across out and tail would already have matched or been held back.
+	if replaced && r.outputContainsNeedle(out, r.tail) {
 		clear(out)
 		clear(r.tail)
 		r.tail = nil

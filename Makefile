@@ -1,7 +1,6 @@
 SHELL := /bin/sh
 GO ?= go
 VERSION ?= dev
-GOMEMLIMIT ?= 512MiB
 TEST_TIMEOUT ?= 2m
 LDFLAGS := -s -w -X github.com/agyard/agsecret/internal/cli.Version=$(VERSION)
 
@@ -12,9 +11,10 @@ build:
 	CGO_ENABLED=0 $(GO) build -p 1 -trimpath -ldflags '$(LDFLAGS)' -o bin/agsecret ./cmd/agsecret
 
 test:
-	GOMEMLIMIT=$(GOMEMLIMIT) CGO_ENABLED=0 sh scripts/bounded-check.sh $(GO) test -p 1 -timeout $(TEST_TIMEOUT) ./...
+	CGO_ENABLED=0 sh scripts/bounded-check.sh $(GO) test -p 1 -timeout $(TEST_TIMEOUT) ./...
 
 check:
+	@unformatted=$$(gofmt -l cmd internal); if [ -n "$$unformatted" ]; then echo "gofmt needed: $$unformatted"; exit 1; fi
 	CGO_ENABLED=0 sh scripts/bounded-check.sh $(GO) vet -p 1 ./...
 
 integration:

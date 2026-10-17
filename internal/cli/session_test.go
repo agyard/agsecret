@@ -16,7 +16,7 @@ func TestInitGeneratesPrivateDefaultPassFile(t *testing.T) {
 	t.Setenv("AGSECRET_DB", "")
 	t.Setenv("AGSECRET_PASS_FILE", "")
 	var out, stderr bytes.Buffer
-	code := Execute(t.Context(), []string{"init"}, strings.NewReader(""), &out, &stderr)
+	code := Execute([]string{"init"}, strings.NewReader(""), &out, &stderr)
 	if code != 0 {
 		t.Fatalf("init exit=%d: %s", code, stderr.String())
 	}
@@ -35,13 +35,13 @@ func TestInitGeneratesPrivateDefaultPassFile(t *testing.T) {
 	if strings.Contains(out.String()+stderr.String(), strings.TrimSpace(string(raw))) {
 		t.Fatal("init disclosed passphrase")
 	}
-	if code := Execute(t.Context(), []string{"doctor", "--json"}, strings.NewReader(""), &out, &stderr); code != 0 {
+	if code := Execute([]string{"doctor", "--json"}, strings.NewReader(""), &out, &stderr); code != 0 {
 		t.Fatalf("doctor: %s", stderr.String())
 	}
 	out.Reset()
 	stderr.Reset()
-	if code := Execute(t.Context(), []string{"init"}, strings.NewReader(""), &out, &stderr); code == 0 {
-		t.Fatal("reinitialized existing vault")
+	if code := Execute([]string{"init"}, strings.NewReader(""), &out, &stderr); code != 0 {
+		t.Fatalf("repeated init: %s", stderr.String())
 	}
 	after, _ := os.ReadFile(pass)
 	if !bytes.Equal(raw, after) {
@@ -56,10 +56,10 @@ func TestInitExternalPassFileNeverFallsBack(t *testing.T) {
 	t.Setenv("AGSECRET_PASS_FILE", "")
 	var out, stderr bytes.Buffer
 	missing := filepath.Join(data, "missing.pass")
-	if code := Execute(t.Context(), []string{"--pass-file", missing, "init"}, strings.NewReader(""), &out, &stderr); code == 0 {
+	if code := Execute([]string{"--pass-file", missing, "init"}, strings.NewReader(""), &out, &stderr); code == 0 {
 		t.Fatal("missing external pass file accepted")
 	}
-	if _, err := os.Stat(secureDefaultPassPath()); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(data, "agsecret", "session.pass")); !os.IsNotExist(err) {
 		t.Fatal("unexpected generated default pass file")
 	}
 }

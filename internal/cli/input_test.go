@@ -20,7 +20,7 @@ func TestOversizedStdinCannotBecomeTruncatedSecret(t *testing.T) {
 		{"report", "--secret-stdin"},
 	} {
 		code, out, errOut := c.call(oversized, args...)
-		if code == 0 || out != "" || !strings.Contains(errOut, "exceeds 1 MiB") {
+		if code == 0 || out != "" || !strings.Contains(errOut, "larger than 1 MiB") {
 			t.Fatalf("oversized input was not rejected: %v code=%d out bytes=%d err=%q", args, code, len(out), errOut)
 		}
 	}
@@ -36,7 +36,7 @@ func TestFileAndStdinUseTheSameInputRules(t *testing.T) {
 		if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
 			t.Fatal(err)
 		}
-		stdin, stdinErr := readSecret(nil, true, "", strings.NewReader(raw))
+		stdin, stdinErr := readSecretInput(strings.NewReader(raw), true)
 		file, fileErr := readPassFile(path)
 		if (stdinErr == nil) != (fileErr == nil) || !bytes.Equal(stdin, file) {
 			t.Fatalf("file and stdin differ for %d bytes: %v / %v", len(raw), stdinErr, fileErr)
