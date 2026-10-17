@@ -1,7 +1,7 @@
 # AG-Secret
 
+[![CI](https://github.com/agyard/agsecret/actions/workflows/ci.yml/badge.svg)](https://github.com/agyard/agsecret/actions/workflows/ci.yml)
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
-[![CGO disabled](https://img.shields.io/badge/CGO-disabled-success)](docs/architecture.md#sqlite-driver-choice)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
 A local credential vault for AI agent workflows. Store passwords and TOTP seeds in encrypted SQLite, then let agents use credential IDs instead of handling raw secrets. `agsecret exec` resolves those IDs when starting a command and redacts matching values from its output.
@@ -116,6 +116,15 @@ make integration  # Optional end-to-end checks on Linux with Python 3
 Checks limit Go concurrency and memory, with a 2 GiB per-process virtual-memory cap on Linux and a 2-minute Go test timeout. Integration tests use synthetic credentials, a temporary vault, a loopback HTTP server, and a private tmux socket; tmux checks are skipped when it is unavailable.
 
 Issues and pull requests are welcome at [agyard/agsecret](https://github.com/agyard/agsecret). Include a minimal reproduction using synthetic credentials and run `make test` and `make check` before submitting code changes.
+
+CI runs on pushes to `main` and pull requests. After CI passes on the commit to release, push an annotated version tag:
+
+```sh
+git tag -a vX.Y.Z -m 'Release vX.Y.Z'
+git push origin vX.Y.Z
+```
+
+The release workflow builds Linux, macOS, and Windows archives for amd64 and arm64, with SHA-256 checksums and generated release notes. Prerelease tags such as `v1.0.0-rc.1` do not become `latest`. Never reuse a published tag.
 
 ## License
 

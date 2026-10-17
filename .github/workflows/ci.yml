@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26.x'
+          check-latest: true
+      - name: Check source
+        run: |
+          unformatted=$(sh scripts/bounded-check.sh gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then printf '%s\n' "$unformatted"; exit 1; fi
+          sh scripts/bounded-check.sh go mod tidy
+          git diff --exit-code -- go.mod go.sum
+          make check
+      - name: Test
+        run: make test
+      - name: Test for races
+        env:
+          CGO_ENABLED: '1'
+          GOMEMLIMIT: 512MiB
+          GOMAXPROCS: '2'
+        run: |
+          ulimit -c 0
+          # Race instrumentation needs more address space than the normal wrapper.
+          ulimit -v 4194304
+          go test -race -p 1 -count=1 -timeout 2m ./...
+      - name: Exercise CLI and tmux workflows
+        run: |
+          if ! command -v tmux >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y tmux
+          fi
+          make integration
+      - name: Cross-build release targets
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          for target in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            export GOOS=${target%/*} GOARCH=${target#*/}
+            sh scripts/bounded-check.sh go build -p 1 -trimpath -o "$RUNNER_TEMP/$target/" ./cmd/agsecret
+          done
