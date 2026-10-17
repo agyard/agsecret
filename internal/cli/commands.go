@@ -5,111 +5,132 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 
-	"github.com/agyard/agsecret/internal/redact"
 	"github.com/agyard/agsecret/internal/store"
 	"github.com/agyard/agsecret/internal/totp"
 	"github.com/spf13/cobra"
 )
 
 func newPut(o *options) *cobra.Command {
-	var kind, mask, ttlText, secretFile string
-	var secretStdin, allowGet, allowExec bool
-	c := &cobra.Command{
-		Use:   "put NAME|ID",
-		Short: "Add or update a secret",
+	var kind, ttlText, accessText string
+	var fromStdin bool
+	var c store.Change
+	cmd := &cobra.Command{
+		Use:        "put NAME|ID",
+		SuggestFor: []string{"add", "set", "store", "insert", "update"},
+		Short:      "Add or update a secret",
 		Long: `Add a secret, or update an existing one by name or ID.
 
-The value comes from standard input with --secret-stdin, from a file with
---secret-file, or from a hidden prompt when you run put in a terminal. Avoid
-putting values on the command line, where shell history would keep them.
-A TOTP secret is a Base32 seed or an otpauth://totp/ URI.
+put reads the value from standard input with --stdin, or from a hidden
+prompt when you run it in a terminal. Never type the value itself into a
+command line, because shell history keeps it. With --type totp, the value is
+a Base32 seed or an otpauth://totp/ URI.
 
-When you update a secret, options you leave out keep their current values.
-Changing the value or type gives the secret a new ID and clears its leak
-reports.`,
+To change only the options of an existing secret, pass them without a value,
+for example --ttl 30d or --access exec. Options you leave out keep their
+current values. Changing the value or type gives the secret a new ID, and the
+old ID stops working.`,
 		Example: `  # Store a token from an environment variable
-  printf '%s' "$GITHUB_TOKEN" | agsecret put github --secret-stdin
+  printf '%s' "$GITHUB_TOKEN" | agsecret put github --stdin
 
   # Type a TOTP seed at a hidden prompt; keep it for 30 days
-  agsecret put github-otp --type totp --ttl 30d`,
+  agsecret put github-otp --type totp --ttl 30d
+
+  # Let agents use a secret only through exec and send
+  agsecret put github --access exec`,
+		// Option values are checked here, before any value is read.
 		Args: func(cmd *cobra.Command, args []string) error {
-			if !secretStdin && secretFile == "" && !isTerminal(cmd.InOrStdin()) {
-				return errors.New("no value given; use --secret-stdin or --secret-file, or run put in a terminal to type it")
-			}
-			return cobra.ExactArgs(1)(cmd, args)
-		},
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if _, err := redact.Parse(mask); err != nil {
+			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return err
 			}
-			expires, err := parseTTL(ttlText)
-			if err != nil {
-				return err
+			if cmd.Flags().Changed("type") {
+				c.Type = &kind
 			}
-			var secret []byte
-			switch in := cmd.InOrStdin(); {
-			case secretFile != "":
-				secret, err = readPassFile(secretFile)
-			case secretStdin:
-				secret, err = readSecretInput(in, true)
-			default:
-				secret, err = promptSecret(in, cmd.ErrOrStderr(), "Secret for "+args[0]+": ")
-			}
-			if err != nil {
-				return err
-			}
-			defer clear(secret)
-			return o.withStore(func(s *store.Store) error {
-				changed := map[string]bool{}
-				for _, name := range []string{"type", "mask", "ttl", "allow-get", "allow-exec"} {
-					changed[name] = cmd.Flags().Changed(name)
-				}
-				result, err := s.Put(store.Record{Name: args[0], Type: kind, Mask: mask, Secret: secret, ExpiresAt: expires, AllowGet: allowGet, AllowExec: allowExec}, changed)
+			if cmd.Flags().Changed("ttl") {
+				expires, err := parseTTL(ttlText)
 				if err != nil {
 					return err
 				}
-				if len(result.DuplicateIDs) > 0 {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agsecret: note: the same value is also stored as %s; a leak report on one marks them all\n", strings.Join(result.DuplicateIDs, ", "))
+				c.ExpiresAt = &expires
+			}
+			if cmd.Flags().Changed("access") {
+				get, exec, err := parseAccess(accessText)
+				if err != nil {
+					return err
+				}
+				c.AllowGet, c.AllowExec = &get, &exec
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := o.checkVault(); err != nil {
+				return err
+			}
+			// Without a value source, only options change, so prompt only
+			// when there is nothing else to do.
+			in := cmd.InOrStdin()
+			var err error
+			switch {
+			case fromStdin:
+				c.Secret, err = readValue(in)
+			case c.Type != nil || c.ExpiresAt == nil && c.AllowGet == nil:
+				if !isTerminal(in) {
+					return fmt.Errorf("give the value with --stdin, or run put in a terminal to type it")
+				}
+				c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "Value for "+args[0]+": ")
+			}
+			if err != nil {
+				return err
+			}
+			defer clear(c.Secret)
+			return o.withStore(func(s *store.Store) error {
+				result, err := s.Put(args[0], c)
+				if err != nil {
+					return err
+				}
+				r := result.Record
+				if len(result.Duplicates) > 0 {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agsecret: note: %s has the same value; a leak report on one marks both\n", strings.Join(result.Duplicates, ", "))
 				}
 				if o.json {
-					return encodeJSON(cmd.OutOrStdout(), recordJSON(result.Record))
+					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
 				}
-				_, err = fmt.Fprintf(cmd.OutOrStdout(), "Stored %s (%s)\n", result.Record.Name, result.Record.ID)
+				switch {
+				case result.Created:
+					_, err = fmt.Fprintf(cmd.OutOrStdout(), "Added %s (%s)\n", r.Name, r.ID)
+				case result.PreviousID != "":
+					_, err = fmt.Fprintf(cmd.OutOrStdout(), "Updated %s; its new ID is %s, and %s no longer works\n", r.Name, r.ID, result.PreviousID)
+				default:
+					_, err = fmt.Fprintf(cmd.OutOrStdout(), "Updated %s (%s)\n", r.Name, r.ID)
+				}
 				return err
 			})
 		},
 	}
-	c.Flags().StringVarP(&kind, "type", "t", "pass", "pass (a password) or totp")
-	c.Flags().StringVar(&mask, "mask", redact.DefaultMask, "how view displays a password: fixed[:TEXT], prefix:N, suffix:N, both:N,M, length or hash")
-	c.Flags().StringVar(&ttlText, "ttl", "0", "how long the secret stays valid, such as 12h, 7d or 2w (0 means forever)")
-	c.Flags().StringVar(&secretFile, "secret-file", "", "read the value from a file that only you can read")
-	c.Flags().BoolVar(&secretStdin, "secret-stdin", false, "read the value from standard input (a trailing newline is dropped)")
-	c.Flags().BoolVar(&allowGet, "allow-get", true, "let get print the value")
-	c.Flags().BoolVar(&allowExec, "allow-exec", true, "let exec and send use the value")
-	c.MarkFlagsMutuallyExclusive("secret-stdin", "secret-file")
-	return c
+	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "read the value from standard input (a trailing newline is dropped)")
+	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password or totp")
+	cmd.Flags().StringVar(&ttlText, "ttl", "", "time until the secret expires, such as 12h, 7d or 2w, or 0 for never (default never)")
+	cmd.Flags().StringVar(&accessText, "access", "", "what agents may do: get,exec (the default), exec, get or none")
+	return addJSONFlag(cmd, o)
 }
 
 func parseTTL(v string) (*time.Time, error) {
-	v = strings.TrimSpace(strings.ToLower(v))
-	if v == "" || v == "0" || v == "permanent" || v == "never" {
+	if v == "0" {
 		return nil, nil
 	}
 	d, err := time.ParseDuration(v)
 	// d and w scale a single number: accepting "1h2d" would read "1h2h" as 3 days.
 	var hours time.Duration
-	switch v[len(v)-1] {
-	case 'd':
-		hours = 24
-	case 'w':
-		hours = 7 * 24
+	if v != "" {
+		hours = map[byte]time.Duration{'d': 24, 'w': 7 * 24}[v[len(v)-1]]
 	}
-	if quantity := v[:len(v)-1]; err != nil && hours != 0 {
+	if err != nil && hours != 0 {
+		quantity := v[:len(v)-1]
 		if _, numberErr := strconv.ParseFloat(quantity, 64); numberErr == nil {
 			// ParseDuration rejects trailing characters, infinities and overflow.
 			if d, err = time.ParseDuration(quantity + "h"); d <= 0 || d > time.Duration(1<<63-1)/hours {
@@ -119,120 +140,27 @@ func parseTTL(v string) (*time.Time, error) {
 		}
 	}
 	if err != nil || d <= 0 {
-		return nil, fmt.Errorf("invalid --ttl %q: use 0 for no expiry, or a duration such as 90m, 12h, 7d or 2w", v)
+		return nil, fmt.Errorf("invalid --ttl %q: use a duration such as 90m, 12h, 7d or 2w, or 0 for never", v)
 	}
-	t := nowUTC().Add(d)
+	t := time.Now().Add(d)
 	return &t, nil
 }
 
-// useValue returns the value that action ("get", "exec" or "send") hands out,
-// which is the current code for a TOTP secret. Refusals are the owner's
-// policy, so their messages tell an agent the fix is not its to make.
-func useValue(r store.Record, now time.Time, action string) ([]byte, error) {
-	allowed := r.AllowExec
-	if action == "get" {
-		allowed = r.AllowGet
+func parseAccess(v string) (get, exec bool, err error) {
+	if v == "none" {
+		return false, false, nil
 	}
-	if r.Expired(now) {
-		return nil, fmt.Errorf("%s (%s) has expired; only its owner can renew it", r.Name, r.ID)
+	for part := range strings.SplitSeq(v, ",") {
+		switch part {
+		case "get":
+			get = true
+		case "exec":
+			exec = true
+		default:
+			return false, false, fmt.Errorf("invalid --access %q: use get,exec, exec, get or none", v)
+		}
 	}
-	if !allowed {
-		return nil, fmt.Errorf("%s is disabled for %s (%s); only its owner can enable it", action, r.Name, r.ID)
-	}
-	if r.Type == "totp" {
-		code, err := totp.Generate(string(r.Secret), now)
-		return []byte(code), err
-	}
-	return bytes.Clone(r.Secret), nil
-}
-
-func newGet(o *options) *cobra.Command {
-	var skipCheck bool
-	c := &cobra.Command{Use: "get NAME|ID", Short: "Print a TOTP code, or a password in a terminal",
-		Long: `Print the current code of a TOTP secret, or the value of a password.
-
-Passwords are printed only to a terminal. When the output is captured or
-piped, get refuses; use exec or send to hand a password to a program.`,
-		Annotations: noJSON, Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				r, err := s.GetByNameOrID(args[0], true)
-				if err != nil {
-					return err
-				}
-				defer clear(r.Secret)
-				value, err := useValue(r, nowUTC(), "get")
-				if err != nil {
-					return err
-				}
-				defer clear(value)
-				if r.Type == "pass" && !skipCheck && !isTerminal(cmd.OutOrStdout()) {
-					return fmt.Errorf("not printing password %s (%s) because the output is not a terminal; use agsecret exec or send to pass it to a program", r.Name, r.ID)
-				}
-				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", value)
-				return err
-			})
-		}}
-	c.Flags().BoolVar(&skipCheck, "dangerously-skip-check", false, "print a password even when the output is not a terminal")
-	return c
-}
-
-func newView(o *options) *cobra.Command {
-	return &cobra.Command{Use: "view NAME|ID", Short: "Show details about a secret", Long: "Show a secret's ID, type, status, access, expiry, masked value and leak\nreports. The value itself is never shown.", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return o.withStore(func(s *store.Store) error {
-			r, err := s.GetByNameOrID(args[0], true)
-			if err != nil {
-				return err
-			}
-			defer clear(r.Secret)
-			// Every mask except fixed reveals something about a TOTP seed.
-			value := "[set]"
-			if r.Type == "pass" {
-				if value, err = redact.Apply(r.Mask, r.Secret); err != nil {
-					return err
-				}
-			}
-			if o.json {
-				data := recordJSON(r)
-				data["value"] = value
-				return encodeJSON(cmd.OutOrStdout(), data)
-			}
-			w := newTable(cmd.OutOrStdout())
-			fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\nStatus:\t%s\nAccess:\t%s\nExpires:\t%s\nValue:\t%s\n",
-				r.Name, r.ID, r.Type, recordStatus(r), access(r), expiryText(r.ExpiresAt), safeText(value))
-			for _, leak := range r.Leaks {
-				line := leak.ReportedAt.Format(time.RFC3339) + " " + leak.Reason
-				if leak.Context != "" {
-					line += "; context: " + leak.Context
-				}
-				if len(leak.Attachments) > 0 {
-					line += "; attachments: " + strings.Join(leak.Attachments, ", ")
-				}
-				fmt.Fprintf(w, "Leak:\t%s\n", safeText(line))
-			}
-			return w.Flush()
-		})
-	}}
-}
-
-func expiryText(t *time.Time) string {
-	if t == nil {
-		return "never"
-	}
-	return t.Format(time.RFC3339)
-}
-
-func recordStatus(r store.Record) string {
-	var parts []string
-	if n := len(r.Leaks); n > 0 {
-		parts = append(parts, fmt.Sprintf("leaked (%d)", n))
-	}
-	if r.Expired(nowUTC()) {
-		parts = append(parts, "expired")
-	}
-	if len(parts) == 0 {
-		return "active"
-	}
-	return strings.Join(parts, ", ")
+	return get, exec, nil
 }
 
 func access(r store.Record) string {
@@ -247,84 +175,210 @@ func access(r store.Record) string {
 	return "none"
 }
 
+// useValue returns the value that action ("get", "exec" or "send") hands out,
+// which is the current code for a TOTP secret. Refusals name the exact fix so
+// a person can apply it, and so an agent knows to ask for it.
+func useValue(r store.Record, now time.Time, action string) ([]byte, error) {
+	allowed := r.AllowExec
+	if action == "get" {
+		allowed = r.AllowGet
+	}
+	if r.Expired(now) {
+		return nil, fmt.Errorf("%s (%s) has expired; ask the user to renew it with agsecret put %s --ttl DURATION", r.Name, r.ID, r.Name)
+	}
+	if !allowed {
+		return nil, fmt.Errorf("%s is turned off for %s (%s); ask the user to allow it with agsecret put %s --access get,exec", action, r.Name, r.ID, r.Name)
+	}
+	if r.Type == "totp" {
+		code, err := totp.Generate(string(r.Secret), now)
+		return []byte(code), err
+	}
+	return bytes.Clone(r.Secret), nil
+}
+
+func newGet(o *options) *cobra.Command {
+	var skipCheck bool
+	c := &cobra.Command{
+		Use:   "get NAME|ID",
+		Short: "Print a TOTP code",
+		Long: `Print the current code of a TOTP secret.
+
+get does not print passwords, because the output may end up in front of an
+agent. Programs should receive passwords through exec or send. To see a
+password yourself, add --dangerously-skip-check, for example:
+
+  agsecret get github --dangerously-skip-check | pbcopy`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return o.withStore(func(s *store.Store) error {
+				r, err := s.Get(args[0], true)
+				if err != nil {
+					return err
+				}
+				defer clear(r.Secret)
+				value, err := useValue(r, time.Now(), "get")
+				if err != nil {
+					return err
+				}
+				defer clear(value)
+				if r.Type == "password" && !skipCheck {
+					return fmt.Errorf("%s is a password, and get does not print passwords; use agsecret exec or send to pass it to a program", r.Name)
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", value)
+				return err
+			})
+		},
+	}
+	c.Flags().BoolVar(&skipCheck, "dangerously-skip-check", false, "print a password (for people only, never for agents)")
+	return c
+}
+
+func newView(o *options) *cobra.Command {
+	return addJSONFlag(&cobra.Command{
+		Use:        "view NAME|ID",
+		SuggestFor: []string{"show", "info", "inspect"},
+		Short:      "Show details about a secret",
+		Long:       "Show a secret's ID, type, status, access, expiry and leak reports. The value\nis never shown.",
+		Args:       cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return o.withStore(func(s *store.Store) error {
+				r, err := s.Get(args[0], false)
+				if err != nil {
+					return err
+				}
+				if o.json {
+					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
+				}
+				expires := "never"
+				if r.ExpiresAt != nil {
+					expires = r.ExpiresAt.Local().Format(time.DateTime)
+				}
+				w := newTable(cmd.OutOrStdout())
+				fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\nStatus:\t%s\nAccess:\t%s\nExpires:\t%s\n", r.Name, r.ID, r.Type, status(r), access(r), expires)
+				for _, leak := range r.Leaks {
+					fmt.Fprintf(w, "Leaked:\t%s %s\n", leak.ReportedAt.Local().Format(time.DateTime), safeText(leak.Reason))
+				}
+				return w.Flush()
+			})
+		},
+	}, o)
+}
+
+func status(r store.Record) string {
+	var parts []string
+	if n := len(r.Leaks); n > 0 {
+		parts = append(parts, fmt.Sprintf("leaked (%d)", n))
+	}
+	if r.Expired(time.Now()) {
+		parts = append(parts, "expired")
+	}
+	if len(parts) == 0 {
+		return "active"
+	}
+	return strings.Join(parts, ", ")
+}
+
 func newTable(out io.Writer) *tabwriter.Writer { return tabwriter.NewWriter(out, 0, 0, 2, ' ', 0) }
 
-func printRecords(out io.Writer, records []store.Record) error {
-	w := newTable(out)
-	fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS")
-	for _, r := range records {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.ID, r.Type, recordStatus(r), access(r))
-	}
-	return w.Flush()
-}
-
-func recordsJSON(records []store.Record) []map[string]any {
-	out := make([]map[string]any, 0, len(records))
-	for _, r := range records {
-		out = append(out, recordJSON(r))
-	}
-	return out
-}
-
 func newList(o *options) *cobra.Command {
-	return &cobra.Command{Use: "list", Aliases: []string{"ls"}, Short: "List secrets and their IDs", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		return o.withStore(func(s *store.Store) error {
-			records, err := s.List()
-			if err != nil {
-				return err
-			}
-			if o.json {
-				return encodeJSON(cmd.OutOrStdout(), recordsJSON(records))
-			}
-			return printRecords(cmd.OutOrStdout(), records)
-		})
-	}}
+	return addJSONFlag(&cobra.Command{
+		Use:        "list",
+		Aliases:    []string{"ls"},
+		SuggestFor: []string{"lst", "lsit"},
+		Short:      "List secrets and their IDs",
+		Long:       "List secrets with their IDs, status and access. Leaked or expired secrets\nshould be replaced with agsecret put.",
+		Args:       cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return o.withStore(func(s *store.Store) error {
+				records, err := s.List(false)
+				if err != nil {
+					return err
+				}
+				out := cmd.OutOrStdout()
+				switch {
+				case o.json:
+					return encodeJSON(out, recordsJSON(records))
+				case len(records) == 0:
+					_, err = fmt.Fprintln(out, "No secrets yet. Add one with: agsecret put NAME")
+					return err
+				}
+				w := newTable(out)
+				fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS")
+				for _, r := range records {
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.ID, r.Type, status(r), access(r))
+				}
+				return w.Flush()
+			})
+		},
+	}, o)
 }
 
 func newDelete(o *options) *cobra.Command {
-	return &cobra.Command{Use: "delete NAME|ID", Aliases: []string{"rm"}, Short: "Delete a secret", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		return o.withStore(func(s *store.Store) error {
-			r, err := s.GetByNameOrID(args[0], false)
-			if err != nil {
+	return addJSONFlag(&cobra.Command{
+		Use:        "delete NAME|ID",
+		Aliases:    []string{"rm"},
+		SuggestFor: []string{"remove", "del"},
+		Short:      "Delete a secret",
+		Args:       cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return o.withStore(func(s *store.Store) error {
+				r, err := s.Get(args[0], false)
+				if err != nil {
+					return err
+				}
+				if err := s.Delete(r.ID); err != nil {
+					return err
+				}
+				if o.json {
+					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "Deleted %s (%s)\n", r.Name, r.ID)
 				return err
-			}
-			if err := s.Delete(r.ID); err != nil {
-				return err
-			}
-			if o.json {
-				return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
-			}
-			_, err = fmt.Fprintf(cmd.OutOrStdout(), "Deleted %s (%s)\n", r.Name, r.ID)
-			return err
-		})
-	}}
+			})
+		},
+	}, o)
 }
 
-func newDoctor(o *options) *cobra.Command {
-	return &cobra.Command{Use: "doctor", Short: "Check the vault and list leaked secrets", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
-		return o.withStore(func(s *store.Store) error {
-			records, err := s.List()
-			if err != nil {
-				return err
+func newReport(o *options) *cobra.Command {
+	var reason string
+	c := &cobra.Command{
+		Use:   "report ID",
+		Short: "Report that a password was exposed",
+		Long: `Record that a password was exposed in plain text, for example printed by a
+debug endpoint or written to a log. The report is added to every password with
+the same value. It does not change what agents may do with the secret; the
+user decides whether to replace it.
+
+report takes the ID that was exposed, not a name. If the secret has been
+replaced since then, the exposed value is gone, and there is nothing to report.`,
+		Example: "  agsecret report ID --reason 'printed by a debug endpoint'",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 1 && !store.ValidID(args[0]) {
+				return fmt.Errorf("report takes the exposed ID, not a name, so a report never marks a newer value; run agsecret list to find it")
 			}
-			var leaked []store.Record
-			for _, r := range records {
-				if len(r.Leaks) > 0 {
-					leaked = append(leaked, r)
+			return cobra.ExactArgs(1)(cmd, args)
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return o.withStore(func(s *store.Store) error {
+				records, err := s.Report(args[0], reason)
+				if errors.Is(err, store.ErrNotFound) {
+					return fmt.Errorf("no secret has ID %s; if it was replaced or deleted, the exposed value is gone and needs no report", args[0])
 				}
-			}
-			if o.json {
-				data := o.vaultJSON()
-				data["credentials"], data["leaked"] = len(records), recordsJSON(leaked)
-				return encodeJSON(cmd.OutOrStdout(), data)
-			}
-			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "Vault: %s\nPass file: %s\nSecrets: %d\nLeaked: %d\n", safeText(o.db), safeText(o.passFile), len(records), len(leaked))
-			if len(leaked) == 0 {
-				return nil
-			}
-			fmt.Fprintln(out, "\nReplace these leaked secrets with agsecret put:")
-			return printRecords(out, leaked)
-		})
-	}}
+				if err != nil {
+					return err
+				}
+				if o.json {
+					return encodeJSON(cmd.OutOrStdout(), recordsJSON(records))
+				}
+				names := make([]string, len(records))
+				for i, r := range records {
+					names[i] = fmt.Sprintf("%s (%s)", r.Name, r.ID)
+				}
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "Reported a leak of %s\n", strings.Join(slices.Sorted(slices.Values(names)), ", "))
+				return err
+			})
+		},
+	}
+	c.Flags().StringVar(&reason, "reason", "", "how the password was exposed")
+	return addJSONFlag(c, o)
 }

@@ -16,9 +16,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      GOMEMLIMIT: 512MiB
-      GOMAXPROCS: '2'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -38,7 +35,7 @@ jobs:
           # Race instrumentation needs more address space than the default cap.
           VMEM_KB: '4194304'
         run: sh scripts/bounded-check.sh go test -race -p 1 -count=1 -timeout 2m ./...
-      - name: Exercise CLI and tmux workflows
+      - name: Run end-to-end tests
         run: |
           if ! command -v tmux >/dev/null; then
             sudo apt-get update

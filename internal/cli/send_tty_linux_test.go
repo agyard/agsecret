@@ -83,6 +83,7 @@ case "$1" in
     printf '%s\n' "$AGSECRET_TEST_TMUX_TTY"
     ;;
   send-keys)
+    [ "$#" -eq 3 ] && exit 0  # target check
     printf '%s\n' "$@" >> "$AGSECRET_TEST_TMUX_LOG"
     ;;
   *) exit 33 ;;
@@ -95,9 +96,7 @@ esac
 	t.Setenv("AGSECRET_TEST_TMUX_TTY", ttyPath)
 	t.Setenv("AGSECRET_TEST_TMUX_LOG", logPath)
 	secret := "-pa ss;word"
-	c.ok(secret, "put", "send-test", "--secret-stdin")
-	stored := c.record("view", "send-test")
-	id := stored["id"].(string)
+	id := c.put("send-test", secret)["id"].(string)
 	readLog := func() string {
 		t.Helper()
 		b, err := os.ReadFile(logPath)
@@ -118,7 +117,7 @@ esac
 	assertNoSend := func() {
 		t.Helper()
 		if got := readLog(); got != "" {
-			t.Fatalf("tmux sent a rejected credential: %q", got)
+			t.Fatalf("tmux typed a refused secret: %q", got)
 		}
 	}
 	literal := "send-keys\n-t\ndev:0.1\n-l\n--\n" + secret + "\n"
@@ -128,7 +127,7 @@ esac
 		t.Fatalf("echo check: code=%d out=%q err=%q", code, out, errText)
 	}
 	assertNoSend()
-	if out, errText := c.ok("", "send", "tmux:dev:0.1", id, "--force-echo", "--enter=false"); out != "" || errText != "" {
+	if out, errText := c.ok("", "send", "tmux:dev:0.1", id, "--dangerously-skip-check", "--no-enter"); out != "" || errText != "" {
 		t.Fatalf("send should be quiet: out=%q err=%q", out, errText)
 	}
 	if got := readLog(); got != literal {
@@ -141,19 +140,19 @@ esac
 		t.Fatalf("send with Enter: %q, want %q", got, literal+enter)
 	}
 	resetLog()
-	c.put("send-test", secret, "--allow-exec=false")
-	if code, _, errText := c.call("", "send", "tmux:dev:0.1", id, "--force-echo"); code == 0 || !strings.Contains(errText, "send is disabled") {
+	c.put("send-test", secret, "--access", "get")
+	if code, _, errText := c.call("", "send", "tmux:dev:0.1", id, "--dangerously-skip-check"); code == 0 || !strings.Contains(errText, "send is turned off") {
 		t.Fatalf("policy check: code=%d err=%q", code, errText)
 	}
 	assertNoSend()
 	c.put("expired", "expired-password", "--ttl", "1ns")
-	if code, _, errText := c.call("", "send", "tmux:dev:0.1", "expired"); code == 0 || !strings.Contains(errText, "has expired; only its owner can renew it") {
+	if code, _, errText := c.call("", "send", "tmux:dev:0.1", "expired"); code == 0 || !strings.Contains(errText, "has expired; ask the user to renew it") {
 		t.Fatalf("expiry check: code=%d err=%q", code, errText)
 	}
 	assertNoSend()
 	seed := "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
-	c.ok(seed, "put", "send-otp", "--secret-stdin", "--type", "totp")
-	c.ok("", "send", "tmux:dev:0.1", "send-otp", "--enter=false")
+	c.put("send-otp", seed, "--type", "totp")
+	c.ok("", "send", "tmux:dev:0.1", "send-otp", "--no-enter")
 	got := readLog()
 	prefix := "send-keys\n-t\ndev:0.1\n-l\n--\n"
 	if !strings.HasPrefix(got, prefix) || !strings.HasSuffix(got, "\n") {
@@ -194,17 +193,18 @@ exit 42
 		{"c1", "\u0085"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// put drops one final newline, so control characters go inside.
 			secret := "prefix" + tc.control + "suffix"
 			name := "unsafe-" + tc.name
 			c.put(name, secret)
-			for _, flags := range [][]string{nil, {"--force-echo"}, {"--force-echo", "--enter=false"}} {
+			for _, flags := range [][]string{nil, {"--dangerously-skip-check"}, {"--dangerously-skip-check", "--no-enter"}} {
 				args := append([]string{"send", "tmux:dev:0.1", name}, flags...)
 				code, out, errText := c.call("", args...)
 				if code == 0 || out != "" || !strings.Contains(errText, "contains control characters") || !strings.Contains(errText, "use agsecret exec") {
 					t.Fatalf("unsafe send: flags=%v code=%d out=%q err=%q", flags, code, out, errText)
 				}
 				if strings.Contains(out+errText, secret) {
-					t.Fatal("rejection disclosed the credential")
+					t.Fatal("rejection disclosed the secret")
 				}
 				if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 					t.Fatalf("unsafe value reached tmux: %v", err)

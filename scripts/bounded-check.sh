@@ -1,6 +1,6 @@
 #!/bin/sh
-# Keep a defective test from exhausting the workstation. GOMEMLIMIT is a GC
-# target; the Linux address-space limit is an additional per-process guard.
+# Stop a runaway test from using up the machine. GOMEMLIMIT only guides the
+# garbage collector; on Linux, ulimit -v also caps each process's address space.
 set -eu
 ulimit -c 0
 export GOMEMLIMIT="${GOMEMLIMIT:-512MiB}"

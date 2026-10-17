@@ -51,7 +51,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          test "$(dist/agsecret_linux_amd64_v1/agsecret version)" = "agsecret $RELEASE_TAG"
+          test "$(dist/agsecret_linux_amd64_v1/agsecret --version)" = "agsecret $RELEASE_TAG"
           (cd dist && sha256sum --check checksums.txt)
           flags=(--latest)
           if [[ "$RELEASE_TAG" == *-* ]]; then flags=(--prerelease --latest=false); fi

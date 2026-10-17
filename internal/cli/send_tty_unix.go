@@ -5,6 +5,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"golang.org/x/sys/unix"
 )
@@ -13,6 +14,9 @@ import (
 // input on, as getpass-style prompts do. Shells and REPLs also turn echo off,
 // but they read raw keys and echo them themselves.
 func atPasswordPrompt(path string) (bool, error) {
+	if !strings.HasPrefix(path, "/dev/") {
+		return false, fmt.Errorf("tmux reported %q as the pane's terminal", path)
+	}
 	f, err := os.OpenFile(path, os.O_RDONLY|unix.O_NOCTTY, 0)
 	if err != nil {
 		return false, fmt.Errorf("cannot open the pane's terminal: %w", err)

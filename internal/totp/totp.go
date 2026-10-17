@@ -18,7 +18,7 @@ import (
 	"unicode"
 )
 
-// Config is a decoded TOTP credential. Call Clear when the key is no longer needed.
+// Config is a decoded TOTP secret. Call Clear when the key is no longer needed.
 type Config struct {
 	Key       []byte
 	Algorithm string
@@ -41,11 +41,11 @@ func Parse(seed string) (Config, error) {
 		}
 		q, err := url.ParseQuery(u.RawQuery)
 		if err != nil || len(q["secret"]) != 1 {
-			return Config{}, errors.New("TOTP URI must contain exactly one secret")
+			return Config{}, errors.New("a TOTP URI must have exactly one secret parameter")
 		}
 		for _, name := range []string{"algorithm", "digits", "period"} {
 			if len(q[name]) > 1 {
-				return Config{}, fmt.Errorf("TOTP URI must not repeat %s", name)
+				return Config{}, fmt.Errorf("a TOTP URI must not repeat %s", name)
 			}
 		}
 		seed = q.Get("secret")
@@ -55,18 +55,18 @@ func Parse(seed string) (Config, error) {
 		if d := q.Get("digits"); d != "" {
 			c.Digits, err = strconv.Atoi(d)
 			if err != nil || (c.Digits != 6 && c.Digits != 8) {
-				return Config{}, errors.New("TOTP digits must be 6 or 8")
+				return Config{}, errors.New("TOTP codes must have 6 or 8 digits")
 			}
 		}
 		if p := q.Get("period"); p != "" {
 			c.Period, err = strconv.ParseUint(p, 10, 32)
 			if err != nil || c.Period == 0 || c.Period > 86400 {
-				return Config{}, errors.New("TOTP period must be between 1 and 86400 seconds")
+				return Config{}, errors.New("the TOTP period must be 1 to 86400 seconds")
 			}
 		}
 	}
 	if c.Algorithm != "SHA1" && c.Algorithm != "SHA256" && c.Algorithm != "SHA512" {
-		return Config{}, errors.New("TOTP algorithm must be SHA1, SHA256, or SHA512")
+		return Config{}, errors.New("the TOTP algorithm must be SHA1, SHA256 or SHA512")
 	}
 	seed = strings.Map(func(r rune) rune {
 		if unicode.IsSpace(r) || r == '-' {

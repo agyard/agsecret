@@ -5,18 +5,6 @@ import (
 	"testing"
 )
 
-func TestApplyNeverRevealsWholeSecretForPartialMasks(t *testing.T) {
-	for _, expr := range []string{"prefix:99", "suffix:99", "both:4,99"} {
-		got, err := Apply(expr, []byte("secret"))
-		if err != nil {
-			t.Fatalf("%s: %v", expr, err)
-		}
-		if got == "secret" {
-			t.Fatalf("%s revealed the entire secret", expr)
-		}
-	}
-}
-
 func TestRedactorHandlesChunkBoundariesAndLongestNeedle(t *testing.T) {
 	r := New(Secret{ID: "a", Value: []byte("secret")}, Secret{ID: "b", Value: []byte("secret-long")})
 	defer r.Close()
@@ -35,7 +23,7 @@ func TestRedactorMarkerCannotEqualSecret(t *testing.T) {
 	defer r.Close()
 	got := append(r.Feed([]byte("[REDACTED:a]"), false), r.Feed(nil, true)...)
 	if string(got) == "[REDACTED:a]" {
-		t.Fatal("redaction marker would reveal a credential equal to the marker")
+		t.Fatal("redaction marker would reveal a secret equal to the marker")
 	}
 }
 

@@ -36,7 +36,7 @@ curl receives the real token. If the token appears in the output, it is replaced
 In scripts, pipe the value in instead of typing it:
 
 ```sh
-printf '%s' "$API_TOKEN" | agsecret put api --secret-stdin
+printf '%s' "$API_TOKEN" | agsecret put api --stdin
 ```
 
 ## Using it with an agent
@@ -45,55 +45,60 @@ Tell your agent to run `agsecret --help`. The top of that page is written for ag
 
 In short:
 
-- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints TOTP codes, but prints passwords only to a terminal.
+- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints TOTP codes but never passwords.
 - If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
 - When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret list --json` rather than remember them.
-- `--json` puts JSON on standard output. Warnings and notes go to standard error.
+- `init`, `put`, `list`, `view`, `report` and `delete` accept `--json`. Errors and notes go to standard error.
 - Exit codes: `0` success, `1` error, `2` usage error. `exec` returns the command's own exit code, or `125`, `126` or `127` if agsecret fails or the command cannot be run.
+
+### Seeing a password yourself
+
+`get` refuses to print a password, so an agent cannot read one by accident, whatever kind of terminal it runs in. To see a password yourself, add `--dangerously-skip-check`:
+
+```sh
+agsecret get github --dangerously-skip-check | pbcopy
+```
+
+The flag is for people. The help tells agents never to use options that start with `--dangerously`, but agsecret cannot tell a person from an agent running as the same user, so keep an eye on what your agent runs.
 
 ## Commands
 
 | Command | Description |
 | --- | --- |
 | `init` | Create the vault, or check that an existing vault opens |
-| `put NAME\|ID` | Add or update a secret |
+| `put NAME\|ID` | Add a secret, or change its value or options |
 | `list` | List secrets and their IDs |
 | `view NAME\|ID` | Show details about a secret, but not its value |
-| `get NAME\|ID` | Print a TOTP code, or a password in a terminal |
+| `get NAME\|ID` | Print a TOTP code |
 | `exec -- COMMAND [ARG...]` | Run a command with secrets filled in by ID |
 | `send tmux:PANE NAME\|ID` | Type a secret into a tmux password prompt |
 | `report ID` | Report that a password was exposed |
 | `delete NAME\|ID` | Delete a secret |
-| `doctor` | Check the vault and list leaked secrets |
-| `version` | Print the version |
 
 ## Configuration
 
-By default the vault is `~/.local/share/agsecret/secrets.db` (or under `$XDG_DATA_HOME`), and the random passphrase that unlocks it is in `session.pass` in the same directory. Anyone who can read that file can open the vault.
+By default the vault is `$XDG_DATA_HOME/agsecret/secrets.db` (`~/.local/share/agsecret/secrets.db` if that is unset). `init` puts a random passphrase in a pass file beside it, with the same name ending in `.pass`. Anyone who can read the pass file can open the vault.
 
 | Setting | Flag | Environment variable |
 | --- | --- | --- |
 | Vault | `--db` | `AGSECRET_DB` |
 | Pass file | `--pass-file` | `AGSECRET_PASS_FILE` |
 
-Flags override environment variables. On Unix, pass files and files given to `put --secret-file` must be readable only by you; on Windows, keep them in a private directory.
+Flags override environment variables. On Unix, the pass file must be private to you (`chmod 600`); on Windows, keep it in a private directory.
 
-`put` also sets options for each secret:
+`put` also sets options for each secret. You can change them later without entering the value again:
 
 - `--type totp` stores a TOTP seed (Base32 or an `otpauth://totp/` URI) instead of a password.
-- `--ttl 7d` makes the secret expire (`90m`, `12h`, `2w` and so on; `0` means never).
-- `--mask` controls how `view` displays a password, such as `suffix:4`.
-- `--allow-get=false` and `--allow-exec=false` stop `get`, or `exec` and `send`, from using the secret.
-
-When you update a secret, options you leave out keep their current values.
+- `--ttl 7d` makes the secret expire after seven days. `90m`, `12h` and `2w` also work; `0` means never.
+- `--access exec` lets agents use the secret only through `exec` and `send`. The other choices are `get,exec` (the default), `get` and `none`.
 
 ## Security
 
-The vault is SQLite encrypted with the Adiantum VFS. Its database key is protected by your passphrase through Argon2id and XChaCha20-Poly1305. The encryption hides your data, but it does not detect tampering or rollback.
+The vault is an SQLite database encrypted with Adiantum. Its key is encrypted with XChaCha20-Poly1305, under a key derived from the passphrase with Argon2id. The encryption hides your data, but it does not detect tampering or rollback.
 
-`exec` only hides exact copies of stored values. Encoded or transformed output, files, network traffic and direct terminal writes get through. AG-Secret is not a sandbox: anything that can read the pass file or the memory of agsecret can get the secrets.
+`exec` hides only exact copies of stored values. Encoded copies, files, network traffic and output written straight to the terminal are not hidden. If your agent runs commands in a pseudo-terminal, that terminal is the agent's view, so anything a program writes straight to it reaches the agent. AG-Secret is not a sandbox: any program that can read the pass file or agsecret's memory can get the secrets.
 
-`send` only types into a pane that is waiting at a password prompt, so a password is never typed into a shell by mistake.
+`send` types only into a pane that is waiting at a password prompt, so a password is not typed into a shell by mistake.
 
 [docs/architecture.md](docs/architecture.md) covers the storage format, locking and design decisions.
 
@@ -121,4 +126,4 @@ The release workflow builds archives for Linux, macOS and Windows on amd64 and a
 
 ## License
 
-[Apache License 2.0](LICENSE). The license text is from the [Apache Software Foundation](https://www.apache.org/licenses/LICENSE-2.0.txt).
+[Apache License 2.0](LICENSE).

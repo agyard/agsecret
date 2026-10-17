@@ -37,26 +37,26 @@ func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 	}
 	ids := []string{id, otherID}
 	slices.Sort(ids)
-	if errOut != "[REDACTED:"+otherID+"]\nagsecret: hid the values of "+ids[0]+", "+ids[1]+" in the output above; nothing leaked\n" {
-		t.Fatalf("unused stored credential or note not protected: %q", errOut)
+	if errOut != "[REDACTED:"+otherID+"]\nagsecret: redacted "+ids[0]+", "+ids[1]+" in the output above; this is not a leak\n" {
+		t.Fatalf("unused stored secret or note not protected: %q", errOut)
 	}
 	code, out, errOut = call("silent")
 	if code != 0 || out != "safe output\n" || errOut != "" {
 		t.Fatalf("no-hit output should have no footer: code=%d out=%q err=%q", code, out, errOut)
 	}
 	code, out, errOut = call("large")
-	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "nothing leaked\n") {
+	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "this is not a leak\n") {
 		t.Fatalf("trailing output lost: code=%d output bytes=%d stderr=%q", code, len(out), errOut)
 	}
 	code, out, errOut = call("exit")
-	if code != 7 || !strings.Contains(out, "[REDACTED:"+id+"]") || !strings.Contains(errOut, "hid the values of "+id) {
+	if code != 7 || !strings.Contains(out, "[REDACTED:"+id+"]") || !strings.Contains(errOut, "redacted "+id) {
 		t.Fatalf("exit status or footer: code=%d out=%q err=%q", code, out, errOut)
 	}
 	shortID := c.put("short", "xy")["id"].(string)
 	seedID := c.put("seed", "otpauth://totp/demo?secret=gezdgnbvgy3tqojqgezdgnbvgy3tqojq", "--type", "totp")["id"].(string)
 	code, out, errOut = c.call("", append(append([]string(nil), args...), "seed", shortID)...)
 	want := "[REDACTED:" + shortID + "]|[REDACTED:" + seedID + "]|[REDACTED:" + seedID + "]"
-	if code != 0 || out != want || !strings.Contains(errOut, "hid the values of") || !strings.Contains(errOut, shortID) {
+	if code != 0 || out != want || !strings.Contains(errOut, "redacted") || !strings.Contains(errOut, shortID) {
 		t.Fatalf("short injected pass or URI seed leaked: code=%d out=%q err=%q", code, out, errOut)
 	}
 }
@@ -152,7 +152,7 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	const id = "ags_0123456789abcdef"
 	now := time.Unix(59, 0).UTC()
 	records := map[string]store.Record{
-		id: {ID: id, Type: "pass", Secret: []byte("literal ags_fedcba9876543210"), AllowExec: true},
+		id: {ID: id, Type: "password", Secret: []byte("literal ags_fedcba9876543210"), AllowExec: true},
 	}
 	got, err := expandTokens("prefix="+id+":suffix", records, now, make(map[string][]byte))
 	if err != nil || got != "prefix=literal ags_fedcba9876543210:suffix" {
@@ -167,7 +167,7 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	if _, err := expandTokens("ags_fedcba9876543210", records, now, make(map[string][]byte)); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("missing ID: %v", err)
 	}
-	for _, typo := range []string{"ags_0123456789abcde", "ags_0123456789ABCDEF", id + "0"} {
+	for _, typo := range []string{"ags_0123456789abcde", "ags_0123456789ABCDEF", "AGS_0123456789abcdef", id + "0"} {
 		if _, err := expandTokens("Bearer "+typo, records, now, make(map[string][]byte)); err == nil || !strings.Contains(err.Error(), "not a valid ID") {
 			t.Fatalf("near-miss ID %q: %v", typo, err)
 		}
@@ -201,7 +201,9 @@ func TestShellCode(t *testing.T) {
 		{[]string{"/bin/bash", "-o", "pipefail", "-ec", "script"}, "-o|pipefail|-ec|script"},
 		{[]string{"zsh", "script.sh", "ags_x"}, "script.sh"},
 		{[]string{"fish", "--command=echo"}, "--command=echo"},
-		{[]string{"env", "sh", "-c", "script"}, ""},
+		{[]string{"env", "sh", "-c", "script"}, "-c|script"},
+		{[]string{"timeout", "5", "/bin/bash", "-lc", "script", "arg"}, "-lc|script"},
+		{[]string{"python3", "-c", "code"}, ""},
 	} {
 		if got := strings.Join(shellCode(tc.args), "|"); got != tc.code {
 			t.Fatalf("%v: got %q, want %q", tc.args, got, tc.code)

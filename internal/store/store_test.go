@@ -10,17 +10,19 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/crypto/argon2"
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
-func newTestStore(t *testing.T) *Store {
+const testPass = "test passphrase"
+
+func newTestStore(t *testing.T) (*Store, string) {
 	t.Helper()
-	s, err := Create(filepath.Join(t.TempDir(), "secrets.db"), []byte("test passphrase"))
+	path := filepath.Join(t.TempDir(), "secrets.db")
+	s, err := Create(path, []byte(testPass))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -29,27 +31,26 @@ func newTestStore(t *testing.T) *Store {
 			t.Error(err)
 		}
 	})
-	return s
+	return s, path
 }
 
-func TestEncryptedStoreRoundTripAndWrongPassphrase(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "secrets.db")
-	pass := []byte("test passphrase")
-	s, err := Create(path, pass)
+func ptr[T any](v T) *T { return &v }
+
+// put creates or replaces a password with the given value.
+func put(t *testing.T, s *Store, ref, value string) PutResult {
+	t.Helper()
+	r, err := s.Put(ref, Change{Secret: []byte(value)})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = s.Put(Record{Name: "api", Type: "pass", Mask: "fixed:[set]", Secret: []byte("super-secret"), AllowGet: true, AllowExec: true}, nil); err != nil {
-		t.Fatal(err)
-	}
-	r, err := s.GetByNameOrID("api", false)
-	if err != nil || !ValidID(r.ID) {
-		t.Fatalf("invalid generated ID %q: %v", r.ID, err)
-	}
-	id := r.ID
-	if len(r.Secret) != 0 {
-		t.Fatal("metadata contains secret")
+	return r
+}
+
+func TestEncryptedRoundTripAndWrongPassphrase(t *testing.T) {
+	s, path := newTestStore(t)
+	id := put(t, s, "api", "super-secret").Record.ID
+	if r, err := s.Get("api", false); err != nil || r.ID != id || len(r.Secret) != 0 {
+		t.Fatalf("metadata read: %v %v", r, err)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatal(err)
@@ -64,226 +65,118 @@ func TestEncryptedStoreRoundTripAndWrongPassphrase(t *testing.T) {
 	if _, err := Open(path, []byte("wrong")); err == nil {
 		t.Fatal("wrong passphrase was accepted")
 	}
-	s, err = Open(path, pass)
+	s, err = Open(path, []byte(testPass))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	r, err = s.GetByNameOrID(id, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer clear(r.Secret)
-	if string(r.Secret) != "super-secret" || !r.AllowGet || r.Name != "api" || r.ID != id {
-		t.Fatal("record round trip changed fields")
-	}
-	descriptor, err := os.ReadFile(path + ".unlock")
-	if err != nil {
-		t.Fatal(err)
+	r, err := s.Get(id, true)
+	if err != nil || string(r.Secret) != "super-secret" || r.Type != "password" || !r.AllowGet || !r.AllowExec {
+		t.Fatalf("round trip: %+v %v", r, err)
 	}
 	var u unlockDescriptor
-	if err := json.Unmarshal(descriptor, &u); err != nil || u.Version != 2 {
-		t.Fatal("new descriptor does not use KDF version 2")
+	if b, err := os.ReadFile(path + ".unlock"); err != nil || json.Unmarshal(b, &u) != nil || u.Version != 2 {
+		t.Fatal("unexpected .unlock format")
 	}
 }
 
-func TestLegacyUnlockDescriptorRemainsReadable(t *testing.T) {
-	pass := []byte("legacy passphrase")
-	key := bytes.Repeat([]byte{17}, 32)
-	defer clear(key)
-	u := unlockDescriptor{Version: 1, Salt: bytes.Repeat([]byte{23}, 16), Nonce: bytes.Repeat([]byte{42}, chacha20poly1305.NonceSizeX)}
-	derived := argon2.IDKey(pass, u.Salt, 3, 64*1024, 4, 32)
-	aead, err := chacha20poly1305.NewX(derived)
-	clear(derived)
-	if err != nil {
+func TestIDsChangeWithTheValue(t *testing.T) {
+	s, _ := newTestStore(t)
+	first := put(t, s, "api", "first-value")
+	if !first.Created || !ValidID(first.Record.ID) {
+		t.Fatalf("create: %+v", first)
+	}
+	if _, err := s.Report(first.Record.ID, "exposed"); err != nil {
 		t.Fatal(err)
 	}
-	u.Wrapped = aead.Seal(nil, u.Nonce, key, []byte("agsecret-store-v1"))
-	descriptor, err := json.Marshal(u)
-	if err != nil {
+	same, err := s.Put(first.Record.ID, Change{AllowGet: ptr(false)})
+	if err != nil || same.Record.ID != first.Record.ID || same.PreviousID != "" || len(same.Record.Leaks) != 1 || same.Record.AllowGet || !same.Record.AllowExec {
+		t.Fatalf("option change lost identity, reports or options: %+v %v", same, err)
+	}
+	replaced := put(t, s, "api", "second-value")
+	if replaced.PreviousID != first.Record.ID || replaced.Record.ID == first.Record.ID || len(replaced.Record.Leaks) != 0 || replaced.Record.AllowGet {
+		t.Fatalf("replacement: %+v", replaced)
+	}
+	for _, ref := range []string{first.Record.ID, "ags_ffffffffffffffff"} {
+		if _, err := s.Get(ref, false); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s resolves: %v", ref, err)
+		}
+		if _, err := s.Report(ref, "late"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("stale report on %s: %v", ref, err)
+		}
+		if _, err := s.Put(ref, Change{Secret: []byte("x")}); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("put by unknown ID %s: %v", ref, err)
+		}
+	}
+	if _, err := s.Put("new", Change{AllowGet: ptr(false)}); err == nil || !strings.Contains(err.Error(), "needs a value") {
+		t.Fatalf("option change on a missing secret: %v", err)
+	}
+	for _, bad := range []string{"ags_reserved", "AGS_0123456789abcdef", "with space", ""} {
+		if _, err := s.Put(bad, Change{Secret: []byte("x")}); err == nil {
+			t.Fatalf("name %q accepted", bad)
+		}
+	}
+	if err := s.Delete(replaced.Record.ID); err != nil {
 		t.Fatal(err)
 	}
-	unwrapped, err := unwrapPassphrase(pass, descriptor)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer clear(unwrapped)
-	if !bytes.Equal(unwrapped, key) {
-		t.Fatal("legacy unlock descriptor no longer opens its database key")
+	if _, err := s.Get("api", false); !errors.Is(err, ErrNotFound) {
+		t.Fatal("delete did not delete")
 	}
 }
 
-func TestIDsAndLookup(t *testing.T) {
-	s := newTestStore(t)
-	ids := map[string]bool{}
-	for _, name := range []string{"api", "mail", "database"} {
-		if _, err := s.Put(Record{Name: name, Secret: []byte("test-value")}, nil); err != nil {
-			t.Fatal(err)
-		}
-		r, err := s.GetByNameOrID(name, false)
-		if err != nil || !ValidID(r.ID) || ids[r.ID] {
-			t.Fatalf("invalid or repeated ID %q, err %v", r.ID, err)
-		}
-		ids[r.ID] = true
-		byID, err := s.GetByNameOrID(r.ID, false)
-		if err != nil || byID.Name != name {
-			t.Fatal("ID lookup failed")
-		}
-		if _, err := s.Put(Record{Name: r.ID, Secret: []byte("rotated-value")}, nil); err != nil {
-			t.Fatal(err)
-		}
-		rotated, err := s.GetByNameOrID(name, false)
-		if err != nil || rotated.ID == r.ID {
-			t.Fatal("secret rotation did not replace identity")
-		}
-		if _, err := s.GetByNameOrID(r.ID, false); !errors.Is(err, ErrNotFound) {
-			t.Fatal("old ID still resolves after secret rotation")
+func TestTypesExpiryAndTOTP(t *testing.T) {
+	s, _ := newTestStore(t)
+	past := time.Now().Add(-time.Second)
+	r, err := s.Put("otp", Change{Secret: []byte("JBSWY3DPEHPK3PXP"), Type: ptr("totp"), ExpiresAt: ptr(&past)})
+	if err != nil || !r.Record.Expired(time.Now()) || !r.Record.ExpiresAt.Equal(past.Truncate(time.Second)) {
+		t.Fatalf("expiry: %+v %v", r, err)
+	}
+	if _, err := s.Report("otp", "x"); err == nil {
+		t.Fatal("TOTP report accepted")
+	}
+	for _, kind := range []string{"pass", "otp"} {
+		if _, err := s.Put("bad", Change{Secret: []byte("123456"), Type: ptr(kind)}); err == nil {
+			t.Fatalf("type %q accepted", kind)
 		}
 	}
-	if _, err := s.Put(Record{Name: "ags_ffffffffffffffff", Secret: []byte("bad")}, nil); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("new ID used as a name: %v", err)
-	}
-	if _, err := s.Put(Record{Name: "ags_reserved", Secret: []byte("bad")}, nil); err == nil {
-		t.Fatal("reserved name allowed")
-	}
-	for _, bad := range []string{"ags_123", "ags_0123456789abcdeF", "agsecret://v1/api", "{{agsecret:api}}"} {
-		if ValidID(bad) {
-			t.Errorf("invalid ID %q accepted", bad)
-		}
-	}
-	r, err := s.GetByNameOrID("api", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Delete(r.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.GetByNameOrID("api", false); !errors.Is(err, ErrNotFound) {
-		t.Fatal("delete by ID did not delete credential")
+	if _, err := s.Put("bad", Change{Secret: []byte("not-a-seed!"), Type: ptr("totp")}); err == nil {
+		t.Fatal("invalid TOTP seed accepted")
 	}
 }
 
-func TestStoreExpiryAndTOTPValidation(t *testing.T) {
-	s := newTestStore(t)
-	expires := time.Now().UTC().Add(-time.Second)
-	if _, err := s.Put(Record{Name: "old", Type: "totp", Secret: []byte("JBSWY3DPEHPK3PXP"), ExpiresAt: &expires}, nil); err != nil {
-		t.Fatal(err)
+func TestReportsReachEveryCopy(t *testing.T) {
+	s, _ := newTestStore(t)
+	a := put(t, s, "primary", "shared-value")
+	past := time.Now().Add(-time.Hour)
+	b, err := s.Put("retired", Change{Secret: []byte("shared-value"), ExpiresAt: ptr(&past), AllowExec: ptr(false)})
+	if err != nil || !slices.Equal(b.Duplicates, []string{"primary"}) {
+		t.Fatalf("duplicate names: %+v %v", b, err)
 	}
-	r, err := s.GetByNameOrID("old", false)
-	if err != nil || !r.Expired(time.Now().UTC()) {
-		t.Fatalf("expiry not preserved: %v", err)
-	}
-	if _, err := s.ReportLeak("old", Leak{}); err == nil {
-		t.Fatal("TOTP leak report was accepted")
-	}
-	if _, err := s.ReportSecret([]byte("JBSWY3DPEHPK3PXP"), Leak{}); err == nil {
-		t.Fatalf("TOTP seed matched report: %v", err)
-	}
-	for _, r := range []Record{{Name: "invalid", Type: "totp", Secret: []byte("not-a-valid-seed!")}, {Name: "legacy", Type: "otp", Secret: []byte("123456")}} {
-		if _, err := s.Put(r, nil); err == nil {
-			t.Fatal("invalid credential accepted")
+	put(t, s, "other", "unrelated")
+	for i, ref := range []string{a.Record.ID, "retired"} {
+		records, err := s.Report(ref, "exposed")
+		if err != nil || len(records) != 2 {
+			t.Fatalf("report via %s: %v %v", ref, records, err)
+		}
+		for _, r := range records {
+			if len(r.Leaks) != i+1 || r.Leaks[i].Reason != "exposed" {
+				t.Fatalf("reports: %+v", r)
+			}
+			if r.Name == "retired" && r.AllowExec {
+				t.Fatal("report changed access")
+			}
 		}
 	}
-}
-
-func TestLeakHistoryAndAtomicRotationOptions(t *testing.T) {
-	s := newTestStore(t)
-	expires := time.Now().UTC().Add(time.Hour)
-	if _, err := s.Put(Record{Name: "api", Type: "pass", Secret: []byte("original"), Mask: "fixed:configured", ExpiresAt: &expires, AllowGet: true, AllowExec: true}, nil); err != nil {
-		t.Fatal(err)
+	if r, _ := s.Get("other", false); len(r.Leaks) != 0 {
+		t.Fatal("unrelated secret reported")
 	}
-	r, err := s.GetByNameOrID("api", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := Leak{ReportedAt: time.Now().UTC(), Reason: "log exposure", Context: "command output", Attachments: []string{"shot.png", "run.log"}}
-	reports, err := s.ReportLeak(r.ID, first)
-	if err != nil || len(reports) != 1 || len(reports[0].Leaks) != 1 {
-		t.Fatalf("first report: %v", err)
-	}
-	reports, err = s.ReportLeak("api", Leak{})
-	if err != nil || len(reports) != 1 || len(reports[0].Leaks) != 2 || !reports[0].AllowGet || !reports[0].AllowExec {
-		t.Fatalf("append or policy mutation failed: %v", err)
-	}
-	r = reports[0]
-	if r.Leaks[0].Context != first.Context || len(r.Leaks[0].Attachments) != 2 || r.Leaks[1].Reason != "reported by agent" {
-		t.Fatal("leak metadata changed")
-	}
-	if _, err := s.Put(Record{Name: r.ID, Secret: []byte("original"), AllowGet: false}, map[string]bool{"allow-get": true}); err != nil {
-		t.Fatal(err)
-	}
-	policyOnly, err := s.GetByNameOrID("api", false)
-	if err != nil || policyOnly.ID != r.ID || len(policyOnly.Leaks) != 2 {
-		t.Fatal("policy-only put unexpectedly changed ID or cleared leaks")
-	}
-	r = policyOnly
-	oldID := r.ID
-	if _, err := s.Put(Record{Name: r.ID, Secret: []byte("rotated"), AllowGet: true, AllowExec: true}, map[string]bool{}); err != nil {
-		t.Fatal(err)
-	}
-	rotated, err := s.GetByNameOrID("api", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rotated.Leaks) != 0 || rotated.ID == oldID || rotated.AllowGet || !rotated.AllowExec || rotated.Mask != "fixed:configured" || rotated.ExpiresAt == nil || !rotated.ExpiresAt.Equal(expires.Truncate(time.Second)) {
-		t.Fatal("rotation failed to clear history, replace ID, or preserve omitted options")
-	}
-	if _, err := s.Put(Record{Name: rotated.ID, Secret: []byte("rotated-again"), AllowGet: true}, map[string]bool{"allow-get": true, "ttl": true}); err != nil {
-		t.Fatal(err)
-	}
-	r, err = s.GetByNameOrID("api", false)
-	if err != nil || !r.AllowGet || !r.AllowExec || r.ExpiresAt != nil {
-		t.Fatal("explicit policy override not applied")
+	put(t, s, "primary", "rotated")
+	if r, _ := s.Get("retired", false); len(r.Leaks) != 2 {
+		t.Fatal("replacing one password cleared another's reports")
 	}
 }
 
-func TestReportSecretMatchesAllExactValues(t *testing.T) {
-	s := newTestStore(t)
-	for _, name := range []string{"one", "two"} {
-		if _, err := s.Put(Record{Name: name, Secret: []byte("shared-secret")}, nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	records, err := s.ReportSecret([]byte("shared-secret"), Leak{Context: "found in stdout"})
-	if err != nil || len(records) != 2 {
-		t.Fatalf("match failed: %v", err)
-	}
-	for _, r := range records {
-		if len(r.Leaks) != 1 || len(r.Secret) != 0 {
-			t.Fatal("invalid report result")
-		}
-	}
-	if _, err := s.ReportSecret([]byte("shared"), Leak{}); err == nil {
-		t.Fatal("partial secret matched")
-	}
-}
-
-func TestMigrateLegacySchema(t *testing.T) {
-	s := newTestStore(t)
-	const oldSchema = `DROP TABLE secrets;
-CREATE TABLE secrets(name TEXT PRIMARY KEY NOT NULL,type TEXT NOT NULL,secret BLOB NOT NULL,mask TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,expires_at TEXT,allow_get INTEGER NOT NULL DEFAULT 0,allow_tokenize INTEGER NOT NULL DEFAULT 1,allow_redact INTEGER NOT NULL DEFAULT 1,allow_exec INTEGER NOT NULL DEFAULT 1);
-PRAGMA user_version=1;`
-	if _, err := s.DB.Exec(oldSchema); err != nil {
-		t.Fatal(err)
-	}
-	now := encodeTime(time.Now())
-	if _, err := s.DB.Exec("INSERT INTO secrets(name,type,secret,mask,created_at,updated_at,allow_get,allow_exec) VALUES('legacy','otp',?,'fixed:[set]',?,?,0,1)", []byte("123456"), now, now); err != nil {
-		t.Fatal(err)
-	}
-	if err := checkSchema(s.DB); err != nil {
-		t.Fatal(err)
-	}
-	r, err := s.GetByNameOrID("legacy", true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer clear(r.Secret)
-	if !ValidID(r.ID) || r.Type != "pass" || string(r.Secret) != "123456" || r.AllowGet || !r.AllowExec || len(r.Leaks) != 0 {
-		t.Fatal("migration did not preserve legacy credential")
-	}
-}
-
-func TestCreatePreservesExistingParentPermissions(t *testing.T) {
+func TestCreateIsExclusiveAndPrivate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix permissions")
 	}
@@ -291,25 +184,24 @@ func TestCreatePreservesExistingParentPermissions(t *testing.T) {
 	if err := os.Chmod(dir, 0750); err != nil {
 		t.Fatal(err)
 	}
-	s, err := Create(filepath.Join(dir, "secrets.db"), []byte("pass"))
+	path := filepath.Join(dir, "secrets.db")
+	s, err := Create(path, []byte("pass"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	info, err := os.Stat(dir)
-	if err != nil || info.Mode().Perm() != 0750 {
+	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0750 {
 		t.Fatalf("parent permissions changed: %v", err)
 	}
 	for _, suffix := range []string{"", ".unlock"} {
-		info, err := os.Stat(s.Path + suffix)
-		if err != nil || info.Mode().Perm() != 0600 {
-			t.Fatalf("store file permissions: %v", err)
+		if info, err := os.Stat(path + suffix); err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("file permissions: %v", err)
 		}
 	}
-	if _, err := Create(s.Path, []byte("pass")); !errors.Is(err, os.ErrExist) {
+	if _, err := Create(path, []byte("pass")); !errors.Is(err, os.ErrExist) {
 		t.Fatal("existing database accepted")
 	}
-	if _, err := s.List(); err != nil {
+	if _, err := s.List(false); err != nil {
 		t.Fatal("duplicate creation damaged database")
 	}
 }
@@ -322,13 +214,29 @@ func TestUnlockDescriptorReadLimit(t *testing.T) {
 	if _, err := readUnlockDescriptor(name); err == nil || !strings.Contains(err.Error(), "4096-byte limit") {
 		t.Fatalf("oversized descriptor accepted: %v", err)
 	}
-	want := []byte(`{"version":2}`)
-	if err := os.WriteFile(name, want, 0600); err != nil {
+}
+
+func TestConcurrentDuplicatePutsSeeEachOther(t *testing.T) {
+	first, path := newTestStore(t)
+	second, err := Open(path, []byte(testPass))
+	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := readUnlockDescriptor(name)
-	if err != nil || !bytes.Equal(got, want) {
-		t.Fatalf("small descriptor read failed: %v", err)
+	defer second.Close()
+	var wg sync.WaitGroup
+	results := make([]PutResult, 2)
+	errs := make([]error, 2)
+	for i, s := range []*Store{first, second} {
+		wg.Go(func() {
+			results[i], errs[i] = s.Put([]string{"first", "second"}[i], Change{Secret: []byte("shared-value")})
+		})
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(results[0].Duplicates) + len(results[1].Duplicates); n != 1 {
+		t.Fatalf("concurrent puts saw %d duplicates, want 1", n)
 	}
 }
 
@@ -412,17 +320,11 @@ func TestStoreSubprocess(t *testing.T) {
 	if mode == "" {
 		t.Skip("subprocess helper")
 	}
-	s, err := Open(os.Getenv("AGSECRET_STORE_HELPER_DB"), []byte("test passphrase"))
+	s, err := Open(os.Getenv("AGSECRET_STORE_HELPER_DB"), []byte(testPass))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	// Both put helpers deliberately read the same old policy before the barrier.
-	// Put must retain the other writer's subsequent policy update.
-	r, err := s.GetByNameOrID("api", false)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err := os.WriteFile(os.Getenv("AGSECRET_STORE_HELPER_READY"), []byte("ready"), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -434,52 +336,30 @@ func TestStoreSubprocess(t *testing.T) {
 	switch mode {
 	case "report":
 		for range 6 {
-			if _, err := s.ReportLeak(r.ID, Leak{Reason: "separate process"}); err != nil {
+			if _, err := s.Report("api", "separate process"); err != nil {
 				t.Fatal(err)
 			}
 		}
-	case "put-get":
-		r.Name, r.Secret, r.AllowGet = "api", []byte("rotated-get"), false
-		if _, err := s.Put(r, map[string]bool{"allow-get": true}); err != nil {
-			t.Fatal(err)
-		}
-	case "put-exec":
-		r.Name, r.Secret, r.AllowExec = "api", []byte("rotated-exec"), false
-		if _, err := s.Put(r, map[string]bool{"allow-exec": true}); err != nil {
-			t.Fatal(err)
-		}
+	// Both writers change one option each on the same secret at once; neither
+	// may undo the other's change.
+	case "deny-get":
+		_, err = s.Put("api", Change{AllowGet: ptr(false)})
+	case "deny-exec":
+		_, err = s.Put("api", Change{AllowExec: ptr(false)})
 	default:
 		t.Fatalf("unknown helper mode %q", mode)
 	}
-}
-
-func TestCrossProcessReports(t *testing.T) {
-	s := newTestStore(t)
-	if _, err := s.Put(Record{Name: "api", Secret: []byte("secret-value"), AllowGet: true, AllowExec: true}, nil); err != nil {
-		t.Fatal(err)
-	}
-	runStoreHelpers(t, s.Path, "report", "report")
-	r, err := s.GetByNameOrID("api", false)
-	if err != nil || len(r.Leaks) != 12 {
-		t.Fatalf("cross-process reports lost: count %d, err %v", len(r.Leaks), err)
-	}
-}
-
-func TestConcurrentPutPreservesDifferentPolicyUpdates(t *testing.T) {
-	s := newTestStore(t)
-	if _, err := s.Put(Record{Name: "api", Secret: []byte("original"), AllowGet: true, AllowExec: true}, nil); err != nil {
-		t.Fatal(err)
-	}
-	before, err := s.GetByNameOrID("api", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	runStoreHelpers(t, s.Path, "put-get", "put-exec")
-	after, err := s.GetByNameOrID("api", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if after.AllowGet || after.AllowExec || before.ID == after.ID {
-		t.Fatal("concurrent put lost an independent policy update or failed to replace the ID")
+}
+
+func TestCrossProcessWritesDoNotLoseUpdates(t *testing.T) {
+	s, path := newTestStore(t)
+	put(t, s, "api", "secret-value")
+	runStoreHelpers(t, path, "report", "report", "deny-get", "deny-exec")
+	r, err := s.Get("api", false)
+	if err != nil || len(r.Leaks) != 12 || r.AllowGet || r.AllowExec {
+		t.Fatalf("lost cross-process update: reports=%d get=%v exec=%v err=%v", len(r.Leaks), r.AllowGet, r.AllowExec, err)
 	}
 }

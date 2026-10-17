@@ -1,3 +1,4 @@
+// Package redact hides secret values in a stream of output.
 package redact
 
 import (
@@ -5,7 +6,7 @@ import (
 	"slices"
 )
 
-// Secret associates an exact byte sequence with its public credential ID.
+// Secret is a value to hide and the ID of the secret it belongs to.
 type Secret struct {
 	ID    string
 	Value []byte
@@ -18,7 +19,7 @@ type replacement struct {
 	used   bool
 }
 
-// Redactor replaces exact secret bytes across arbitrary stream boundaries.
+// Redactor replaces exact secret values, even when they span chunk boundaries.
 // Its retained input is bounded by the longest secret. Each stream owns one
 // Redactor; callers may clear their input secrets after construction.
 type Redactor struct {
@@ -28,7 +29,7 @@ type Redactor struct {
 	tail    []byte
 }
 
-// New labels replacements with the corresponding credential ID.
+// New labels replacements with the ID of the matching secret.
 func New(secrets ...Secret) *Redactor {
 	r := &Redactor{}
 	for _, secret := range secrets {
@@ -40,7 +41,7 @@ func New(secrets ...Secret) *Redactor {
 		r.maxLen = max(r.maxLen, len(secret.Value))
 	}
 	for i := range r.rules {
-		// Arbitrary credentials can themselves equal (or occur inside) a
+		// Arbitrary secrets can themselves equal (or occur inside) a
 		// marker. Select from a finite set, ending in an empty replacement,
 		// rather than repeatedly extending a colliding marker.
 		candidates := [][]byte{r.rules[i].marker, []byte("[REDACTED]"), []byte("[hidden]"), []byte("***"), []byte("?"), nil}
@@ -137,7 +138,7 @@ func (r *Redactor) Feed(chunk []byte, final bool) []byte {
 	// A replacement marker can join with adjacent ordinary text and recreate a
 	// different stored secret (for example marker `]` + following `tail`). Drop
 	// the affected output conservatively; this rare pathological case is safer
-	// than emitting a newly constructed credential. The next chunks remain
+	// than emitting a newly constructed secret. The next chunks remain
 	// protected by the same rules. Without a replacement, any needle in out or
 	// across out and tail would already have matched or been held back.
 	if replaced && r.outputContainsNeedle(out, r.tail) {

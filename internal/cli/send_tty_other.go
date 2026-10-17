@@ -5,5 +5,5 @@ package cli
 import "errors"
 
 func atPasswordPrompt(string) (bool, error) {
-	return false, errors.New("send requires Linux, macOS or BSD terminal inspection")
+	return false, errors.New("send works only on Linux, macOS and BSD")
 }

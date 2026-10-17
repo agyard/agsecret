@@ -26,8 +26,9 @@ import (
 
 func newExec(o *options) *cobra.Command {
 	c := &cobra.Command{
-		Use:   "exec -- COMMAND [ARG...]",
-		Short: "Run a command with secrets filled in by ID",
+		Use:        "exec -- COMMAND [ARG...]",
+		SuggestFor: []string{"run"},
+		Short:      "Run a command with secrets filled in by ID",
 		Long: `Run a command, replacing each secret ID in its arguments and environment
 variables with the secret's value (for a TOTP secret, its current code).
 
@@ -45,11 +46,19 @@ interpret the value:
 Environment variables are also safer than arguments, which other users can
 see with ps.
 
-The exit status is the command's own (128+N if signal N killed it). If
-agsecret itself fails, it exits with 125, or with 126 or 127 when the command
-cannot be run or is not found.`,
-		Annotations: noJSON,
-		Args:        cobra.MinimumNArgs(1),
+The command's output goes through a pipe, not the terminal, so programs that
+behave differently in a terminal (pagers, REPLs) may look different.
+
+The exit status is the command's own, or 128+N if signal N killed it. If the
+command cannot be run, agsecret exits with 126, or 127 if it is not found. For
+any other agsecret error, it exits with 125.`,
+		DisableFlagsInUseLine: true,
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return fmt.Errorf("usage: %s", cmd.UseLine())
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			err := runExpanded(o, cmd, args)
 			if _, ok := errors.AsType[*exitError](err); err != nil && !ok {
@@ -64,12 +73,12 @@ cannot be run or is not found.`,
 
 // tokenPattern also matches near-miss IDs so that a mistyped ID fails loudly
 // instead of reaching the command as literal text.
-var tokenPattern = regexp.MustCompile(`\bags_[0-9A-Fa-f]{8,}`)
+var tokenPattern = regexp.MustCompile(`(?i)\bags_[0-9a-f]{8,}`)
 
 // expandTokens performs a single pass so a secret that happens to contain a
 // different record ID is never interpreted recursively.
 func expandTokens(value string, records map[string]store.Record, now time.Time, injected map[string][]byte) (string, error) {
-	if !strings.Contains(value, "ags_") {
+	if !strings.Contains(strings.ToLower(value), "ags_") {
 		return value, nil // Skips the regexp for most environment values.
 	}
 	var b strings.Builder
@@ -102,32 +111,35 @@ func expandTokens(value string, records map[string]store.Record, now time.Time, 
 	return b.String(), nil
 }
 
+var shells = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish"}
+
 // shellCode returns the arguments a known shell parses as code: its options
-// and first operand, which is the -c command string or a script path.
+// and first operand, which is the -c command string or a script path. The
+// shell may follow wrappers such as env, timeout or sudo, so every argument
+// that names a shell starts a check.
 func shellCode(args []string) []string {
-	switch strings.TrimPrefix(filepath.Base(args[0]), "-") {
-	case "sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish":
-	default:
+	start := slices.IndexFunc(args, func(a string) bool { return slices.Contains(shells, filepath.Base(a)) })
+	if start < 0 {
 		return nil
 	}
-	for i := 1; i < len(args); i++ {
+	for i := start + 1; i < len(args); i++ {
 		switch arg := args[i]; {
 		case slices.Contains([]string{"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, arg):
 			i++ // The next argument is this option's value.
 		case !strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "+"):
-			return args[1 : i+1]
+			return args[start+1 : i+1]
 		}
 	}
-	return args[1:]
+	return args[start+1:]
 }
 
 // protectedValues lists what output filtering removes: unexpired passwords of
-// at least four bytes and every encoding of TOTP seeds. Injected values are
-// added by the caller.
+// at least four bytes, and unexpired TOTP seeds as stored and in canonical
+// Base32. The caller adds the values it injects.
 func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, error) {
 	var protected []redact.Secret
 	for _, r := range records {
-		if r.Expired(now) || (r.Type == "pass" && len(r.Secret) < 4) {
+		if r.Expired(now) || (r.Type == "password" && len(r.Secret) < 4) {
 			continue
 		}
 		protected = append(protected, redact.Secret{ID: r.ID, Value: r.Secret})
@@ -139,9 +151,8 @@ func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, er
 			return nil, err
 		}
 		canonical := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(config.Key)
-		padded := base32.StdEncoding.EncodeToString(config.Key)
 		config.Clear()
-		for _, v := range []string{canonical, padded, strings.ToLower(canonical), strings.ToLower(padded)} {
+		for _, v := range []string{canonical, strings.ToLower(canonical)} {
 			protected = append(protected, redact.Secret{ID: r.ID, Value: []byte(v)})
 		}
 		if uri, err := url.Parse(string(r.Secret)); err == nil && strings.EqualFold(uri.Scheme, "otpauth") {
@@ -163,7 +174,7 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 	var records []store.Record
 	err := o.withStore(func(s *store.Store) error {
 		var err error
-		records, err = s.ListWithSecrets()
+		records, err = s.List(true)
 		return err
 	})
 	if err != nil {
@@ -174,7 +185,7 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 			clear(r.Secret)
 		}
 	}()
-	now := nowUTC()
+	now := time.Now()
 	protected, err := protectedValues(records, now)
 	defer func() {
 		for _, secret := range protected {
@@ -207,9 +218,12 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 			continue
 		}
 		if value, err = expandTokens(value, byID, now, injected); err != nil {
-			return err
+			return fmt.Errorf("in environment variable %s: %w", key, err)
 		}
 		env[i] = key + "=" + value
+	}
+	if len(injected) == 0 {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: note: no secret IDs found in the command or environment, so nothing was filled in")
 	}
 	for id, value := range injected {
 		protected = append(protected, redact.Secret{ID: id, Value: value})
@@ -237,11 +251,17 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 		close(signals)
 	}()
 	if err := child.Start(); err != nil {
-		code := 126
 		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
-			code = 127
+			msg := "command not found: " + args[0]
+			if strings.Contains(args[0], " ") {
+				msg += " (pass the command and each argument as separate words)"
+			}
+			return &exitError{code: 127, err: errors.New(msg)}
 		}
-		return &exitError{code: code, err: fmt.Errorf("cannot run %s: %w", args[0], err)}
+		if pe, ok := errors.AsType[*fs.PathError](err); ok {
+			err = pe.Err
+		}
+		return &exitError{code: 126, err: fmt.Errorf("cannot run %s: %w", args[0], err)}
 	}
 	// Relay signals so the command can shut down cleanly. A terminal already
 	// sends Ctrl-C to the whole foreground process group, including the child.
@@ -261,7 +281,7 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 		if stderr.last != '\n' {
 			prefix = "\n"
 		}
-		note := fmt.Sprintf("%sagsecret: hid the values of %s in the output above; nothing leaked\n", prefix, strings.Join(slices.Compact(ids), ", "))
+		note := fmt.Sprintf("%sagsecret: redacted %s in the output above; this is not a leak\n", prefix, strings.Join(slices.Compact(ids), ", "))
 		stderrErr = errors.Join(stderrErr, stderr.emit(stderr.redactor.Feed([]byte(note), true)))
 	}
 	if state := child.ProcessState; state != nil && !state.Success() {
