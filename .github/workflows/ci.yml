@@ -16,6 +16,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      GOMEMLIMIT: 512MiB
+      GOMAXPROCS: '2'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
@@ -34,8 +37,6 @@ jobs:
       - name: Test for races
         env:
           CGO_ENABLED: '1'
-          GOMEMLIMIT: 512MiB
-          GOMAXPROCS: '2'
         run: |
           ulimit -c 0
           # Race instrumentation needs more address space than the normal wrapper.
@@ -52,7 +53,9 @@ jobs:
         env:
           CGO_ENABLED: '0'
         run: |
+          ulimit -c 0
+          ulimit -v 4194304
           for target in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             export GOOS=${target%/*} GOARCH=${target#*/}
-            sh scripts/bounded-check.sh go build -p 1 -trimpath -o "$RUNNER_TEMP/$target/" ./cmd/agsecret
+            go build -p 1 -trimpath -o "$RUNNER_TEMP/$target/" ./cmd/agsecret
           done
