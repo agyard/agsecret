@@ -154,11 +154,12 @@ its output pipes. exec is not a sandbox.
 
 ## get and send
 
-`get` on Linux finds the nearest shell running `-c`, using the final `)` to
+`get` on Linux finds the nearest shell (interactive, script or `-c`), using the final `)` to
 parse `/proc/PID/stat` even if the process name contains parentheses. A pipe
 different from that shell's stdout and stderr is treated as an indirect pipe
 or command substitution. Direct capture and regular-file redirection are
-refused. Without a command-shell ancestor, terminal output is permitted; other
+refused. For terminal output it instead checks for any `-c` shell ancestor;
+without one, terminal output is permitted. Other
 platforms allow terminal output or require `--dangerously-skip-check`.
 TOTP codes bypass this output-context check. The consumer's output is never
 filtered, and an indirect consumer can print the password again. Process and

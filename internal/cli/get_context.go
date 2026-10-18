@@ -20,19 +20,15 @@ const capturedOutputRefusal = `refused to print a password directly to captured 
 // is rejected. This is a context check, not a security boundary: callers that
 // can inspect the process or rewrite the value can still defeat it.
 func trustedTerminal(out io.Writer) error {
+	terminal := isTerminalWriter(out)
 	if runtime.GOOS == "linux" {
-		pid, err := shellCommandAncestor(os.Getppid(), os.ReadFile)
-		if err != nil {
-			return &exitError{code: 2, err: errors.New(capturedOutputRefusal)}
+		// Pipes belong to the nearest shell, whether interactive, scripted or
+		// running -c. Terminal output still refuses any command-shell ancestor.
+		pid, err := shellAncestor(os.Getppid(), terminal, os.ReadFile)
+		if err == nil && (terminal && pid == 0 || !terminal && pid != 0 && isIndirectOutput(out, pid)) {
+			return nil
 		}
-		if pid != 0 {
-			if isIndirectOutput(out, pid) {
-				return nil
-			}
-			return &exitError{code: 2, err: errors.New(capturedOutputRefusal)}
-		}
-	}
-	if isTerminalWriter(out) {
+	} else if terminal {
 		return nil
 	}
 	return &exitError{code: 2, err: errors.New(capturedOutputRefusal)}
@@ -81,10 +77,9 @@ func parseParentPID(stat string) (int, error) {
 	return pid, nil
 }
 
-// shellCommandAncestor finds a shell running -c in the process ancestry.
-// Interactive shells and shells executing a script are not considered a
-// capture context, so a human can still run get at a terminal.
-func shellCommandAncestor(pid int, readFile func(string) ([]byte, error)) (int, error) {
+// shellAncestor finds the nearest shell, or only shells running -c when
+// commandOnly is true. Skipping an inner shell would compare the wrong pipes.
+func shellAncestor(pid int, commandOnly bool, readFile func(string) ([]byte, error)) (int, error) {
 	seen := make(map[int]bool)
 	for pid > 0 {
 		if seen[pid] || len(seen) >= 4096 {
@@ -95,7 +90,8 @@ func shellCommandAncestor(pid int, readFile func(string) ([]byte, error)) (int, 
 		if err != nil {
 			return 0, err
 		}
-		if isShellCommand(strings.Split(string(cmdline), "\x00")) {
+		args := strings.Split(string(cmdline), "\x00")
+		if len(shellArgs(args)) > 0 && (!commandOnly || isShellCommand(args)) {
 			return pid, nil
 		}
 		if pid == 1 {
@@ -113,9 +109,9 @@ func shellCommandAncestor(pid int, readFile func(string) ([]byte, error)) (int, 
 	return 0, nil
 }
 
-func isShellCommand(args []string) bool {
+func shellArgs(args []string) []string {
 	if len(args) == 0 {
-		return false
+		return nil
 	}
 	name := strings.TrimPrefix(strings.ToLower(filepathBase(args[0])), "-")
 	if name == "busybox" && len(args) > 1 {
@@ -124,9 +120,14 @@ func isShellCommand(args []string) bool {
 	}
 	switch name {
 	case "sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish":
+		return args
 	default:
-		return false
+		return nil
 	}
+}
+
+func isShellCommand(args []string) bool {
+	args = shellArgs(args)
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--command" || strings.HasPrefix(arg, "--command=") {

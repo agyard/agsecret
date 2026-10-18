@@ -5,6 +5,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,7 +41,7 @@ func TestGetShellContexts(t *testing.T) {
 	const value = "synthetic-get-context-value"
 	id := c.put("context-test", value)["id"].(string)
 	const get = `"$AGSECRET_TEST_GET_BINARY" -test.run='^TestGetProcessHelper$' -- get "$AGSECRET_TEST_GET_ID"`
-	for _, tc := range []struct {
+	cases := []struct {
 		name, script string
 		allowed      bool
 	}{
@@ -49,41 +50,57 @@ func TestGetShellContexts(t *testing.T) {
 		{"command substitution", `value=$(` + get + `); status=$?; [ "$status" -eq 0 ] || exit "$status"; [ "$value" = "$AGSECRET_TEST_GET_VALUE" ] || exit 21; printf 'accepted\n'`, true},
 		{"inner pipeline", get + ` | { IFS= read -r value; [ "$value" = "$AGSECRET_TEST_GET_VALUE" ] || exit 21; printf 'accepted\n'; }`, true},
 		{"file redirect", get + ` > "$AGSECRET_TEST_GET_FILE"; status=$?; exit "$status"`, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			capture := filepath.Join(t.TempDir(), "capture")
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			defer cancel()
-			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", tc.script)
-			cmd.WaitDelay = time.Second
-			cmd.Env = append(os.Environ(),
-				"AGSECRET_TEST_GET_HELPER=1", "AGSECRET_TEST_GET_BINARY="+binary,
-				"AGSECRET_TEST_GET_DB="+c.db, "AGSECRET_TEST_GET_PASS="+c.pass,
-				"AGSECRET_TEST_GET_ID="+id, "AGSECRET_TEST_GET_VALUE="+value,
-				"AGSECRET_TEST_GET_FILE="+capture)
-			var out, errOut bytes.Buffer
-			cmd.Stdout, cmd.Stderr = &out, &errOut
-			err := cmd.Run()
-			if ctx.Err() != nil {
-				t.Fatalf("shell context check timed out: %v", ctx.Err())
-			}
-			if tc.allowed {
-				if err != nil || out.String() != "accepted\n" || errOut.Len() != 0 {
-					t.Fatalf("indirect get failed: err=%v out=%q stderr=%q", err, out.String(), errOut.String())
+	}
+	for _, mode := range []string{"command", "stdin", "interactive", "nested capture"} {
+		for _, tc := range cases {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				capture := filepath.Join(t.TempDir(), "capture")
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				args := []string{"/bin/sh", "-c", tc.script}
+				if mode == "stdin" {
+					args = []string{"/bin/sh"}
+				} else if mode == "interactive" {
+					args = []string{"/bin/sh", "-i"}
+				} else if mode == "nested capture" {
+					// Keep the outer -c shell's descriptors distinct from the inner
+					// stdin shell. Direct inner output must still be refused.
+					args = []string{"/bin/sh", "-c", `result=$(/bin/sh); status=$?; [ -z "$result" ] || printf '%s\n' "$result"; exit "$status"`}
 				}
-			} else if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 2 || out.Len() != 0 || !strings.Contains(errOut.String(), "refused to print a password directly") {
-				t.Fatalf("direct get was not refused: err=%v out=%q stderr=%q", err, out.String(), errOut.String())
-			}
-			if strings.Contains(out.String()+errOut.String(), value) {
-				t.Fatal("the shell exposed the synthetic password")
-			}
-			if tc.name == "file redirect" {
-				data, err := os.ReadFile(capture)
-				if err != nil || len(data) != 0 {
-					t.Fatalf("file redirect was not refused: bytes=%d err=%v", len(data), err)
+				cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+				if mode != "command" {
+					cmd.Stdin = strings.NewReader(tc.script + "\n")
 				}
-			}
-		})
+				cmd.WaitDelay = time.Second
+				cmd.Env = append(os.Environ(),
+					"AGSECRET_TEST_GET_HELPER=1", "AGSECRET_TEST_GET_BINARY="+binary,
+					"AGSECRET_TEST_GET_DB="+c.db, "AGSECRET_TEST_GET_PASS="+c.pass,
+					"AGSECRET_TEST_GET_ID="+id, "AGSECRET_TEST_GET_VALUE="+value,
+					"AGSECRET_TEST_GET_FILE="+capture)
+				var out, errOut bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &out, &errOut
+				err := cmd.Run()
+				if ctx.Err() != nil {
+					t.Fatalf("shell context check timed out: %v", ctx.Err())
+				}
+				if tc.allowed {
+					if err != nil || out.String() != "accepted\n" || (mode != "interactive" && errOut.Len() != 0) {
+						t.Fatalf("indirect get failed: err=%v out=%q stderr=%q", err, out.String(), errOut.String())
+					}
+				} else if cmd.ProcessState == nil || cmd.ProcessState.ExitCode() != 2 || out.Len() != 0 || !strings.Contains(errOut.String(), "refused to print a password directly") {
+					t.Fatalf("direct get was not refused: err=%v out=%q stderr=%q", err, out.String(), errOut.String())
+				}
+				if strings.Contains(out.String()+errOut.String(), value) {
+					t.Fatal("the shell exposed the synthetic password")
+				}
+				if tc.name == "file redirect" {
+					data, err := os.ReadFile(capture)
+					if err != nil || len(data) != 0 {
+						t.Fatalf("file redirect was not refused: bytes=%d err=%v", len(data), err)
+					}
+				}
+			})
+		}
 	}
 }
 
@@ -122,6 +139,33 @@ func TestIsShellCommand(t *testing.T) {
 	} {
 		if got := isShellCommand(tc.args); got != tc.want {
 			t.Errorf("isShellCommand(%q)=%v, want %v", tc.args, got, tc.want)
+		}
+	}
+}
+
+func TestNearestShellAncestor(t *testing.T) {
+	for _, shell := range []string{"-bash\x00", "bash\x00-i\x00", "sh\x00script.sh\x00", "busybox\x00sh\x00"} {
+		files := map[string]string{
+			"/proc/50/cmdline": "wrapper\x00",
+			"/proc/50/stat":    "50 (wrapper) S 40",
+			"/proc/40/cmdline": shell,
+			"/proc/40/stat":    "40 (inner shell) S 30",
+			"/proc/30/cmdline": "sh\x00-c\x00run-script\x00",
+		}
+		read := func(path string) ([]byte, error) {
+			if value, ok := files[path]; ok {
+				return []byte(value), nil
+			}
+			return nil, fmt.Errorf("unexpected proc read: %s", path)
+		}
+		for _, tc := range []struct {
+			commandOnly bool
+			want        int
+		}{{false, 40}, {true, 30}} {
+			pid, err := shellAncestor(50, tc.commandOnly, read)
+			if err != nil || pid != tc.want {
+				t.Fatalf("shell %q, commandOnly=%v: pid=%d err=%v", shell, tc.commandOnly, pid, err)
+			}
 		}
 	}
 }
