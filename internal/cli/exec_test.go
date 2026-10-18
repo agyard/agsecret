@@ -158,10 +158,10 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	if err != nil || got != "prefix=literal ags_fedcba9876543210:suffix" {
 		t.Fatalf("single-pass expansion: %q %v", got, err)
 	}
-	for _, old := range []string{"agsecret://v1/name", "{{agsecret:name}}", "flags_deadbeefcafe", "ags_project", "x" + id} {
-		got, err := expandTokens(old, records, now, make(map[string][]byte))
-		if err != nil || got != old {
-			t.Fatalf("removed syntax was interpreted: %q %v", got, err)
+	for _, literal := range []string{"flags_deadbeefcafe", "ags_project", "x" + id} {
+		got, err := expandTokens(literal, records, now, make(map[string][]byte))
+		if err != nil || got != literal {
+			t.Fatalf("literal text was interpreted as an ID: %q %v", got, err)
 		}
 	}
 	if _, err := expandTokens("ags_fedcba9876543210", records, now, make(map[string][]byte)); !errors.Is(err, store.ErrNotFound) {

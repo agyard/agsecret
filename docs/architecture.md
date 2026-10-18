@@ -108,12 +108,10 @@ value of a secret; it is not a password or capability.
 The database has a single `secrets` table: name, ID, type (`password`,
 `totp` or `plain`), value, timestamps in whole seconds, the two access options, and the
 leak reports as a JSON array of `reported_at` and `reason`. Usage is stored in
-`max_uses` (0 means unlimited) and `used_count`. Only format 3 is supported;
-opening a vault checks `PRAGMA user_version` and rejects every other version.
-There are no legacy schemas or migration paths. Rejection never rebuilds or
-replaces the vault.
+`max_uses` (0 means unlimited) and `used_count`. The vault format is version 1.
+Opening a vault validates `PRAGMA user_version` without rewriting it.
 
-The `.unlock` file holds the random database key, encrypted with
+The version 1 `.unlock` file holds the random database key, encrypted with
 XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id (time
 1, 16 MiB of memory, parallelism 2). `init` creates every file exclusively: it
 never replaces an existing vault or pass file, and it never changes the

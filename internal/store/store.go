@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 3
+	SchemaVersion            = 1
 	MaxSecretLen             = 1 << 20
 	maxNameBytes             = 128
 	maxUnlockDescriptorBytes = 4096
@@ -92,7 +92,7 @@ type unlockDescriptor struct {
 }
 
 func wrapPassphrase(pass, key []byte) ([]byte, error) {
-	u := unlockDescriptor{Version: 2, Salt: make([]byte, 16), Nonce: make([]byte, chacha20poly1305.NonceSizeX)}
+	u := unlockDescriptor{Version: 1, Salt: make([]byte, 16), Nonce: make([]byte, chacha20poly1305.NonceSizeX)}
 	rand.Read(u.Salt)
 	rand.Read(u.Nonce)
 	k := argon2.IDKey(pass, u.Salt, 1, 16*1024, 2, 32)
@@ -107,7 +107,7 @@ func wrapPassphrase(pass, key []byte) ([]byte, error) {
 
 func unwrapPassphrase(pass, b []byte) ([]byte, error) {
 	var u unlockDescriptor
-	if err := json.Unmarshal(b, &u); err != nil || u.Version != 2 || len(u.Salt) != 16 || len(u.Nonce) != chacha20poly1305.NonceSizeX || len(u.Wrapped) != 32+chacha20poly1305.Overhead {
+	if err := json.Unmarshal(b, &u); err != nil || u.Version != 1 || len(u.Salt) != 16 || len(u.Nonce) != chacha20poly1305.NonceSizeX || len(u.Wrapped) != 32+chacha20poly1305.Overhead {
 		return nil, errors.New("the vault's .unlock file is invalid")
 	}
 	k := argon2.IDKey(pass, u.Salt, 1, 16*1024, 2, 32)
@@ -281,7 +281,7 @@ const schema = `CREATE TABLE secrets (
  used_count INTEGER NOT NULL DEFAULT 0 CHECK(used_count >= 0),
  leaks TEXT NOT NULL
 );
-PRAGMA user_version=3;`
+PRAGMA user_version=1;`
 
 // connect takes ownership of key and erases it on failure or Close.
 func connect(name string, key []byte, create bool) (*Store, error) {

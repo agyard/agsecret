@@ -75,7 +75,7 @@ func TestEncryptedRoundTripAndWrongPassphrase(t *testing.T) {
 		t.Fatalf("round trip: %+v %v", r, err)
 	}
 	var u unlockDescriptor
-	if b, err := os.ReadFile(path + ".unlock"); err != nil || json.Unmarshal(b, &u) != nil || u.Version != 2 {
+	if b, err := os.ReadFile(path + ".unlock"); err != nil || json.Unmarshal(b, &u) != nil || u.Version != 1 {
 		t.Fatal("unexpected .unlock format")
 	}
 }
@@ -83,7 +83,7 @@ func TestEncryptedRoundTripAndWrongPassphrase(t *testing.T) {
 func TestOpenRejectsUnsupportedFormatsWithoutChangingThem(t *testing.T) {
 	s, path := newTestStore(t)
 	id := put(t, s, "api", "synthetic-value").Record.ID
-	for _, version := range []int{0, 1, 2, SchemaVersion + 1} {
+	for _, version := range []int{0, SchemaVersion + 1} {
 		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version=%d", version)); err != nil {
 			t.Fatal(err)
 		}
