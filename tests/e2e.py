@@ -5,7 +5,6 @@ import json
 import os
 import pathlib
 import selectors
-import shlex
 import shutil
 import signal
 import subprocess
@@ -32,36 +31,36 @@ def check_tmux(root, env, run, secret_id):
     if not tmux or not sys.platform.startswith('linux'):
         print('SKIP: real tmux requires Linux and tmux')
         return
-    socket = str(root / 'tmux.sock')
+    socket = str(root / 'tmux socket')
     helper = root / 'prompt.py'
     helper.write_text('''import pathlib, signal, sys, termios, time
 signal.alarm(12)
 root = pathlib.Path(sys.argv[1])
+mode = sys.argv[2]
+prefix = 'prompt' if mode == 'password' else 'username'
 state = termios.tcgetattr(0)
-hidden = termios.tcgetattr(0)
-hidden[3] &= ~termios.ECHO
-termios.tcsetattr(0, termios.TCSANOW, hidden)
-(root / 'prompt-ready').write_text('ready')
-print('Password: ', end='', flush=True)
+settings = termios.tcgetattr(0)
+settings[3] |= termios.ICANON | termios.ECHO
+if mode == 'password':
+    settings[3] &= ~termios.ECHO
+termios.tcsetattr(0, termios.TCSANOW, settings)
+(root / (prefix + '-ready')).write_text('ready')
+print(mode + ': ', end='', flush=True)
 try:
     value = sys.stdin.readline().rstrip('\\n')
 finally:
     termios.tcsetattr(0, termios.TCSANOW, state)
-accepted = value == 'synthetic-password-with-$-and-spaces'
-(root / 'prompt-result').write_text('accepted' if accepted else 'rejected')
+expected = 'synthetic-password-with-$-and-spaces' if mode == 'password' else 'synthetic-user'
+accepted = value == expected
+(root / (prefix + '-result')).write_text('accepted' if accepted else 'rejected')
 print('accepted' if accepted else 'rejected', flush=True)
 while not (root / 'prompt-stop').exists():
     time.sleep(0.02)
 ''')
-    private_bin = root / 'private-bin'
-    private_bin.mkdir()
-    shim = private_bin / 'tmux'
-    shim.write_text('#!/bin/sh\nexec ' + shlex.quote(tmux) + ' -S ' + shlex.quote(socket) + ' "$@"\n')
-    shim.chmod(0o700)
-    tmux_env = dict(env, PATH=str(private_bin)+os.pathsep+env['PATH'], TMUX='', TERM='xterm-256color')
+    tmux_env = dict(env, AGSECRET_TMUX_SOCKET=socket, TMUX='', TERM='xterm-256color')
     try:
         subprocess.run([tmux, '-S', socket, '-f', os.devnull, 'new-session', '-d', '-s', 'selfcheck',
-                        sys.executable, str(helper), str(root)], env=tmux_env, capture_output=True, check=True, timeout=5)
+                        sys.executable, str(helper), str(root), 'password'], env=tmux_env, capture_output=True, check=True, timeout=5)
         wait_file(root / 'prompt-ready')
         bad = json.loads(run('put', 'multiline', '--stdin', '--json', data='first\nsecond').stdout)
         result = run('send', 'tmux:selfcheck:0.0', bad['id'], '--dangerously-skip-check', check=False, child_env=tmux_env)
@@ -75,14 +74,24 @@ while not (root / 'prompt-stop').exists():
             time.sleep(0.5)
             result = run('send', 'tmux:selfcheck:1', secret_id, check=False, child_env=tmux_env)
             assert result.returncode == 1 and 'not waiting at a password prompt' in result.stderr
-        result = run('send', 'tmux:selfcheck:0.0', secret_id, child_env=tmux_env)
+        subprocess.run([tmux, '-S', socket, 'select-pane', '-m', '-t', 'selfcheck:0.0'],
+                       capture_output=True, check=True, timeout=5)
+        result = run('send', 'tmux:{marked}', secret_id, child_env=tmux_env)
         assert result.stdout == result.stderr == ''
         wait_file(root / 'prompt-result')
         assert (root / 'prompt-result').read_text() == 'accepted'
         capture = subprocess.run([tmux, '-S', socket, 'capture-pane', '-p', '-t', 'selfcheck:0.0'],
                                  capture_output=True, text=True, check=True, timeout=5).stdout
         assert PASSWORD not in capture
-        print('PASS: send types into a real tmux password prompt and refuses a shell pane and control characters')
+        username = json.loads(run('put', 'login:username', 'synthetic-user', '--type', 'plain', '--json').stdout)
+        subprocess.run([tmux, '-S', socket, 'new-window', '-d', '-t', 'selfcheck:2',
+                        sys.executable, str(helper), str(root), 'username'],
+                       env=tmux_env, capture_output=True, check=True, timeout=5)
+        wait_file(root / 'username-ready')
+        run('send', 'tmux:selfcheck:2.0', username['id'], child_env=tmux_env)
+        wait_file(root / 'username-result')
+        assert (root / 'username-result').read_text() == 'accepted'
+        print('PASS: private tmux socket, marked pane, hidden password and visible plain prompts; unsafe sends refused')
     finally:
         (root / 'prompt-stop').touch()
         subprocess.run([tmux, '-S', socket, 'kill-server'], capture_output=True, timeout=5)

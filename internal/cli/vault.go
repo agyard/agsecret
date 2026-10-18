@@ -165,13 +165,18 @@ func (o *options) create() error {
 }
 
 func recordJSON(r store.Record) map[string]any {
-	return map[string]any{
+	value := map[string]any{
 		"name": r.Name, "id": r.ID, "type": r.Type,
 		"created_at": r.CreatedAt, "updated_at": r.UpdatedAt,
-		"expires_at": r.ExpiresAt, "expired": r.Expired(time.Now()),
-		"access": access(r), "leaks": r.Leaks,
-		"max_uses": r.MaxUses, "used_count": r.UsedCount,
 	}
+	if r.Type == "plain" {
+		value["value"] = string(r.Secret)
+	} else {
+		value["expires_at"], value["expired"] = r.ExpiresAt, r.Expired(time.Now())
+		value["access"], value["leaks"] = access(r), r.Leaks
+		value["max_uses"], value["used_count"] = r.MaxUses, r.UsedCount
+	}
+	return value
 }
 
 // Values were prepared from a snapshot. Recheck the current IDs and consume

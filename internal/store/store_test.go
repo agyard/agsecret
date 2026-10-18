@@ -552,7 +552,10 @@ func TestUsageLimitConcurrentConsumption(t *testing.T) {
 func TestMigrateV1UsageColumns(t *testing.T) {
 	s, path := newTestStore(t)
 	original := put(t, s, "api", "value")
-	if _, err := s.db.Exec(`ALTER TABLE secrets DROP COLUMN max_uses;
+	v2Schema := strings.ReplaceAll(strings.ReplaceAll(schema, ",'plain'", ""), "user_version=3", "user_version=2")
+	if _, err := s.db.Exec("ALTER TABLE secrets RENAME TO v3_secrets;" + v2Schema +
+		`INSERT INTO secrets SELECT * FROM v3_secrets; DROP TABLE v3_secrets;
+ALTER TABLE secrets DROP COLUMN max_uses;
 ALTER TABLE secrets DROP COLUMN used_count;
 PRAGMA user_version=1;`); err != nil {
 		t.Fatal(err)
@@ -577,6 +580,9 @@ PRAGMA user_version=1;`); err != nil {
 			var version int
 			if err := migrated.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != SchemaVersion {
 				t.Errorf("migrated schema version: %d %v", version, err)
+			}
+			if _, err := migrated.Put("username", Change{Secret: []byte("user"), Type: ptr("plain")}); err != nil {
+				t.Errorf("plain after v1 migration: %v", err)
 			}
 		})
 	}

@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 2
+	SchemaVersion            = 3
 	MaxSecretLen             = 1 << 20
 	maxNameBytes             = 128
 	maxUnlockDescriptorBytes = 4096
@@ -47,12 +47,12 @@ var (
 	ErrNoUses     = errors.New("no uses left")
 )
 
-// Record is a stored secret. Secret holds the value only when a caller asks
-// for it.
+// Record is a stored secret. Plain values are always included; sensitive
+// values are included only when a caller asks for them.
 type Record struct {
 	Name      string
 	ID        string
-	Type      string // "password" or "totp"
+	Type      string // "password", "totp", or "plain"
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	ExpiresAt *time.Time
@@ -74,7 +74,7 @@ type Leak struct {
 }
 
 func (r Record) Expired(now time.Time) bool {
-	return r.ExpiresAt != nil && !now.Before(*r.ExpiresAt)
+	return r.Type != "plain" && r.ExpiresAt != nil && !now.Before(*r.ExpiresAt)
 }
 
 // Store is used by one process. SQLite provides the cross-process locking
@@ -270,7 +270,7 @@ func openDatabase(name string, key []byte, create bool) (*sql.DB, error) {
 const schema = `CREATE TABLE secrets (
  name TEXT PRIMARY KEY NOT NULL,
  id TEXT NOT NULL UNIQUE,
- type TEXT NOT NULL CHECK(type IN ('password','totp')),
+ type TEXT NOT NULL CHECK(type IN ('password','totp','plain')),
  secret BLOB NOT NULL,
  created_at TEXT NOT NULL,
  updated_at TEXT NOT NULL,
@@ -281,7 +281,7 @@ const schema = `CREATE TABLE secrets (
  used_count INTEGER NOT NULL DEFAULT 0 CHECK(used_count >= 0),
  leaks TEXT NOT NULL
 );
-PRAGMA user_version=2;`
+PRAGMA user_version=3;`
 
 // connect takes ownership of key and erases it on failure or Close.
 func connect(name string, key []byte, create bool) (*Store, error) {
@@ -313,9 +313,9 @@ func checkSchema(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return errors.New("cannot read the vault; it may be damaged or not an agsecret vault")
 	}
-	if version == 1 {
-		if err := migrateV1ToV2(db); err != nil {
-			return fmt.Errorf("cannot migrate the vault to format version 2: %w", err)
+	if version == 1 || version == 2 {
+		if err := migrate(db); err != nil {
+			return fmt.Errorf("cannot migrate the vault to format version %d: %w", SchemaVersion, err)
 		}
 		version = SchemaVersion
 	}
@@ -325,7 +325,7 @@ func checkSchema(db *sql.DB) error {
 	return nil
 }
 
-func migrateV1ToV2(db *sql.DB) error {
+func migrate(db *sql.DB) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -339,16 +339,19 @@ func migrateV1ToV2(db *sql.DB) error {
 	if version == SchemaVersion {
 		return nil
 	}
-	if version != 1 {
+	if version != 1 && version != 2 {
 		return fmt.Errorf("unexpected format version %d", version)
 	}
-	if _, err := tx.Exec("ALTER TABLE secrets ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 0 CHECK(max_uses >= 0)"); err != nil {
+	if _, err := tx.Exec("ALTER TABLE secrets RENAME TO previous_secrets;" + schema); err != nil {
 		return err
 	}
-	if _, err := tx.Exec("ALTER TABLE secrets ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0 CHECK(used_count >= 0)"); err != nil {
-		return err
+	usage := "max_uses,used_count"
+	if version == 1 {
+		usage = "0,0"
 	}
-	if _, err := tx.Exec("PRAGMA user_version=2"); err != nil {
+	if _, err := tx.Exec(`INSERT INTO secrets(name,id,type,secret,created_at,updated_at,expires_at,allow_get,allow_exec,max_uses,used_count,leaks)
+SELECT name,id,type,secret,created_at,updated_at,expires_at,allow_get,allow_exec,` + usage + `,leaks FROM previous_secrets;
+DROP TABLE previous_secrets;`); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -392,19 +395,13 @@ func newID() string {
 
 // validateRef accepts a current ID or a secret name.
 func validateRef(ref string) error {
-	switch {
-	case ValidID(ref):
+	if ValidID(ref) {
 		return nil
-	case strings.HasPrefix(strings.ToLower(ref), "ags_"):
-		return fmt.Errorf("%w, and names cannot start with ags_", CheckID(ref))
-	case ref == "" || len(ref) > maxNameBytes:
-		return errors.New("a name must be 1 to 128 bytes long")
-	case strings.ContainsFunc(ref, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/@+-", r))
-	}):
-		return errors.New("a name may contain only letters, digits, '.', '_', '/', '@', '+' and '-'")
 	}
-	return nil
+	if strings.HasPrefix(strings.ToLower(ref), "ags_") {
+		return fmt.Errorf("%w, and names cannot start with ags_", CheckID(ref))
+	}
+	return ValidateName(ref)
 }
 
 // Stored timestamps have whole seconds so JSON output has one fixed width.
@@ -429,7 +426,7 @@ type Change struct {
 	SkipCheck bool
 }
 
-// PutResult describes a committed put. Record.Secret is not set.
+// PutResult describes a committed put. Only plain values have Record.Secret set.
 type PutResult struct {
 	Record     Record
 	Created    bool
@@ -444,7 +441,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	if ValidID(ref) {
 		return PutResult{}, errors.New("put takes a name, not an ID; changing the value creates a new ID automatically")
 	}
-	if err := validateRef(ref); err != nil {
+	if err := ValidateName(ref); err != nil {
 		return PutResult{}, err
 	}
 	if c.Secret != nil && (!validSize(c.Secret) || !utf8.Valid(c.Secret)) {
@@ -476,6 +473,15 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	if c.Type != nil {
 		r.Type = *c.Type
 	}
+	if r.Type == "plain" {
+		if c.ExpiresAt != nil || c.AllowGet != nil || c.AllowExec != nil || c.MaxUses != nil || c.SkipCheck {
+			return PutResult{}, errors.New("plain values do not support expiry, access restrictions, usage limits or bypass options")
+		}
+		if !created && previous.Type != "plain" && c.Secret == nil {
+			return PutResult{}, fmt.Errorf("%w of %s to change its type to plain", ErrNeedsValue, r.Name)
+		}
+		r.ExpiresAt, r.AllowGet, r.AllowExec, r.MaxUses, r.UsedCount = nil, true, true, 0, 0
+	}
 	if c.ExpiresAt != nil {
 		r.ExpiresAt = *c.ExpiresAt
 	}
@@ -489,7 +495,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		r.MaxUses = *c.MaxUses
 	}
 	switch r.Type {
-	case "password":
+	case "password", "plain":
 	case "totp":
 		config, err := totp.Parse(string(r.Secret))
 		if err != nil {
@@ -497,7 +503,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		}
 		config.Clear()
 	default:
-		return PutResult{}, errors.New("the type must be password or totp")
+		return PutResult{}, errors.New("the type must be password, totp or plain")
 	}
 	if r.ExpiresAt != nil {
 		expires := r.ExpiresAt.UTC().Truncate(time.Second)
@@ -543,7 +549,11 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	if err := tx.Commit(); err != nil {
 		return PutResult{}, err
 	}
-	r.Secret = nil
+	if r.Type == "plain" {
+		r.Secret = bytes.Clone(r.Secret)
+	} else {
+		r.Secret = nil
+	}
 	result.Record = r
 	return result, nil
 }
@@ -588,7 +598,7 @@ func uniqueID(tx *sql.Tx) (string, error) {
 }
 
 func columns(includeSecret bool) string {
-	secret := "NULL"
+	secret := "CASE WHEN type='plain' THEN secret ELSE NULL END"
 	if includeSecret {
 		secret = "secret"
 	}
@@ -621,7 +631,7 @@ func scanRecord(scanner interface{ Scan(...any) error }, includeSecret bool) (Re
 	if err := json.Unmarshal([]byte(leaks), &r.Leaks); err != nil || r.Leaks == nil {
 		return r, fmt.Errorf("the leak reports of %s are damaged", r.Name)
 	}
-	if includeSecret {
+	if includeSecret || r.Type == "plain" {
 		r.Secret = bytes.Clone(secret)
 	}
 	return r, nil
@@ -641,7 +651,7 @@ func getRecord(db rowQuerier, ref string, includeSecret bool) (Record, error) {
 	return r, err
 }
 
-// Get returns a secret by name or ID, with its value only if includeSecret.
+// Get returns a secret by name or ID. Sensitive values require includeSecret.
 func (s *Store) Get(ref string, includeSecret bool) (Record, error) {
 	if err := validateRef(ref); err != nil {
 		return Record{}, err
@@ -649,9 +659,11 @@ func (s *Store) Get(ref string, includeSecret bool) (Record, error) {
 	return getRecord(s.db, ref, includeSecret)
 }
 
-// List returns all secrets sorted by name, with values only if includeSecret.
+// List returns standalone secrets first, followed by credentials ordered by
+// name and field. Sensitive values require includeSecret.
 func (s *Store) List(includeSecret bool) ([]Record, error) {
-	rows, err := s.db.Query("SELECT " + columns(includeSecret) + " FROM secrets ORDER BY name")
+	rows, err := s.db.Query("SELECT " + columns(includeSecret) + ` FROM secrets ORDER BY instr(name,':')>0,
+CASE WHEN instr(name,':')>0 THEN substr(name,1,instr(name,':')-1) ELSE name END,name`)
 	return scanRecords(rows, err, includeSecret)
 }
 
@@ -737,6 +749,9 @@ func (s *Store) ConsumeMany(refs []string, action string) ([]Record, error) {
 	}
 	checkAt := time.Now().UTC()
 	for _, r := range records {
+		if r.Type == "plain" {
+			continue
+		}
 		if r.Expired(checkAt) {
 			return nil, fmt.Errorf("secret %s (%s) %w", r.Name, r.ID, ErrExpired)
 		}
@@ -754,6 +769,9 @@ func (s *Store) ConsumeMany(refs []string, action string) ([]Record, error) {
 
 	updatedAt := checkAt.Truncate(time.Second)
 	for i := range records {
+		if records[i].Type == "plain" {
+			continue
+		}
 		result, err := tx.Exec(`UPDATE secrets
 SET used_count=used_count+1, updated_at=?
 WHERE id=? AND (max_uses=0 OR used_count<max_uses)`, encodeTime(updatedAt), records[i].ID)
@@ -806,7 +824,7 @@ func (s *Store) Report(ref, reason string) ([]Record, error) {
 	}
 	defer clear(r.Secret)
 	if r.Type != "password" {
-		return nil, errors.New("only passwords can be reported, not TOTP secrets")
+		return nil, errors.New("only passwords can be reported")
 	}
 	rows, err := tx.Query("SELECT "+columns(false)+" FROM secrets WHERE type='password' AND secret=? ORDER BY name", r.Secret)
 	records, err := scanRecords(rows, err, false)

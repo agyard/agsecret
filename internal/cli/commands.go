@@ -22,15 +22,16 @@ func newPut(o *options) *cobra.Command {
 	var fromStdin bool
 	var c store.Change
 	cmd := &cobra.Command{
-		Use:        "put NAME",
+		Use:        "put NAME [VALUE]",
 		SuggestFor: []string{"add", "set", "store", "insert", "update"},
 		Short:      "Add or update a secret",
-		Long: `Add a secret, or update an existing one by name.
+		Long: `Add or update a value by NAME or CREDENTIAL:FIELD.
 
-put reads the value from standard input with --stdin, or from a hidden
-prompt when you run it in a terminal. Never type the value itself into a
-command line, because shell history keeps it. With --type totp, the value is
-a Base32 seed or an otpauth://totp/ URI.
+Provide VALUE directly, use --stdin, or type at the hidden terminal prompt.
+Passwords and TOTP seeds passed as VALUE may remain in shell history; remove
+that command from history, or prefer --stdin/the hidden prompt. With --type
+totp, the value is a Base32 seed or an otpauth://totp/ URI. plain values are
+directly visible and accept no access, expiry or usage protection options.
 
 Options you leave out keep their current values. You can narrow access or
 bring the expiry closer without the value, for example with --access exec.
@@ -40,23 +41,31 @@ new ID, and the old ID stops working. --uses limits total get/exec/send
 authorizations for that ID (0 means unlimited). A changed value or type resets
 the counter; resubmitting the same value preserves it. Increasing the limit
 requires the value, just like extending expiry.
-A put always names the credential; use
-its ID with get, view, send, exec or report.`,
+A put always names the field; use its ID with get, view, send, exec or report.`,
 		Example: `  # Store a token from an environment variable
   printf '%s' "$GITHUB_TOKEN" | agsecret put github --stdin
 
   # Type a TOTP seed at a hidden prompt; keep it for 30 days
   agsecret put github-otp --type totp --ttl 30d
 
+  # Store a visible account name in a credential
+  agsecret put example:username alice --type plain
+
   # Let agents use a secret only through exec and send
   agsecret put github --access exec`,
 		// Option values are checked here, before any value is read.
 		Args: func(cmd *cobra.Command, args []string) error {
-			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+			if err := cobra.RangeArgs(1, 2)(cmd, args); err != nil {
 				return err
 			}
 			if store.ValidID(args[0]) {
 				return errors.New("put takes a name, not an ID; changing the value creates a new ID automatically")
+			}
+			if err := store.ValidateName(args[0]); err != nil {
+				return err
+			}
+			if len(args) == 2 && fromStdin {
+				return errors.New("use either VALUE or --stdin, not both")
 			}
 			if cmd.Flags().Changed("type") {
 				c.Type = &kind
@@ -88,24 +97,39 @@ its ID with get, view, send, exec or report.`,
 				return err
 			}
 			// Without a value source, only options change, so prompt only
-			// when there is nothing else to do. A terminal always gets the
-			// hidden prompt, even with --stdin, so the value is never echoed.
+			// when there is nothing else to do. Terminal stdin uses a hidden
+			// prompt; an explicit VALUE remains a separate input source.
 			in := cmd.InOrStdin()
 			var err error
 			switch {
+			case len(args) == 2:
+				c.Secret = []byte(args[1])
 			case !fromStdin && c.Type == nil && (c.ExpiresAt != nil || c.AllowGet != nil || c.MaxUses != nil):
 			case isTerminal(in):
 				c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "Value for "+args[0]+" (hidden): ")
 			case fromStdin:
 				c.Secret, err = readValue(in)
 			default:
-				return fmt.Errorf("give the value with --stdin, or run put in a terminal to type it")
+				return fmt.Errorf("give VALUE or --stdin, or run put in a terminal to type it")
 			}
 			if err != nil {
 				return err
 			}
 			defer func() { clear(c.Secret) }()
 			return o.withStore(func(s *store.Store) error {
+				effectiveType := kind
+				if c.Type == nil {
+					if previous, readErr := s.Get(args[0], false); readErr == nil {
+						effectiveType = previous.Type
+						clear(previous.Secret)
+					}
+				}
+				if effectiveType == "plain" && cmd.Flags().Changed("dangerously-skip-check") {
+					return errors.New("plain values do not support bypass options")
+				}
+				if len(args) == 2 && effectiveType != "plain" {
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: warning: a sensitive value was supplied on the command line; remove this command from shell history. Prefer --stdin or the hidden prompt.")
+				}
 				result, err := s.Put(args[0], c)
 				if errors.Is(err, store.ErrNeedsValue) && isTerminal(in) {
 					if c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "This loosens the limits of "+args[0]+"; enter its value: "); err != nil {
@@ -117,6 +141,7 @@ its ID with get, view, send, exec or report.`,
 					return err
 				}
 				r := result.Record
+				defer clear(r.Secret)
 				if len(result.Duplicates) > 0 {
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "agsecret: note: the same value is also stored as %s; a leak report on one marks them all\n", strings.Join(result.Duplicates, ", "))
 				}
@@ -136,7 +161,7 @@ its ID with get, view, send, exec or report.`,
 		},
 	}
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "read the value from standard input (a trailing newline is dropped)")
-	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password or totp")
+	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password, totp or plain")
 	cmd.Flags().StringVar(&ttlText, "ttl", "", "time until the secret expires, such as 12h, 7d or 2w, or 0 for never")
 	cmd.Flags().Int64Var(&maxUses, "uses", 0, "total get/exec/send authorizations allowed for this ID (0 means unlimited)")
 	cmd.Flags().StringVar(&accessText, "access", "", "what agents may do: get,exec (the default), exec (which includes send), get or none")
@@ -204,6 +229,9 @@ func access(r store.Record) string {
 // which is the current code for a TOTP secret. Refusals point people to the
 // fix without handing agents a command to lift the limit themselves.
 func useValue(r store.Record, now time.Time, action string) ([]byte, error) {
+	if r.Type == "plain" {
+		return bytes.Clone(r.Secret), nil
+	}
 	allowed := r.AllowExec
 	if action == "get" {
 		allowed = r.AllowGet
@@ -228,14 +256,15 @@ func newGet(o *options) *cobra.Command {
 	var skipCheck bool
 	c := &cobra.Command{
 		Use:   "get NAME|ID",
-		Short: "Print a TOTP code",
-		Long: `Print the current code of a TOTP secret.
+		Short: "Print a plain value or current TOTP code",
+		Long: `Print a plain value or the current code of a TOTP secret.
 
 Passwords go to programs through exec or send. get refuses passwords by
 default in every shell and output context, including terminals, pipes and
 command substitutions. People who intentionally need plaintext may use
 --dangerously-skip-check; its output is not filtered. Agents must not use it.
-Each authorized get consumes one use, shared with exec and send.`,
+Each authorized sensitive get consumes one use, shared with exec and send.
+plain values have no access, expiry or usage restrictions.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {
@@ -269,7 +298,7 @@ func newView(o *options) *cobra.Command {
 		Use:        "view NAME|ID",
 		SuggestFor: []string{"show", "info", "inspect"},
 		Short:      "Show details about a secret",
-		Long:       "Show a secret's ID, type, status, access, expiry and leak reports. The value\nis never shown.",
+		Long:       "Show a field's ID, type and metadata. plain values are displayed directly;\npasswords and TOTP seeds are never shown. Use credential view NAME for a group.",
 		Args:       cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {
@@ -277,6 +306,7 @@ func newView(o *options) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				defer clear(r.Secret)
 				if o.json {
 					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
 				}
@@ -285,7 +315,12 @@ func newView(o *options) *cobra.Command {
 					expires = r.ExpiresAt.Local().Format(time.DateTime)
 				}
 				w := newTable(cmd.OutOrStdout())
-				fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\nStatus:\t%s\nAccess:\t%s\nExpires:\t%s\nUses:\t%s\n", r.Name, r.ID, r.Type, status(r), access(r), expires, usageText(r))
+				fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\n", r.Name, r.ID, r.Type)
+				if r.Type == "plain" {
+					fmt.Fprintf(w, "Value:\t%s\n", safeText(string(r.Secret)))
+				} else {
+					fmt.Fprintf(w, "Status:\t%s\nAccess:\t%s\nExpires:\t%s\nUses:\t%s\n", status(r), access(r), expires, usageText(r))
+				}
 				for _, leak := range r.Leaks {
 					fmt.Fprintf(w, "Leaked:\t%s %s\n", leak.ReportedAt.Local().Format(time.DateTime), safeText(leak.Reason))
 				}
@@ -323,11 +358,10 @@ func usageText(r store.Record) string {
 
 func newList(o *options) *cobra.Command {
 	return addJSONFlag(&cobra.Command{
-		Use:        "list",
-		Aliases:    []string{"ls"},
-		SuggestFor: []string{"lst", "lsit"},
+		Use:        "ls",
+		SuggestFor: []string{"list", "lst", "lsit"},
 		Short:      "List secrets and their IDs",
-		Long:       "List secrets with their IDs, status and access. Leaked or expired secrets\nshould be replaced with agsecret put.",
+		Long:       "List standalone fields first, then credentials and their fields in lexical\norder. plain values are visible; sensitive values are represented by their IDs.",
 		Args:       cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return o.withStore(func(s *store.Store) error {
@@ -335,6 +369,11 @@ func newList(o *options) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				defer func() {
+					for _, r := range records {
+						clear(r.Secret)
+					}
+				}()
 				out := cmd.OutOrStdout()
 				switch {
 				case o.json:
@@ -343,15 +382,32 @@ func newList(o *options) *cobra.Command {
 					_, err = fmt.Fprintln(out, "No secrets yet. Add one with: agsecret put NAME")
 					return err
 				}
-				w := newTable(out)
-				fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS\tUSES")
-				for _, r := range records {
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, r.ID, r.Type, status(r), access(r), usageText(r))
-				}
-				return w.Flush()
+				return renderRecords(out, records)
 			})
 		},
 	}, o)
+}
+
+func renderRecords(out io.Writer, records []store.Record) error {
+	w := newTable(out)
+	fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS\tUSES\tVALUE")
+	previousGroup := ""
+	for _, r := range records {
+		group, field := store.SplitName(r.Name)
+		if group != previousGroup {
+			fmt.Fprintf(w, "%s:\t\t\t\t\t\t\n", group)
+			previousGroup = group
+		}
+		if group != "" {
+			field = "  " + field
+		}
+		state, permissions, uses, value := status(r), access(r), usageText(r), ""
+		if r.Type == "plain" {
+			state, permissions, uses, value = "-", "-", "-", safeText(string(r.Secret))
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", field, r.ID, r.Type, state, permissions, uses, value)
+	}
+	return w.Flush()
 }
 
 func newDelete(o *options) *cobra.Command {
@@ -395,7 +451,7 @@ replaced since then, the exposed value is gone, and there is nothing to report.`
 		Example: "  agsecret report ID --reason 'printed by a debug endpoint'",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 1 && !store.ValidID(args[0]) {
-				return fmt.Errorf("report takes the exposed ID, not a name, so a report never marks a newer value; run agsecret list to find it")
+				return fmt.Errorf("report takes the exposed ID, not a name, so a report never marks a newer value; run agsecret ls to find it")
 			}
 			return cobra.ExactArgs(1)(cmd, args)
 		},

@@ -6,9 +6,35 @@ command needs them. Passwords go through `exec` or `send` by default;
 the CLI never prints a TOTP seed, only its current code. These checks reduce
 accidental exposure, not deliberate extraction by a receiving program.
 
-Each secret has a name and a random ID. The ID stays the same while the value
+Each field has a name and a random ID. The ID stays the same while the value
 and type stay the same. Changing either one assigns a new ID, and the old ID
 stops working at once.
+
+## Credentials and plain fields
+
+A name is standalone or CREDENTIAL:FIELD, with exactly one colon separating
+nonempty names. Credentials are derived namespaces, not separate records:
+the first field creates a group and removing the last one removes the group.
+Fields have no reserved names. Each field belongs to one group at most; equal
+passwords still have independent IDs and the existing duplicate/report behavior.
+
+rename changes a field's name and updated_at only. Group rename updates all
+matching names in one transaction, rejecting existing target namespaces and
+overlong names before writing. Group delete is one atomic DELETE. Matching uses
+the exact colon boundary, not SQL wildcard patterns. IDs, counters, expiry,
+access and history survive moves. Standalone names can equal credential names.
+
+The plain type has visible values and no protection settings or use accounting.
+Metadata reads select values only for plain, and JSON omits its inapplicable
+policy fields. put rejects explicit protection settings on plain. Changing a
+sensitive type to plain requires the value, creates a new ID, and clears the old
+controls and history. Plain values are excluded from the redaction patterns,
+including injected values, but a matching password pattern still takes effect.
+
+ls orders standalone fields first, then namespaces and local fields lexically.
+Its JSON is a flat record array in the same order; credential view wraps a
+record array with the namespace name. Viewing a group never generates OTP
+codes or consumes uses. No import, export or sharing protocol is implemented.
 
 ```mermaid
 flowchart LR
@@ -58,7 +84,7 @@ read never write.
 - **get/send/exec** validate the request or target and prepare the values.
   Immediately before handing them out, an immediate transaction rechecks all
   referenced IDs for expiry, access and remaining uses and increments each
-  distinct ID's counter once. Any refusal rolls back the whole batch. IDs
+  distinct sensitive ID's counter once. Plain fields are not counted. Any refusal rolls back the whole batch. IDs
   invalidated by a concurrent rotation are rejected. Downstream failures do not
   refund a committed authorization. Exec closes the vault before child launch.
 
@@ -79,12 +105,13 @@ value of a secret; it is not a password or capability.
 
 ## File formats
 
-The database has a single `secrets` table: name, ID, type (`password` or
-`totp`), value, timestamps in whole seconds, the two access options, and the
+The database has a single `secrets` table: name, ID, type (`password`,
+`totp` or `plain`), value, timestamps in whole seconds, the two access options, and the
 leak reports as a JSON array of `reported_at` and `reason`. Format 2 adds
-`max_uses` (0 means unlimited) and `used_count`. Opening a format 1 vault adds
-these columns in an immediate transaction, rechecking the version under the
-lock so concurrent upgrades are safe. Existing records start at 0/0. Unknown
+`max_uses` (0 means unlimited) and `used_count`. Format 3 allows the plain type.
+Opening a format 1 or 2 vault rebuilds the table in an immediate transaction,
+rechecking the version under the lock so concurrent upgrades are safe. All
+records and their state are copied; format 1 records start at 0/0 uses. Unknown
 format versions are refused without modification; older binaries cannot read
 the upgraded format.
 
@@ -155,7 +182,7 @@ its output pipes. exec is not a sandbox.
 ## get and send
 
 `get` refuses passwords by default on all platforms and in all output contexts.
-It prints TOTP codes subject to access, expiry and use limits. People may opt
+It prints plain values freely and TOTP codes subject to access, expiry and use limits. People may opt
 into unfiltered plaintext with `--dangerously-skip-check`; agents use `exec` or
 `send` instead. No process ancestry or shell detection is involved. A pipe or
 TTY cannot establish where a consumer will forward the value, so automatic
@@ -170,6 +197,10 @@ is the mode password prompts from sudo, ssh, psql and getpass use. Shells and
 REPLs turn echo off too, but they read raw keys and echo them themselves, so
 they fail the check. The terminal mode or the pane could still change between
 the check and the typing, and the program reading the password is trusted.
+Plain fields bypass the hidden-prompt check, but still reject terminal control
+characters. tmux targets are passed literally and resolved to a pane ID before
+typing. AGSECRET_TMUX_SOCKET adds `-S SOCKET` to every tmux invocation; absent
+that override, tmux inherits TMUX/TMUX_TMPDIR normally.
 
 Tests never touch a real tmux session. Unit tests use a private pseudo-terminal
 and a fake tmux; `make integration` starts a separate tmux server on a

@@ -37,7 +37,7 @@ func TestUsageSharedByGetAndExec(t *testing.T) {
 		t.Fatalf("exhausted get: code=%d out=%q err=%q", code, out, errText)
 	}
 	c.assertUsage(id, 2, 2)
-	rows := c.json("", "list").([]any)
+	rows := c.json("", "ls").([]any)
 	if len(rows) != 1 || rows[0].(map[string]any)["used_count"] != float64(2) {
 		t.Fatalf("list usage: %v", rows)
 	}

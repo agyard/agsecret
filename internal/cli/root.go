@@ -80,7 +80,7 @@ func Execute(args []string, in io.Reader, out, errOut io.Writer) int {
 	if err != nil {
 		message := err.Error()
 		if errors.Is(err, store.ErrNotFound) {
-			message += "; run agsecret list to see current names and IDs"
+			message += "; run agsecret ls to see current names and IDs"
 		}
 		_, _ = fmt.Fprintln(errOut, "agsecret:", safeText(message))
 	}
@@ -133,14 +133,21 @@ func safeText(s string) string {
 	return b.String()
 }
 
-const guide = `Store passwords and TOTP secrets in an encrypted local vault, and help AI
-agents use them while reducing accidental plaintext exposure. Agents refer to
-each secret by an ID such as ags_3f2a9c0b7d1e4f60. Run "agsecret list" to see IDs.
+const guide = `Store passwords, TOTP seeds and visible plain values in an encrypted vault.
+Use CREDENTIAL:FIELD names to group an account's fields. There are no fixed
+field names or empty credentials. Run "agsecret ls" to see fields and IDs,
+or "agsecret credential view NAME" to see one account.
 
 Getting started:
-  agsecret init                 # create the vault
-  agsecret put github           # store a secret; type it at the hidden prompt
-  agsecret list                 # show names and IDs
+  agsecret init                              # create the vault
+  agsecret put github:username alice --type plain
+  agsecret put github:password               # hidden password prompt
+  agsecret credential view github --json     # plain values and sensitive IDs
+
+Use rename OLD NEW to change a name or move a field into/out of a credential.
+Renaming preserves IDs, values, limits and leak reports. Changing a value or
+type assigns a new ID. put NAME VALUE also works for sensitive values, but
+prints a reminder to remove the command from shell history.
 
 Examples:
   # Call an API with a token; exec hides the token if curl prints it
@@ -158,7 +165,11 @@ Examples:
   # Type a password into a tmux pane that is waiting at a password prompt
   agsecret send tmux:PANE ID
 
-  # Read a current TOTP code
+  # Use tmux's marked pane on another server
+  AGSECRET_TMUX_SOCKET=/tmp/work.sock agsecret send 'tmux:{marked}' ID
+
+  # Read a plain value or current TOTP code
+  agsecret get github:username
   agsecret get TOTP_ID
 
 Notes for agents:
@@ -167,12 +178,16 @@ Notes for agents:
   - If a secret is refused because it expired, is disabled or has no uses left,
     ask the user. put NAME --ttl 1h --uses 2 sets a lifetime and shared use cap.
     Never use options whose names start with --dangerously.
-  - Use exec or send for passwords. get prints TOTP codes; it refuses passwords
-    by default in every shell, including pipes and command substitutions.
+  - Use exec or send for passwords. get prints plain values and TOTP codes;
+    it refuses passwords by default in every shell, including pipes and
+    command substitutions.
     exec substitutes IDs and filters its child's stdout/stderr.
-  - get, exec and send share one counter per ID. Each authorized invocation
-    costs one use, even if the downstream command fails. Repeated IDs in one
-    exec cost one use each; list, view and report do not consume uses.
+  - Passwords and TOTP share a counter per ID across get, exec and send.
+    Each authorized invocation costs one use, even if the downstream command
+    fails. Repeated IDs in one
+    exec cost one use each; ls, view and report do not consume uses.
+  - plain values are directly visible, never protected or counted. They do not
+    support --access, --ttl or --uses. Use a plain field for a URL or note.
   - If you see a password in plain text anyway, run "agsecret report ID" and
     tell the user.
   - Only exact copies are hidden. Encoded copies, files and network traffic are
@@ -205,8 +220,9 @@ func newRoot(o *options) *cobra.Command {
 		target.InitDefaultVersionFlag()
 		return target.Help()
 	}})
-	r.AddCommand(newInit(o), newPut(o), newList(o), newView(o), newGet(o), newExec(o), newSend(o), newReport(o), newDelete(o))
-	for _, c := range r.Commands() {
+	r.AddCommand(newInit(o), newPut(o), newList(o), newView(o), newGet(o), newExec(o), newSend(o), newReport(o), newDelete(o), newRename(o), newCredential(o))
+	var markStarted func(*cobra.Command)
+	markStarted = func(c *cobra.Command) {
 		// Cobra validates flag groups after the pre-run hooks, so only the
 		// start of RunE reliably separates usage errors from runtime errors.
 		if run := c.RunE; run != nil {
@@ -215,7 +231,11 @@ func newRoot(o *options) *cobra.Command {
 				return run(cmd, args)
 			}
 		}
+		for _, child := range c.Commands() {
+			markStarted(child)
+		}
 	}
+	markStarted(r)
 	return r
 }
 

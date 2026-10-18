@@ -35,7 +35,7 @@ func newExec(o *options) *cobra.Command {
 		Long: `Run a command, replacing each secret ID in its arguments and environment
 variables with the secret's value (for a TOTP secret, its current code).
 
-Any stored value that shows up in the command's output is replaced with
+Matching sensitive values in the command's output are replaced with
 [REDACTED:ID], and a note on standard error lists the IDs. Only exact copies
 are caught: encoded values, files, network connections and writes straight to
 the terminal are not.
@@ -56,9 +56,10 @@ arguments or environment variables instead.
 IDs in executable names and tmux/screen arguments are still refused; use send
 for terminal panes. Arguments can be visible to process inspectors.
 
-Each distinct ID consumes one use, shared with get and send, before starting
+Each distinct sensitive ID consumes one use, shared with get and send, before starting
 the command. Repeating it in arguments/environment costs no extra uses.
-After authorization, a failed command still consumes its uses.
+After authorization, a failed command still consumes its uses. plain IDs
+expand without redaction or usage counting; code-position rules still apply.
 
 The command's input and output go through pipes, and it runs without a
 controlling terminal, so it cannot write to the terminal past the filter.
@@ -181,7 +182,7 @@ func unsafeArgs(args []string) []string {
 func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, error) {
 	var protected []redact.Secret
 	for _, r := range records {
-		if r.Expired(now) || (r.Type == "password" && len(r.Secret) < 4) {
+		if r.Type == "plain" || r.Expired(now) || (r.Type == "password" && len(r.Secret) < 4) {
 			continue
 		}
 		protected = append(protected, redact.Secret{ID: r.ID, Value: r.Secret})
@@ -266,7 +267,9 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: note: no secret IDs found in the command or environment, so nothing was filled in")
 		}
 		for id, value := range injected {
-			protected = append(protected, redact.Secret{ID: id, Value: value})
+			if byID[id].Type != "plain" {
+				protected = append(protected, redact.Secret{ID: id, Value: value})
+			}
 		}
 		return consumeUses(s, slices.Sorted(maps.Keys(injected)), "exec")
 	})

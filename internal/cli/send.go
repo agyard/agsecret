@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -17,17 +18,18 @@ func newSend(o *options) *cobra.Command {
 	var noEnter, skipCheck bool
 	c := &cobra.Command{
 		Use:   "send tmux:PANE NAME|ID",
-		Short: "Type a secret into a tmux password prompt",
-		Long: `Type a password, or the current code of a TOTP secret, into a tmux pane and
-press Enter. PANE is any tmux target, such as 0, work:1.0 or %3.
+		Short: "Type a value into a tmux pane",
+		Long: `Type a plain value, password, or current TOTP code into a tmux pane and
+press Enter. PANE uses tmux target syntax, such as 0, work:1.0, %3 or {marked}.
+Set AGSECRET_TMUX_SOCKET to a socket path to select another tmux server.
+Otherwise tmux uses its usual environment, including TMUX and TMUX_TMPDIR.
 
-The pane must be waiting at a password prompt that hides what you type, like
-the ones from sudo, ssh or psql. Other panes are refused, so a secret is never
-typed into a shell where it would be shown or run as a command.
+Passwords and TOTP codes require a password prompt that hides what you type,
+like the ones from sudo, ssh or psql. Plain values can be typed at any prompt.
 
-Passwords that contain newlines or other control characters cannot be typed
-safely; use exec for those. After the pane check passes, each send consumes one
-use shared with get and exec, even if the subsequent injection fails.`,
+Values containing newlines or other control characters cannot be typed safely;
+use exec for those. After the pane check passes, sending a password or TOTP code
+consumes one use shared with get and exec, even if injection fails.`,
 		Example: "  agsecret send tmux:db ID\n  agsecret send tmux:%3 ID --no-enter",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
@@ -54,32 +56,39 @@ use shared with get and exec, even if the subsequent injection fails.`,
 				// tmux's literal mode only disables key-name interpretation; the
 				// terminal still acts on newlines and interrupt keys.
 				if bytes.IndexFunc(value, unicode.IsControl) >= 0 {
-					return errors.New("cannot type this password because it contains control characters that the terminal would act on; use agsecret exec instead")
+					return errors.New("cannot type this value because it contains control characters that the terminal would act on; use agsecret exec instead")
 				}
 				// display-message falls back to the current pane for unknown
 				// targets, so check the target with send-keys first.
-				if out, err := exec.Command("tmux", "send-keys", "-t", pane).CombinedOutput(); err != nil {
+				if out, err := tmuxCommand("send-keys", "-t", pane).CombinedOutput(); err != nil {
 					return fmt.Errorf("no tmux pane %q: %s", pane, strings.TrimSpace(string(out)))
 				}
-				out, err := exec.Command("tmux", "display-message", "-p", "-t", pane, "#{pane_tty}").Output()
+				out, err := tmuxCommand("display-message", "-p", "-t", pane, "#{pane_id}\t#{pane_tty}").Output()
 				if err != nil {
 					return fmt.Errorf("cannot inspect tmux pane %q: %w", pane, err)
 				}
-				prompt, err := atPasswordPrompt(strings.TrimSpace(string(out)))
-				if err != nil {
-					return err
+				// Keep relative and marked targets fixed between inspection and typing.
+				paneID, ttyPath, ok := strings.Cut(strings.TrimSpace(string(out)), "\t")
+				if !ok || !strings.HasPrefix(paneID, "%") || ttyPath == "" {
+					return fmt.Errorf("cannot resolve tmux pane %q", pane)
 				}
-				if !prompt && !skipCheck {
-					return fmt.Errorf("tmux pane %q is not waiting at a password prompt, so the secret could be shown or run as a command", pane)
+				if r.Type != "plain" {
+					prompt, err := atPasswordPrompt(ttyPath)
+					if err != nil {
+						return err
+					}
+					if !prompt && !skipCheck {
+						return fmt.Errorf("tmux pane %q is not waiting at a password prompt, so the secret could be shown or run as a command", pane)
+					}
 				}
 				if err := consumeUses(s, []string{r.ID}, "send"); err != nil {
 					return err
 				}
-				if err := exec.Command("tmux", "send-keys", "-t", pane, "-l", "--", string(value)).Run(); err != nil {
+				if err := tmuxCommand("send-keys", "-t", paneID, "-l", "--", string(value)).Run(); err != nil {
 					return fmt.Errorf("cannot type into tmux pane %q: %w", pane, err)
 				}
 				if !noEnter {
-					if err := exec.Command("tmux", "send-keys", "-t", pane, "Enter").Run(); err != nil {
+					if err := tmuxCommand("send-keys", "-t", paneID, "Enter").Run(); err != nil {
 						return fmt.Errorf("cannot press Enter in tmux pane %q: %w", pane, err)
 					}
 				}
@@ -90,4 +99,11 @@ use shared with get and exec, even if the subsequent injection fails.`,
 	c.Flags().BoolVar(&noEnter, "no-enter", false, "do not press Enter after typing")
 	c.Flags().BoolVar(&skipCheck, "dangerously-skip-check", false, "type even if the pane is not at a password prompt (for people only, never for agents)")
 	return c
+}
+
+func tmuxCommand(args ...string) *exec.Cmd {
+	if socket := os.Getenv("AGSECRET_TMUX_SOCKET"); socket != "" {
+		args = append([]string{"-S", socket}, args...)
+	}
+	return exec.Command("tmux", args...)
 }

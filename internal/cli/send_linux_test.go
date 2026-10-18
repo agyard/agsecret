@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/agyard/agsecret/internal/store"
 	"golang.org/x/sys/unix"
 )
 
@@ -95,16 +96,22 @@ func TestSendChecksEchoAndUsesLiteralTmuxArguments(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "send.log")
 	stub := `#!/bin/sh
+[ "$TMUX" = 'inherited-socket,123,0' ] || exit 30
+if [ -n "$AGSECRET_TMUX_SOCKET" ]; then
+  [ "$1" = '-S' ] && [ "$2" = "$AGSECRET_TMUX_SOCKET" ] || exit 31
+  shift 2
+fi
 case "$1" in
   display-message)
-    [ "$#" -eq 5 ] && [ "$2" = '-p' ] && [ "$3" = '-t' ] && [ "$4" = 'dev:0.1' ] && [ "$5" = '#{pane_tty}' ] || exit 32
-    printf '%s\n' "$AGSECRET_TEST_TMUX_TTY"
+    [ "$#" -eq 5 ] && [ "$2" = '-p' ] && [ "$3" = '-t' ] && [ "$4" = "$AGSECRET_TEST_TMUX_TARGET" ] && [ "$5" = '#{pane_id}	#{pane_tty}' ] || exit 32
+    printf '%%9\t%s\n' "$AGSECRET_TEST_TMUX_TTY"
     ;;
   send-keys)
     if [ "$#" -eq 3 ]; then
-      [ "$3" = 'dev:0.1' ] && exit 0
+      [ "$3" = "$AGSECRET_TEST_TMUX_TARGET" ] && exit 0
       exit 34
     fi
+    [ "$3" = '%9' ] || exit 35
     printf '%s\n' "$@" >> "$AGSECRET_TEST_TMUX_LOG"
     ;;
   *) exit 33 ;;
@@ -116,6 +123,9 @@ esac
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("AGSECRET_TEST_TMUX_TTY", ttyPath)
 	t.Setenv("AGSECRET_TEST_TMUX_LOG", logPath)
+	t.Setenv("AGSECRET_TEST_TMUX_TARGET", "dev:0.1")
+	t.Setenv("AGSECRET_TMUX_SOCKET", filepath.Join(dir, "socket with spaces"))
+	t.Setenv("TMUX", "inherited-socket,123,0")
 	secret := "-pa ss;word"
 	id := c.put("send-test", secret)["id"].(string)
 	readLog := func() string {
@@ -141,8 +151,8 @@ esac
 			t.Fatalf("tmux typed a refused secret: %q", got)
 		}
 	}
-	literal := "send-keys\n-t\ndev:0.1\n-l\n--\n" + secret + "\n"
-	enter := "send-keys\n-t\ndev:0.1\nEnter\n"
+	literal := "send-keys\n-t\n%9\n-l\n--\n" + secret + "\n"
+	enter := "send-keys\n-t\n%9\nEnter\n"
 	setPTYMode(t, master, false, false)
 	if code, out, errText := c.call("", "send", "tmux:dev:0.1", id); code == 0 || out != "" || !strings.Contains(errText, "not waiting at a password prompt") {
 		t.Fatalf("echo check: code=%d out=%q err=%q", code, out, errText)
@@ -175,7 +185,7 @@ esac
 	c.put("send-otp", seed, "--type", "totp")
 	c.ok("", "send", "tmux:dev:0.1", "send-otp", "--no-enter")
 	got := readLog()
-	prefix := "send-keys\n-t\ndev:0.1\n-l\n--\n"
+	prefix := "send-keys\n-t\n%9\n-l\n--\n"
 	if !strings.HasPrefix(got, prefix) || !strings.HasSuffix(got, "\n") {
 		t.Fatalf("TOTP send arguments: %q", got)
 	}
@@ -209,6 +219,34 @@ esac
 	}
 	assertNoSend()
 	c.assertUsage(limited, 2, 2)
+
+	// Plain fields work at visible prompts and accept tmux's own target syntax.
+	plainID := c.put("login:username", "test-user", "--type", "plain")["id"].(string)
+	setPTYMode(t, master, true, true)
+	for _, target := range []string{"%3", "{marked}", "~", "=dev:0.1"} {
+		resetLog()
+		t.Setenv("AGSECRET_TEST_TMUX_TARGET", target)
+		c.ok("", "send", "tmux:"+target, plainID)
+		if got := readLog(); got != prefix+"test-user\n"+enter {
+			t.Fatalf("plain send to %q: %q", target, got)
+		}
+	}
+	// An unset override leaves tmux's inherited socket selection untouched.
+	resetLog()
+	t.Setenv("AGSECRET_TMUX_SOCKET", "")
+	c.ok("", "send", "tmux:=dev:0.1", plainID, "--no-enter")
+	if got := readLog(); got != prefix+"test-user\n" {
+		t.Fatalf("inherited socket: %q", got)
+	}
+	s, err := store.Open(c.db, []byte("test-passphrase"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	r, err := s.Get(plainID, false)
+	if err != nil || r.UsedCount != 0 {
+		t.Fatalf("plain send consumed a use: count=%d err=%v", r.UsedCount, err)
+	}
 }
 
 func TestSendRejectsControlCharactersBeforeCallingTmux(t *testing.T) {

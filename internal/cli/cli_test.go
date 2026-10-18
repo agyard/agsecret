@@ -74,7 +74,7 @@ func (c testCLI) id(name string) string {
 }
 
 func TestHelpAndUsageErrors(t *testing.T) {
-	for _, command := range []string{"", "init", "put", "list", "view", "get", "exec", "send", "report", "delete"} {
+	for _, command := range []string{"", "init", "put", "ls", "view", "get", "exec", "send", "report", "delete"} {
 		helpArgs, flagArgs := []string{"help"}, []string{"--help"}
 		if command != "" {
 			helpArgs, flagArgs = []string{"help", command}, []string{command, "--help"}
@@ -92,12 +92,12 @@ func TestHelpAndUsageErrors(t *testing.T) {
 		t.Fatalf("version: code=%d out=%q", code, out)
 	}
 	for args, want := range map[string]string{
-		"lst":                            `unknown command "lst"; did you mean "list"?`,
+		"lst":                            `unknown command "lst"; did you mean "ls"?`,
 		"show x":                         `did you mean "view"?`,
 		"run echo":                       `did you mean "exec"?`,
 		"help nonsense":                  `no help for "nonsense"`,
 		"view":                           "usage: agsecret view NAME|ID",
-		"list extra":                     "usage: agsecret list",
+		"ls extra":                       "usage: agsecret ls",
 		"exec":                           "usage: agsecret exec -- COMMAND [ARG...]",
 		"get x --json":                   "unknown flag: --json",
 		"send tmux:0 x --no-enter false": "write boolean flags as --flag=false",
@@ -161,7 +161,7 @@ func TestWorkflow(t *testing.T) {
 	if out, _ := c.ok("", "report", id, "--reason", "printed by a debug endpoint"); out != "Reported a leak of api ("+id+")\n" {
 		t.Fatalf("report: %q", out)
 	}
-	if text, _ := c.ok("", "list"); !strings.Contains(text, "leaked (1)") || !strings.Contains(text, "get,exec") {
+	if text, _ := c.ok("", "ls"); !strings.Contains(text, "leaked (1)") || !strings.Contains(text, "get,exec") {
 		t.Fatalf("list: %q", text)
 	}
 	if text, _ := c.ok("", "view", "api"); !strings.Contains(text, "Leaked:") || !strings.Contains(text, "printed by a debug endpoint") {
@@ -188,10 +188,10 @@ func TestWorkflow(t *testing.T) {
 	if deleted := c.record("rm", "api"); deleted["name"] != "api" {
 		t.Fatalf("delete: %v", deleted)
 	}
-	if code, _, errText := c.call("", "view", "api"); code != 1 || !strings.Contains(errText, "secret api not found; run agsecret list") {
+	if code, _, errText := c.call("", "view", "api"); code != 1 || !strings.Contains(errText, "secret api not found; run agsecret ls") {
 		t.Fatalf("deleted secret: code=%d err=%q", code, errText)
 	}
-	if out, _ := c.ok("", "list"); !strings.HasPrefix(out, "No secrets yet") {
+	if out, _ := c.ok("", "ls"); !strings.HasPrefix(out, "No secrets yet") {
 		t.Fatalf("empty list: %q", out)
 	}
 	if code, _, errText := c.call("", "view", "ags_123"); code != 1 || !strings.Contains(errText, "not a valid ID") {
@@ -272,7 +272,7 @@ func TestVaultSetup(t *testing.T) {
 		t.Fatalf("repeated init: out=%q err=%q", out, errText)
 	}
 	missing := filepath.Join(t.TempDir(), "missing.db")
-	for _, args := range [][]string{{"list"}, {"put", "x"}} {
+	for _, args := range [][]string{{"ls"}, {"put", "x"}} {
 		if code, _, errText := c.call("value", append([]string{"--db", missing}, args...)...); code != 1 || !strings.Contains(errText, "no vault at "+missing+"; run agsecret init") {
 			t.Fatalf("missing vault %v: code=%d err=%q", args, code, errText)
 		}
@@ -280,7 +280,7 @@ func TestVaultSetup(t *testing.T) {
 	if err := os.WriteFile(c.pass, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if code, _, errText := c.call("", "list"); code != 1 || !strings.Contains(errText, "pass file "+c.pass+": the value is empty") {
+	if code, _, errText := c.call("", "ls"); code != 1 || !strings.Contains(errText, "pass file "+c.pass+": the value is empty") {
 		t.Fatalf("empty pass file: code=%d err=%q", code, errText)
 	}
 }
