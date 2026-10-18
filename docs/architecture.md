@@ -2,9 +2,9 @@
 
 AG-Secret is a Go CLI built with Cobra. Each run opens one local SQLite vault,
 does its work and exits. Secret values stay in memory only as long as a
-command needs them. `get` prints a password only with an explicit
-`--dangerously-skip-check`; the CLI never prints a TOTP seed, only its current
-code.
+command needs them. `get` checks its output context before printing a password;
+the CLI never prints a TOTP seed, only its current code. These checks reduce
+accidental exposure, not deliberate extraction by a receiving program.
 
 Each secret has a name and a random ID. The ID stays the same while the value
 and type stay the same. Changing either one assigns a new ID, and the old ID
@@ -45,17 +45,27 @@ Each process opens one connection with a 5-second busy timeout and
 `synchronous=FULL`. Writes use immediate transactions, and commands that only
 read never write.
 
-- **put** reads the existing secret and applies only the changes it was given,
+- **put** reads the existing secret by name and applies only the changes it was given,
   so two people changing different options at once do not undo each other.
-  Without the value, it refuses changes that widen access or extend the expiry,
+  Without the value, it refuses changes that widen access, extend the expiry or
+  increase the use limit,
   unless given `--dangerously-skip-check`. If the value or type changed, it
   assigns a new ID and clears the leak reports in the same transaction. If the same password is stored under other names,
   including expired or disabled ones, put prints a note naming them.
 - **report** looks up the password for an ID and adds the report to every
   password with that value, in a single transaction. Expired and disabled
   secrets are included; TOTP secrets are not. Reports never change access.
-- **exec** reads all secrets at once, closes the vault, and then starts the
-  command.
+- **get/send/exec** validate the output context or target and prepare the values.
+  Immediately before handing them out, an immediate transaction rechecks all
+  referenced IDs for expiry, access and remaining uses and increments each
+  distinct ID's counter once. Any refusal rolls back the whole batch. IDs
+  invalidated by a concurrent rotation are rejected. Downstream failures do not
+  refund a committed authorization. Exec closes the vault before child launch.
+
+`--uses 0` means unlimited. Same-value updates retain the count, while a changed
+value or type resets it with the new ID. Limits omitted from put stay unchanged.
+Output redaction reads do not consume uses. These counters govern CLI
+authorizations, not reuse of a value by a child process.
 
 Concurrent commands are applied in some serial order. If a secret is replaced
 after a report, the replacement clears that report. A report that uses an old
@@ -71,9 +81,12 @@ value of a secret; it is not a password or capability.
 
 The database has a single `secrets` table: name, ID, type (`password` or
 `totp`), value, timestamps in whole seconds, the two access options, and the
-leak reports as a JSON array of `reported_at` and `reason`. `PRAGMA
-user_version` records the format version, and agsecret refuses versions it does
-not know without changing them.
+leak reports as a JSON array of `reported_at` and `reason`. Format 2 adds
+`max_uses` (0 means unlimited) and `used_count`. Opening a format 1 vault adds
+these columns in an immediate transaction, rechecking the version under the
+lock so concurrent upgrades are safe. Existing records start at 0/0. Unknown
+format versions are refused without modification; older binaries cannot read
+the upgraded format.
 
 The `.unlock` file holds the random database key, encrypted with
 XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id (time
@@ -88,9 +101,8 @@ database tamper-proof. Protect the vault, the pass file and any backups with
 file permissions. Anyone who can read the pass file can decrypt the vault, so
 programs running as the same user are trusted.
 
-Requiring the value to loosen limits means an agent cannot renew or re-enable
-a secret it is not allowed to use, since it cannot get the value through the
-CLI. `--dangerously` options bypass such checks and are meant for people only;
+Requiring the value to loosen limits discourages accidental renewals or access
+changes. `--dangerously` options bypass such checks and are meant for people only;
 AG-Secret cannot tell a person from an agent running as the same user. Hiding TOTP seeds from the CLI's output
 likewise does not protect them from code that can read the database or process
 memory. On Windows, use a private directory; the Unix permission checks do not
@@ -98,7 +110,9 @@ audit ACLs.
 
 ## exec
 
-exec replaces IDs in the command's arguments and environment in a single pass,
+`exec -- COMMAND [ARG...]` runs separate arguments directly; `exec -c SCRIPT`
+explicitly selects /bin/sh (cmd.exe on Windows). Quoted arguments are never
+automatically split. exec replaces IDs in arguments and environment in a single pass,
 so an ID that appears inside a secret's value is never expanded. Text that
 looks like a mistyped ID (`ags_` plus eight or more hex digits in any case that
 do not form a valid ID) is an error rather than being passed through as literal
@@ -140,11 +154,16 @@ its output pipes. exec is not a sandbox.
 
 ## get and send
 
-`get` never prints a password unless given `--dangerously-skip-check`. Checking
-whether standard output is a terminal would not protect agents that run
-commands in a pseudo-terminal, and inspecting the process tree cannot follow
-commands started through tmux or screen servers, so the explicit flag is the
-only switch. TOTP codes are short-lived and are printed without it.
+`get` on Linux finds the nearest shell running `-c`, using the final `)` to
+parse `/proc/PID/stat` even if the process name contains parentheses. A pipe
+different from that shell's stdout and stderr is treated as an indirect pipe
+or command substitution. Direct capture and regular-file redirection are
+refused. Without a command-shell ancestor, terminal output is permitted; other
+platforms allow terminal output or require `--dangerously-skip-check`.
+TOTP codes bypass this output-context check. The consumer's output is never
+filtered, and an indirect consumer can print the password again. Process and
+TTY heuristics cannot distinguish every agent from a person and are not a
+security boundary.
 
 `send` refuses passwords with control characters before it runs tmux, because
 tmux's literal mode does not stop the terminal from acting on newlines or

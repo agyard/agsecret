@@ -89,7 +89,7 @@ func TestIDsChangeWithTheValue(t *testing.T) {
 	if _, err := s.Report(first.Record.ID, "exposed"); err != nil {
 		t.Fatal(err)
 	}
-	same, err := s.Put(first.Record.ID, Change{AllowGet: ptr(false)})
+	same, err := s.Put("api", Change{AllowGet: ptr(false)})
 	if err != nil || same.Record.ID != first.Record.ID || same.PreviousID != "" || len(same.Record.Leaks) != 1 || same.Record.AllowGet || !same.Record.AllowExec {
 		t.Fatalf("option change lost identity, reports or options: %+v %v", same, err)
 	}
@@ -104,7 +104,7 @@ func TestIDsChangeWithTheValue(t *testing.T) {
 		if _, err := s.Report(ref, "late"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("stale report on %s: %v", ref, err)
 		}
-		if _, err := s.Put(ref, Change{Secret: []byte("x")}); !errors.Is(err, ErrNotFound) {
+		if _, err := s.Put(ref, Change{Secret: []byte("x")}); err == nil || !strings.Contains(err.Error(), "put takes a name") {
 			t.Fatalf("put by unknown ID %s: %v", ref, err)
 		}
 	}
@@ -396,4 +396,189 @@ func TestCrossProcessWritesDoNotLoseUpdates(t *testing.T) {
 	if err != nil || len(r.Leaks) != 12 || r.AllowGet || r.AllowExec {
 		t.Fatalf("lost cross-process update: reports=%d get=%v exec=%v err=%v", len(r.Leaks), r.AllowGet, r.AllowExec, err)
 	}
+}
+
+func TestUsageLimitsAndAtomicConsumption(t *testing.T) {
+	s, _ := newTestStore(t)
+	max := int64(2)
+	created, err := s.Put("api", Change{Secret: []byte("value"), MaxUses: &max})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created.Record.MaxUses != 2 || created.Record.UsedCount != 0 {
+		t.Fatalf("initial usage state: %+v", created.Record)
+	}
+	for i, ref := range []string{created.Record.ID, "api"} {
+		r, err := s.Consume(ref, "get")
+		if err != nil || r.UsedCount != int64(i+1) || string(r.Secret) != "value" {
+			t.Fatalf("consume %d: %+v %v", i+1, r, err)
+		}
+		clear(r.Secret)
+	}
+	if _, err := s.Consume(created.Record.ID, "get"); !errors.Is(err, ErrNoUses) {
+		t.Fatalf("third use: %v", err)
+	}
+	r, err := s.Get(created.Record.ID, false)
+	if err != nil || r.UsedCount != 2 {
+		t.Fatalf("failed consume changed state: %+v %v", r, err)
+	}
+
+	// A finite limit can be narrowed without the value, but widening it needs
+	// the value (or the explicit caller-side bypass).
+	narrow := int64(1)
+	if _, err := s.Put("api", Change{MaxUses: &narrow}); err != nil {
+		t.Fatalf("narrowing limit: %v", err)
+	}
+	widen := int64(3)
+	if _, err := s.Put("api", Change{MaxUses: &widen}); !errors.Is(err, ErrNeedsValue) {
+		t.Fatalf("widening limit without value: %v", err)
+	}
+	updated, err := s.Put("api", Change{Secret: []byte("value"), MaxUses: &widen})
+	if err != nil || updated.Record.ID != created.Record.ID || updated.Record.UsedCount != 2 || updated.Record.MaxUses != 3 {
+		t.Fatalf("widening with same value: %+v %v", updated, err)
+	}
+	rotated := put(t, s, "api", "new-value")
+	if rotated.Record.ID == created.Record.ID || rotated.Record.UsedCount != 0 || rotated.Record.MaxUses != 3 {
+		t.Fatalf("rotation usage state: %+v", rotated.Record)
+	}
+
+	// A failed batch leaves every counter untouched, and repeated refs count
+	// only once.
+	one := int64(1)
+	first := put(t, s, "first", "one")
+	if _, err := s.Put("first", Change{MaxUses: &one}); err != nil {
+		t.Fatal(err)
+	}
+	second := put(t, s, "second", "two")
+	if _, err := s.Put("second", Change{MaxUses: &one}); err != nil {
+		t.Fatal(err)
+	}
+	used, err := s.ConsumeMany([]string{first.Record.ID, "first"}, "exec")
+	if err != nil || len(used) != 1 || used[0].UsedCount != 1 {
+		t.Fatalf("duplicate refs consumed more than once: %+v %v", used, err)
+	}
+	clear(used[0].Secret)
+	if _, err := s.ConsumeMany([]string{first.Record.ID, second.Record.ID}, "exec"); !errors.Is(err, ErrNoUses) {
+		t.Fatalf("failed batch: %v", err)
+	}
+	secondState, err := s.Get(second.Record.ID, false)
+	if err != nil || secondState.UsedCount != 0 {
+		t.Fatalf("failed batch changed second counter: %+v %v", secondState, err)
+	}
+}
+
+func TestConsumeChecksDoNotSpendUses(t *testing.T) {
+	s, _ := newTestStore(t)
+	put(t, s, "available", "value")
+	past := time.Now().Add(-time.Minute)
+	for _, tc := range []struct {
+		name, action string
+		change       Change
+		want         error
+	}{
+		{"expired", "get", Change{ExpiresAt: ptr(&past)}, ErrExpired},
+		{"deny-get", "get", Change{AllowGet: ptr(false)}, ErrNotAllowed},
+		{"deny-exec", "exec", Change{AllowExec: ptr(false)}, ErrNotAllowed},
+		{"deny-send", "send", Change{AllowExec: ptr(false)}, ErrNotAllowed},
+	} {
+		tc.change.Secret = []byte("value")
+		if _, err := s.Put(tc.name, tc.change); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.ConsumeMany([]string{"available", tc.name}, tc.action); !errors.Is(err, tc.want) {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+	}
+	r, err := s.Get("available", false)
+	if err != nil || r.UsedCount != 0 {
+		t.Fatalf("refused batches consumed uses: %+v %v", r, err)
+	}
+	r, err = s.Consume("available", "exec")
+	defer clear(r.Secret)
+	if err != nil || r.MaxUses != 0 || r.UsedCount != 1 {
+		t.Fatalf("unlimited credential usage: %+v %v", r, err)
+	}
+}
+
+func TestUsageLimitConcurrentConsumption(t *testing.T) {
+	first, path := newTestStore(t)
+	max := int64(5)
+	created := put(t, first, "api", "value")
+	if _, err := first.Put("api", Change{MaxUses: &max}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Open(path, []byte(testPass))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	stores := []*Store{first, second}
+	var wg sync.WaitGroup
+	results := make(chan error, 12)
+	for i := 0; i < 12; i++ {
+		store := stores[i%len(stores)]
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r, err := store.Consume(created.Record.ID, "send")
+			if err == nil {
+				clear(r.Secret)
+			}
+			results <- err
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var success, exhausted int64
+	for err := range results {
+		switch {
+		case err == nil:
+			success++
+		case errors.Is(err, ErrNoUses):
+			exhausted++
+		default:
+			t.Fatalf("concurrent consume: %v", err)
+		}
+	}
+	if success != max || exhausted != 12-max {
+		t.Fatalf("success=%d exhausted=%d", success, exhausted)
+	}
+	r, err := first.Get(created.Record.ID, false)
+	if err != nil || r.UsedCount != max {
+		t.Fatalf("final usage count: %+v %v", r, err)
+	}
+}
+
+func TestMigrateV1UsageColumns(t *testing.T) {
+	s, path := newTestStore(t)
+	original := put(t, s, "api", "value")
+	if _, err := s.db.Exec(`ALTER TABLE secrets DROP COLUMN max_uses;
+ALTER TABLE secrets DROP COLUMN used_count;
+PRAGMA user_version=1;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Go(func() {
+			migrated, err := Open(path, []byte(testPass))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer migrated.Close()
+			r, err := migrated.Get("api", true)
+			defer clear(r.Secret)
+			if err != nil || r.MaxUses != 0 || r.UsedCount != 0 || r.ID != original.Record.ID || string(r.Secret) != "value" {
+				t.Errorf("migrated record: %+v %v", r, err)
+			}
+			var version int
+			if err := migrated.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != SchemaVersion {
+				t.Errorf("migrated schema version: %d %v", version, err)
+			}
+		})
+	}
+	wg.Wait()
 }

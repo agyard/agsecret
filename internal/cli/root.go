@@ -133,9 +133,9 @@ func safeText(s string) string {
 	return b.String()
 }
 
-const guide = `Store passwords and TOTP secrets in an encrypted local vault, and let AI
-agents use them without seeing them. Agents refer to each secret by an ID such
-as ags_3f2a9c0b7d1e4f60. Run "agsecret list" to see the IDs.
+const guide = `Store passwords and TOTP secrets in an encrypted local vault, and help AI
+agents use them while reducing accidental plaintext exposure. Agents refer to
+each secret by an ID such as ags_3f2a9c0b7d1e4f60. Run "agsecret list" to see IDs.
 
 Getting started:
   agsecret init                 # create the vault
@@ -147,7 +147,10 @@ Examples:
   agsecret exec -- curl -H 'Authorization: Bearer ID' https://api.example.com
 
   # Need a shell? Pass the ID in an environment variable
-  TOKEN=ID agsecret exec -- sh -c 'curl -H "Authorization: Bearer $TOKEN" URL | jq'
+  TOKEN=ID agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL | jq'
+
+  # Pass a password as an ordinary argument, with output redaction
+  agsecret exec -- agent-browser fill e1 ID
 
   # A TOTP ID becomes its current code
   agsecret exec -- curl "https://example.com/login?code=ID"
@@ -155,19 +158,31 @@ Examples:
   # Type a password into a tmux pane that is waiting at a password prompt
   agsecret send tmux:PANE ID
 
+  # Let a shell pass a password to the next program (get checks the context)
+  agent-browser fill e1 "$(agsecret get ID)"
+
 Notes for agents:
   - [REDACTED:ID] in output means the value was hidden from you. That is not
     a leak, and there is nothing to report.
-  - If a secret is refused because it expired or is disabled, ask the user.
+  - If a secret is refused because it expired, is disabled or has no uses left,
+    ask the user. put NAME --ttl 1h --uses 2 sets a lifetime and shared use cap.
     Never use options whose names start with --dangerously.
+  - get allows an interactive terminal or, on Linux, an indirect shell pipe
+    or command substitution. It does not filter the consumer's output.
+    exec substitutes IDs and filters its child's stdout/stderr instead.
+  - get, exec and send share one counter per ID. Each authorized invocation
+    costs one use, even if the downstream command fails. Repeated IDs in one
+    exec cost one use each; list, view and report do not consume uses.
   - If you see a password in plain text anyway, run "agsecret report ID" and
     tell the user.
-  - Only exact copies are hidden. Encoded copies and files are not.`
+  - Only exact copies are hidden. Encoded copies, files and network traffic are
+    not. exec and get are convenience checks, not a security boundary; do not
+    use this tool for high-sensitivity secrets.`
 
 func newRoot(o *options) *cobra.Command {
 	r := &cobra.Command{
 		Use:               "agsecret",
-		Short:             "Let AI agents use secrets without seeing them",
+		Short:             "Use credentials in agent workflows with less accidental exposure",
 		Long:              guide,
 		Version:           Version,
 		SilenceUsage:      true,

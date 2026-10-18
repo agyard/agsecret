@@ -4,7 +4,7 @@
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
-AG-Secret keeps passwords and TOTP secrets in an encrypted local vault and lets AI agents use them without seeing them. An agent refers to a secret by its ID. `agsecret exec` fills in the real value when it starts a command and hides that value if it shows up in the command's output.
+AG-Secret keeps passwords and TOTP secrets in an encrypted local vault and helps AI agents use them while reducing accidental plaintext exposure. An agent refers to a secret by its ID. `agsecret exec` fills in the real value when it starts a command and hides that value if it shows up in the command's output.
 
 ## Installation
 
@@ -43,17 +43,18 @@ printf '%s' "$API_TOKEN" | agsecret put api --stdin
 
 Tell your agent to run `agsecret --help`. The top of that page is written for agents: how to use IDs, a few examples, and what to do when something is refused or leaks. Each command's `--help` has the details.
 
-In short:
+Key workflow:
 
-- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints TOTP codes but never passwords.
+- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` permits an interactive terminal and, on Linux, an indirect shell pipe or command substitution; direct captured output is refused.
+- `get` is useful when the surrounding shell passes the value to a consumer, for example `agent-browser fill e1 "$(agsecret get ID)"`. `exec` replaces IDs in command arguments and environment variables and redacts exact values in output.
 - If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
 - When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret list --json` rather than remember them.
 - `init`, `put`, `list`, `view`, `report` and `delete` accept `--json`. Errors and notes go to standard error.
 - Exit codes: `0` success, `1` error, `2` usage error. `exec` returns the command's own exit code, or `125`, `126` or `127` if agsecret fails or the command cannot be run.
 
-### Seeing a password yourself
+### Getting a password through a shell
 
-`get` refuses to print a password, so an agent cannot read one by accident, whatever kind of terminal it runs in. To see a password yourself, add `--dangerously-skip-check`:
+`get` checks where its output is going. On Linux it permits indirect pipes and command substitutions; it refuses direct captured output and regular-file redirection. An interactive terminal is also allowed. The receiving program's output is not filtered. To bypass the check for a trusted destination:
 
 ```sh
 agsecret get github --dangerously-skip-check | pbcopy
@@ -61,16 +62,25 @@ agsecret get github --dangerously-skip-check | pbcopy
 
 The flag is for people. The help tells agents never to use options that start with `--dangerously`, but agsecret cannot tell a person from an agent running as the same user, so keep an eye on what your agent runs.
 
+`exec --` preserves separate arguments. `exec -c` explicitly uses `/bin/sh` (`cmd.exe` on Windows); it never guesses whether a quoted argument is a command string:
+
+```sh
+agsecret exec -- agent-browser fill e1 ags_0123456789abcdef
+TOKEN=ags_0123456789abcdef agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL'
+```
+
+IDs inside interpreter code, such as `bash -c 'echo ID'`, are refused because shell syntax in the substituted password could execute commands. Pass the ID as an argument or environment value instead.
+
 ## Commands
 
 | Command | Description |
 | --- | --- |
 | `init` | Create the vault, or check that an existing vault opens |
-| `put NAME\|ID` | Add a secret, or change its value or options |
+| `put NAME` | Add a secret, or change its value or options |
 | `list` | List secrets and their IDs |
 | `view NAME\|ID` | Show details about a secret, but not its value |
-| `get NAME\|ID` | Print a TOTP code |
-| `exec -- COMMAND [ARG...]` | Run a command with secrets filled in by ID |
+| `get NAME\|ID` | Print a TOTP code or password when the output context allows it |
+| `exec -- COMMAND [ARG...]` / `exec -c SCRIPT` | Run a command with secrets filled in by ID |
 | `send tmux:PANE NAME\|ID` | Type a secret into a tmux password prompt |
 | `report ID` | Report that a password was exposed |
 | `delete NAME\|ID` | Delete a secret |
@@ -90,17 +100,22 @@ Flags override environment variables. On Unix, the pass file must be private to 
 
 - `--type totp` stores a TOTP seed (Base32 or an `otpauth://totp/` URI) instead of a password.
 - `--ttl 7d` makes the secret expire after seven days. `90m`, `12h` and `2w` also work; `0` means never.
+- `--uses 2` permits two total authorizations for the current ID across `get`, `exec`, and `send`. `0` means unlimited.
 - `--access exec` lets agents use the secret only through `exec` and `send`. The other choices are `get,exec` (the default), `get` and `none`.
 
-You can narrow access or bring the expiry closer without the value. Widening access or extending the expiry needs the value (`put` asks for it in a terminal), so an agent cannot lift limits you set. If you don't have the value at hand, add `--dangerously-skip-check`.
+You can narrow access, bring the expiry closer or reduce the use limit without the value. Widening these limits needs the value (`put` asks for it in a terminal), or the explicit `--dangerously-skip-check` override.
+
+For example, `agsecret put api --ttl 1h --uses 2` sets both limits by name. Counters are atomic across concurrent commands. Each distinct ID in one `exec` costs one use, even if it appears in multiple arguments or environment variables. Authorization consumes the use before output or execution; downstream failure does not refund it. Rejected contexts, disabled/expired credentials, `list`, `view`, and `report` consume nothing.
+
+`list` and `view` show used/allowed counts; JSON includes `max_uses` and `used_count`. Resubmitting the same value preserves the counter. Replacing its value or type gives it a new ID and resets the counter, while preserving limits not explicitly changed. Existing vaults upgrade automatically on first open; their credentials start with unlimited uses.
 
 ## Security
 
 The vault is an SQLite database encrypted with Adiantum. Its key is encrypted with XChaCha20-Poly1305, under a key derived from the passphrase with Argon2id. The encryption hides your data, but it does not detect tampering or rollback.
 
-`exec` hides only exact copies of stored values. Encoded copies, files and network traffic are not hidden. The command gets no terminal, so it cannot write past the filter, but it also cannot prompt; use `send` for password prompts. AG-Secret is not a sandbox: any program that can read the pass file or agsecret's memory can get the secrets.
+AG-Secret balances convenience with reducing accidental exposure. It is not a security boundary and is not recommended for highly sensitive credentials. `exec` hides only exact copies of stored values; Base64, custom encodings, files and network traffic can bypass it. The command gets no controlling terminal; use `send` for password prompts. Any program that can read the pass file or agsecret's memory can get the secrets. Expiry and use limits govern AG-Secret authorizations, not what a receiving program does with a value it already has.
 
-`send` types only into a pane that is waiting at a password prompt, so a password is not typed into a shell by mistake.
+`send` checks for terminal settings typical of a password prompt to reduce accidental typing into a shell. These settings cannot prove which program is receiving the value.
 
 [docs/architecture.md](docs/architecture.md) covers the storage format, locking and design decisions.
 

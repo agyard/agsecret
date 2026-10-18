@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +27,7 @@ import (
 )
 
 func newExec(o *options) *cobra.Command {
+	var script string
 	c := &cobra.Command{
 		Use:        "exec -- COMMAND [ARG...]",
 		SuggestFor: []string{"run"},
@@ -37,15 +40,25 @@ Any stored value that shows up in the command's output is replaced with
 are caught: encoded values, files, network connections and writes straight to
 the terminal are not.
 
-The command runs without a shell. A shell or interpreter would run a value
-placed in its code, so IDs in code such as sh -c or python -c are refused, as
-are IDs given to tmux or screen (use send for those). Pass the ID in an
-environment variable instead:
+With -- COMMAND [ARG...], each argument stays separate; no shell is added.
+Use -c SCRIPT to run a command string through /bin/sh (cmd.exe on Windows).
+There is no automatic detection or splitting of a quoted command string.
+IDs in ordinary arguments, such as echo ID or agent-browser fill e1 ID, work
+directly. Prefer an environment variable when a shell is needed:
 
   TOKEN=ID agsecret exec -- sh -c 'curl -H "Authorization: Bearer $TOKEN" URL'
 
-Environment variables are also safer than arguments, which other users can
-see with ps.
+  TOKEN=ID agsecret exec -c 'echo "$TOKEN"'
+
+IDs placed inside interpreter code are refused: quotes, substitutions and
+shell operators in a password could execute commands. Pass them through
+arguments or environment variables instead.
+IDs in executable names and tmux/screen arguments are still refused; use send
+for terminal panes. Arguments can be visible to process inspectors.
+
+Each distinct ID consumes one use, shared with get and send, before starting
+the command. Repeating it in arguments/environment costs no extra uses.
+After authorization, a failed command still consumes its uses.
 
 The command's input and output go through pipes, and it runs without a
 controlling terminal, so it cannot write to the terminal past the filter.
@@ -58,12 +71,24 @@ command cannot be run, agsecret exits with 126, or 127 if it is not found. For
 any other agsecret error, it exits with 125.`,
 		DisableFlagsInUseLine: true,
 		Args: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("command") {
+				if len(args) != 0 || script == "" {
+					return errors.New("use either -c SCRIPT or -- COMMAND [ARG...]")
+				}
+				return nil
+			}
 			if len(args) == 0 {
 				return fmt.Errorf("usage: %s", cmd.UseLine())
 			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if cmd.Flags().Changed("command") {
+				args = []string{"/bin/sh", "-c", script}
+				if runtime.GOOS == "windows" {
+					args = []string{"cmd.exe", "/d", "/s", "/c", script}
+				}
+			}
 			err := runExpanded(o, cmd, args)
 			if _, ok := errors.AsType[*exitError](err); err != nil && !ok {
 				err = &exitError{code: 125, err: err}
@@ -71,6 +96,7 @@ any other agsecret error, it exits with 125.`,
 			return err
 		},
 	}
+	c.Flags().StringVarP(&script, "command", "c", "", "run a shell command string (/bin/sh, or cmd.exe on Windows)")
 	c.Flags().SetInterspersed(false)
 	return c
 }
@@ -117,7 +143,7 @@ func expandTokens(value string, records map[string]store.Record, now time.Time, 
 
 // codeRunners parse their options and first operand as code, so a secret
 // placed there would run instead of being passed as data.
-var codeRunners = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "python", "python3", "node", "perl", "ruby", "php"}
+var codeRunners = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "python", "python3", "node", "perl", "ruby", "php", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"}
 
 // unsafeArgs returns the arguments in which an ID is refused: the code given
 // to a code runner, which may follow wrappers such as env, timeout or sudo,
@@ -132,6 +158,9 @@ func unsafeArgs(args []string) []string {
 		case name == "tmux" || name == "screen":
 			return args[i:]
 		case slices.Contains(codeRunners, name):
+			if name == "cmd" || name == "cmd.exe" {
+				return args[i+1:]
+			}
 			for j := i + 1; j < len(args); j++ {
 				switch a := args[j]; {
 				case slices.Contains([]string{"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, a):
@@ -177,73 +206,72 @@ func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, er
 
 func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 	if tokenPattern.MatchString(args[0]) {
-		return errors.New("the command name cannot contain a secret ID; pass IDs as separate arguments")
+		return errors.New("the command name cannot contain a secret ID; pass the command and each argument as separate words")
 	}
-	for _, arg := range unsafeArgs(args) {
+	codeArgs := unsafeArgs(args)
+	for _, arg := range codeArgs {
 		if !tokenPattern.MatchString(arg) {
 			continue
 		}
-		if name := filepath.Base(args[0]); name == "tmux" || name == "screen" {
+		if name := filepath.Base(codeArgs[0]); name == "tmux" || name == "screen" {
 			return errors.New("use agsecret send to type a secret into a terminal pane")
 		}
-		return errors.New(`the secret would be read as code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -- sh -c '... "$TOKEN" ...'`)
+		return errors.New(`the secret would be read as code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -c '... "$TOKEN" ...'`)
 	}
 	var records []store.Record
-	err := o.withStore(func(s *store.Store) error {
-		var err error
-		records, err = s.List(true)
-		return err
-	})
-	if err != nil {
-		return err
-	}
+	var protected []redact.Secret
+	injected := make(map[string][]byte)
+	expanded := make([]string, len(args))
+	env := os.Environ()
 	defer func() {
 		for _, r := range records {
 			clear(r.Secret)
 		}
-	}()
-	now := time.Now()
-	protected, err := protectedValues(records, now)
-	defer func() {
 		for _, secret := range protected {
 			clear(secret.Value)
 		}
-	}()
-	if err != nil {
-		return err
-	}
-	byID := make(map[string]store.Record, len(records))
-	for _, r := range records {
-		byID[r.ID] = r
-	}
-	injected := make(map[string][]byte)
-	defer func() {
 		for _, value := range injected {
 			clear(value)
 		}
 	}()
-	expanded := make([]string, len(args))
-	for i, arg := range args {
-		if expanded[i], err = expandTokens(arg, byID, now, injected); err != nil {
+	err := o.withStore(func(s *store.Store) error {
+		var err error
+		if records, err = s.List(true); err != nil {
 			return err
 		}
-	}
-	env := os.Environ()
-	for i, item := range env {
-		key, value, found := strings.Cut(item, "=")
-		if !found {
-			continue
+		now := time.Now()
+		if protected, err = protectedValues(records, now); err != nil {
+			return err
 		}
-		if value, err = expandTokens(value, byID, now, injected); err != nil {
-			return fmt.Errorf("in environment variable %s: %w", key, err)
+		byID := make(map[string]store.Record, len(records))
+		for _, r := range records {
+			byID[r.ID] = r
 		}
-		env[i] = key + "=" + value
-	}
-	if len(injected) == 0 {
-		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: note: no secret IDs found in the command or environment, so nothing was filled in")
-	}
-	for id, value := range injected {
-		protected = append(protected, redact.Secret{ID: id, Value: value})
+		for i, arg := range args {
+			if expanded[i], err = expandTokens(arg, byID, now, injected); err != nil {
+				return err
+			}
+		}
+		for i, item := range env {
+			key, value, found := strings.Cut(item, "=")
+			if !found {
+				continue
+			}
+			if value, err = expandTokens(value, byID, now, injected); err != nil {
+				return fmt.Errorf("in environment variable %s: %w", key, err)
+			}
+			env[i] = key + "=" + value
+		}
+		if len(injected) == 0 {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: note: no secret IDs found in the command or environment, so nothing was filled in")
+		}
+		for id, value := range injected {
+			protected = append(protected, redact.Secret{ID: id, Value: value})
+		}
+		return consumeUses(s, slices.Sorted(maps.Keys(injected)), "exec")
+	})
+	if err != nil {
+		return err
 	}
 
 	// Supplying Writers lets os/exec own its copy goroutines and wait for

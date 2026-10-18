@@ -122,8 +122,11 @@ func TestWorkflow(t *testing.T) {
 	if view := c.record("view", id); view["name"] != "api" || view["value"] != nil {
 		t.Fatalf("view: %v", view)
 	}
-	if code, out, errText := c.call("", "get", id); code != 1 || out != "" || !strings.Contains(errText, "get does not print passwords") {
+	if code, out, errText := c.call("", "get", id); code != 2 || out != "" || !strings.Contains(errText, "refused to print a password directly") {
 		t.Fatalf("get: code=%d out=%q err=%s", code, out, errText)
+	}
+	if code, out, errText := c.call("replacement", "put", id, "--stdin"); code != 2 || out != "" || !strings.Contains(errText, "put takes a name, not an ID") {
+		t.Fatalf("put by ID: code=%d out=%q err=%q", code, out, errText)
 	}
 	if out, errText := c.ok("", "get", id, "--dangerously-skip-check"); out != "secret-value\n" || errText != "" {
 		t.Fatalf("revealed get: out=%q err=%q", out, errText)
@@ -294,6 +297,13 @@ func TestExecNoteIsRedactedAndExitCodes(t *testing.T) {
 	code, out, errText := c.call("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", id)
 	if code != 0 || out != "[REDACTED:"+id+"]\n" || strings.Contains(errText, "leak") || !strings.Contains(errText, "redacted "+id) {
 		t.Fatalf("note leaked a secret: code=%d out=%q err=%q", code, out, errText)
+	}
+	// IDs are ordinary argument substitutions, including for browser and CLI
+	// tools that take several positional arguments.
+	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "fill e1 leak")
+	code, out, errText = c.call("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", "fill", "e1", id)
+	if code != 0 || out != "fill e1 [REDACTED:"+id+"]\n" || strings.Contains(errText, "leak") {
+		t.Fatalf("multi-argument ID expansion: code=%d out=%q err=%q", code, out, errText)
 	}
 	if _, errText := c.ok("", "exec", "--", "true"); !strings.Contains(errText, "no secret IDs found") {
 		t.Fatalf("no-ID note: %q", errText)

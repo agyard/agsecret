@@ -18,13 +18,14 @@ import (
 
 func newPut(o *options) *cobra.Command {
 	var kind, ttlText, accessText string
+	var maxUses int64
 	var fromStdin bool
 	var c store.Change
 	cmd := &cobra.Command{
-		Use:        "put NAME|ID",
+		Use:        "put NAME",
 		SuggestFor: []string{"add", "set", "store", "insert", "update"},
 		Short:      "Add or update a secret",
-		Long: `Add a secret, or update an existing one by name or ID.
+		Long: `Add a secret, or update an existing one by name.
 
 put reads the value from standard input with --stdin, or from a hidden
 prompt when you run it in a terminal. Never type the value itself into a
@@ -33,9 +34,14 @@ a Base32 seed or an otpauth://totp/ URI.
 
 Options you leave out keep their current values. You can narrow access or
 bring the expiry closer without the value, for example with --access exec.
-Widening access or extending the expiry needs the value, so that an agent
-cannot lift limits the user set. Changing the value or type gives the secret a
-new ID, and the old ID stops working.`,
+Widening access or extending the expiry needs the value to discourage
+accidental changes to the user's limits. Changing the value or type gives it a
+new ID, and the old ID stops working. --uses limits total get/exec/send
+authorizations for that ID (0 means unlimited). A changed value or type resets
+the counter; resubmitting the same value preserves it. Increasing the limit
+requires the value, just like extending expiry.
+A put always names the credential; use
+its ID with get, view, send, exec or report.`,
 		Example: `  # Store a token from an environment variable
   printf '%s' "$GITHUB_TOKEN" | agsecret put github --stdin
 
@@ -48,6 +54,9 @@ new ID, and the old ID stops working.`,
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
 				return err
+			}
+			if store.ValidID(args[0]) {
+				return errors.New("put takes a name, not an ID; changing the value creates a new ID automatically")
 			}
 			if cmd.Flags().Changed("type") {
 				c.Type = &kind
@@ -66,6 +75,12 @@ new ID, and the old ID stops working.`,
 				}
 				c.AllowGet, c.AllowExec = &get, &exec
 			}
+			if cmd.Flags().Changed("uses") {
+				if maxUses < 0 {
+					return errors.New("--uses must be zero or greater (0 means unlimited)")
+				}
+				c.MaxUses = &maxUses
+			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -78,7 +93,7 @@ new ID, and the old ID stops working.`,
 			in := cmd.InOrStdin()
 			var err error
 			switch {
-			case !fromStdin && c.Type == nil && (c.ExpiresAt != nil || c.AllowGet != nil):
+			case !fromStdin && c.Type == nil && (c.ExpiresAt != nil || c.AllowGet != nil || c.MaxUses != nil):
 			case isTerminal(in):
 				c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "Value for "+args[0]+" (hidden): ")
 			case fromStdin:
@@ -123,8 +138,9 @@ new ID, and the old ID stops working.`,
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "read the value from standard input (a trailing newline is dropped)")
 	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password or totp")
 	cmd.Flags().StringVar(&ttlText, "ttl", "", "time until the secret expires, such as 12h, 7d or 2w, or 0 for never")
+	cmd.Flags().Int64Var(&maxUses, "uses", 0, "total get/exec/send authorizations allowed for this ID (0 means unlimited)")
 	cmd.Flags().StringVar(&accessText, "access", "", "what agents may do: get,exec (the default), exec (which includes send), get or none")
-	cmd.Flags().BoolVar(&c.SkipCheck, "dangerously-skip-check", false, "widen access or extend the expiry without the value (for people only, never for agents)")
+	cmd.Flags().BoolVar(&c.SkipCheck, "dangerously-skip-check", false, "loosen access, expiry or usage limits without the value (for people only)")
 	return addJSONFlag(cmd, o)
 }
 
@@ -198,6 +214,9 @@ func useValue(r store.Record, now time.Time, action string) ([]byte, error) {
 	if !allowed {
 		return nil, fmt.Errorf("%s is turned off for %s (%s); turning it on is up to the user (see agsecret put --help)", action, r.Name, r.ID)
 	}
+	if r.MaxUses > 0 && r.UsedCount >= r.MaxUses {
+		return nil, fmt.Errorf("%s (%s) has no uses left; ask the user to change its limit", r.Name, r.ID)
+	}
 	if r.Type == "totp" {
 		code, err := totp.Generate(string(r.Secret), now)
 		return []byte(code), err
@@ -209,12 +228,17 @@ func newGet(o *options) *cobra.Command {
 	var skipCheck bool
 	c := &cobra.Command{
 		Use:   "get NAME|ID",
-		Short: "Print a TOTP code",
-		Long: `Print the current code of a TOTP secret.
+		Short: "Print a TOTP code or password",
+		Long: `Print a TOTP code or password.
 
-get does not print passwords, because the output may end up in front of an
-agent. Programs should receive passwords through exec or send. To see a
-password yourself, add --dangerously-skip-check.`,
+For passwords, the default check allows an interactive terminal and, on Linux,
+an indirect shell pipe or command substitution, but refuses direct captured
+output and file redirection. This keeps
+get useful for an agent-controlled workflow such as feeding a password to a
+program while catching accidental prints into the agent transcript. Use exec
+or send when they fit better. To bypass the context check, add
+--dangerously-skip-check. The receiving program's output is not filtered.
+Each authorized get consumes one use, shared with exec and send.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {
@@ -224,13 +248,18 @@ password yourself, add --dangerously-skip-check.`,
 				}
 				defer clear(r.Secret)
 				if r.Type == "password" && !skipCheck {
-					return fmt.Errorf("%s is a password, and get does not print passwords; use agsecret exec or send to pass it to a program (people: see agsecret get --help)", r.Name)
+					if err := trustedTerminal(cmd.OutOrStdout()); err != nil {
+						return err
+					}
 				}
 				value, err := useValue(r, time.Now(), "get")
 				if err != nil {
 					return err
 				}
 				defer clear(value)
+				if err := consumeUses(s, []string{r.ID}, "get"); err != nil {
+					return err
+				}
 				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", value)
 				return err
 			})
@@ -261,7 +290,7 @@ func newView(o *options) *cobra.Command {
 					expires = r.ExpiresAt.Local().Format(time.DateTime)
 				}
 				w := newTable(cmd.OutOrStdout())
-				fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\nStatus:\t%s\nAccess:\t%s\nExpires:\t%s\n", r.Name, r.ID, r.Type, status(r), access(r), expires)
+				fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\nStatus:\t%s\nAccess:\t%s\nExpires:\t%s\nUses:\t%s\n", r.Name, r.ID, r.Type, status(r), access(r), expires, usageText(r))
 				for _, leak := range r.Leaks {
 					fmt.Fprintf(w, "Leaked:\t%s %s\n", leak.ReportedAt.Local().Format(time.DateTime), safeText(leak.Reason))
 				}
@@ -279,6 +308,9 @@ func status(r store.Record) string {
 	if r.Expired(time.Now()) {
 		parts = append(parts, "expired")
 	}
+	if r.MaxUses > 0 && r.UsedCount >= r.MaxUses {
+		parts = append(parts, "exhausted")
+	}
 	if len(parts) == 0 {
 		return "active"
 	}
@@ -286,6 +318,13 @@ func status(r store.Record) string {
 }
 
 func newTable(out io.Writer) *tabwriter.Writer { return tabwriter.NewWriter(out, 0, 0, 2, ' ', 0) }
+
+func usageText(r store.Record) string {
+	if r.MaxUses == 0 {
+		return fmt.Sprintf("%d/unlimited", r.UsedCount)
+	}
+	return fmt.Sprintf("%d/%d", r.UsedCount, r.MaxUses)
+}
 
 func newList(o *options) *cobra.Command {
 	return addJSONFlag(&cobra.Command{
@@ -310,9 +349,9 @@ func newList(o *options) *cobra.Command {
 					return err
 				}
 				w := newTable(out)
-				fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS")
+				fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS\tUSES")
 				for _, r := range records {
-					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", r.Name, r.ID, r.Type, status(r), access(r))
+					fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.Name, r.ID, r.Type, status(r), access(r), usageText(r))
 				}
 				return w.Flush()
 			})

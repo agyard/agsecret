@@ -26,7 +26,8 @@ the ones from sudo, ssh or psql. Other panes are refused, so a secret is never
 typed into a shell where it would be shown or run as a command.
 
 Passwords that contain newlines or other control characters cannot be typed
-safely; use exec for those.`,
+safely; use exec for those. After the pane check passes, each send consumes one
+use shared with get and exec, even if the subsequent injection fails.`,
 		Example: "  agsecret send tmux:db ID\n  agsecret send tmux:%3 ID --no-enter",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
@@ -70,6 +71,9 @@ safely; use exec for those.`,
 				}
 				if !prompt && !skipCheck {
 					return fmt.Errorf("tmux pane %q is not waiting at a password prompt, so the secret could be shown or run as a command", pane)
+				}
+				if err := consumeUses(s, []string{r.ID}, "send"); err != nil {
+					return err
 				}
 				if err := exec.Command("tmux", "send-keys", "-t", pane, "-l", "--", string(value)).Run(); err != nil {
 					return fmt.Errorf("cannot type into tmux pane %q: %w", pane, err)

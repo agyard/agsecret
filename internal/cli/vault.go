@@ -170,7 +170,18 @@ func recordJSON(r store.Record) map[string]any {
 		"created_at": r.CreatedAt, "updated_at": r.UpdatedAt,
 		"expires_at": r.ExpiresAt, "expired": r.Expired(time.Now()),
 		"access": access(r), "leaks": r.Leaks,
+		"max_uses": r.MaxUses, "used_count": r.UsedCount,
 	}
+}
+
+// Values were prepared from a snapshot. Recheck the current IDs and consume
+// all uses atomically before handing any value to another process or output.
+func consumeUses(s *store.Store, ids []string, action string) error {
+	records, err := s.ConsumeMany(ids, action)
+	for _, r := range records {
+		clear(r.Secret)
+	}
+	return err
 }
 
 func recordsJSON(records []store.Record) []map[string]any {

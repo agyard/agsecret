@@ -83,7 +83,10 @@ case "$1" in
     printf '%s\n' "$AGSECRET_TEST_TMUX_TTY"
     ;;
   send-keys)
-    [ "$#" -eq 3 ] && exit 0  # target check
+    if [ "$#" -eq 3 ]; then
+      [ "$3" = 'dev:0.1' ] && exit 0
+      exit 34
+    fi
     printf '%s\n' "$@" >> "$AGSECRET_TEST_TMUX_LOG"
     ;;
   *) exit 33 ;;
@@ -162,6 +165,32 @@ esac
 	if len(code) != 6 || strings.Trim(code, "0123456789") != "" || strings.Contains(got, seed) {
 		t.Fatalf("TOTP send did not use a six-digit code: %q", got)
 	}
+
+	// get and send share one counter; invalid panes and prompts cost no use.
+	resetLog()
+	limited := c.put("send-limited", secret, "--uses", "2")["id"].(string)
+	if code, _, errText := c.call("", "send", "tmux:missing", limited); code != 1 || !strings.Contains(errText, "no tmux pane") {
+		t.Fatalf("missing pane: code=%d err=%q", code, errText)
+	}
+	setPTYMode(t, master, true, true)
+	if code, _, errText := c.call("", "send", "tmux:dev:0.1", limited); code != 1 || !strings.Contains(errText, "not waiting at a password prompt") {
+		t.Fatalf("visible prompt: code=%d err=%q", code, errText)
+	}
+	assertNoSend()
+	c.assertUsage(limited, 2, 0)
+	c.ok("", "get", limited, "--dangerously-skip-check")
+	setPTYMode(t, master, false, true)
+	c.ok("", "send", "tmux:dev:0.1", limited)
+	if got := readLog(); got != literal+enter {
+		t.Fatalf("limited send: %q, want %q", got, literal+enter)
+	}
+	c.assertUsage(limited, 2, 2)
+	resetLog()
+	if code, out, errText := c.call("", "send", "tmux:dev:0.1", limited); code != 1 || out != "" || !strings.Contains(errText, "no uses left") {
+		t.Fatalf("exhausted send: code=%d out=%q err=%q", code, out, errText)
+	}
+	assertNoSend()
+	c.assertUsage(limited, 2, 2)
 }
 
 func TestSendRejectsControlCharactersBeforeCallingTmux(t *testing.T) {

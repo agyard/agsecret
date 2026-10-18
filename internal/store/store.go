@@ -32,7 +32,7 @@ import (
 )
 
 const (
-	SchemaVersion            = 1
+	SchemaVersion            = 2
 	MaxSecretLen             = 1 << 20
 	maxNameBytes             = 128
 	maxUnlockDescriptorBytes = 4096
@@ -42,6 +42,9 @@ var (
 	ErrNotFound = errors.New("not found")
 	// ErrNeedsValue means a change without the value would loosen limits.
 	ErrNeedsValue = errors.New("put needs the value")
+	ErrExpired    = errors.New("expired")
+	ErrNotAllowed = errors.New("not allowed")
+	ErrNoUses     = errors.New("no uses left")
 )
 
 // Record is a stored secret. Secret holds the value only when a caller asks
@@ -55,6 +58,10 @@ type Record struct {
 	ExpiresAt *time.Time
 	AllowGet  bool
 	AllowExec bool
+	// MaxUses limits authorized get/exec/send attempts, including downstream
+	// failures. Zero means unlimited. UsedCount is shared by all three actions.
+	MaxUses   int64
+	UsedCount int64
 	Leaks     []Leak
 	Secret    []byte
 }
@@ -270,9 +277,11 @@ const schema = `CREATE TABLE secrets (
  expires_at TEXT,
  allow_get INTEGER NOT NULL,
  allow_exec INTEGER NOT NULL,
+ max_uses INTEGER NOT NULL DEFAULT 0 CHECK(max_uses >= 0),
+ used_count INTEGER NOT NULL DEFAULT 0 CHECK(used_count >= 0),
  leaks TEXT NOT NULL
 );
-PRAGMA user_version=1;`
+PRAGMA user_version=2;`
 
 // connect takes ownership of key and erases it on failure or Close.
 func connect(name string, key []byte, create bool) (*Store, error) {
@@ -304,10 +313,45 @@ func checkSchema(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return errors.New("cannot read the vault; it may be damaged or not an agsecret vault")
 	}
+	if version == 1 {
+		if err := migrateV1ToV2(db); err != nil {
+			return fmt.Errorf("cannot migrate the vault to format version 2: %w", err)
+		}
+		version = SchemaVersion
+	}
 	if version != SchemaVersion {
 		return fmt.Errorf("the vault has format version %d, but this agsecret reads version %d", version, SchemaVersion)
 	}
 	return nil
+}
+
+func migrateV1ToV2(db *sql.DB) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	// Another opener may have finished migrating while we waited for the lock.
+	var version int
+	if err := tx.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return err
+	}
+	if version == SchemaVersion {
+		return nil
+	}
+	if version != 1 {
+		return fmt.Errorf("unexpected format version %d", version)
+	}
+	if _, err := tx.Exec("ALTER TABLE secrets ADD COLUMN max_uses INTEGER NOT NULL DEFAULT 0 CHECK(max_uses >= 0)"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("ALTER TABLE secrets ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0 CHECK(used_count >= 0)"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("PRAGMA user_version=2"); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func (s *Store) Close() error {
@@ -378,6 +422,10 @@ type Change struct {
 	ExpiresAt **time.Time
 	AllowGet  *bool
 	AllowExec *bool
+	// MaxUses is the total number of authorized get/exec/send attempts. A
+	// value of zero means unlimited. Extending a finite limit requires Secret
+	// or SkipCheck, just like widening access.
+	MaxUses   *int64
 	SkipCheck bool
 }
 
@@ -389,15 +437,21 @@ type PutResult struct {
 	Duplicates []string // names of other passwords with the same value
 }
 
-// Put stores a secret under its name or current ID. Without a value, only the
+// Put stores a secret under its name. Without a value, only the
 // options change. A new value or type assigns a new ID and clears the leak
 // reports in the same transaction, so the old ID stops working.
 func (s *Store) Put(ref string, c Change) (PutResult, error) {
+	if ValidID(ref) {
+		return PutResult{}, errors.New("put takes a name, not an ID; changing the value creates a new ID automatically")
+	}
 	if err := validateRef(ref); err != nil {
 		return PutResult{}, err
 	}
 	if c.Secret != nil && (!validSize(c.Secret) || !utf8.Valid(c.Secret)) {
 		return PutResult{}, errors.New("the value must be 1 byte to 1 MiB of UTF-8 text without NUL bytes")
+	}
+	if c.MaxUses != nil && *c.MaxUses < 0 {
+		return PutResult{}, errors.New("max uses must be zero or greater")
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -406,7 +460,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	defer tx.Rollback()
 	r, err := getRecord(tx, ref, true)
 	defer clear(r.Secret)
-	created := errors.Is(err, ErrNotFound) && !ValidID(ref)
+	created := errors.Is(err, ErrNotFound)
 	switch {
 	case created && c.Secret == nil:
 		return PutResult{}, fmt.Errorf("secret %s does not exist yet, so it needs a value", ref)
@@ -431,6 +485,9 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	if c.AllowExec != nil {
 		r.AllowExec = *c.AllowExec
 	}
+	if c.MaxUses != nil {
+		r.MaxUses = *c.MaxUses
+	}
 	switch r.Type {
 	case "password":
 	case "totp":
@@ -447,7 +504,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		r.ExpiresAt = &expires
 	}
 	if c.Secret == nil && !c.SkipCheck && loosens(previous, r) {
-		return PutResult{}, fmt.Errorf("%w of %s to widen its access or extend its expiry", ErrNeedsValue, r.Name)
+		return PutResult{}, fmt.Errorf("%w of %s to widen its access, extend its expiry or increase its uses", ErrNeedsValue, r.Name)
 	}
 	result := PutResult{Created: created}
 	r.UpdatedAt = now()
@@ -458,7 +515,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		if r.ID, err = uniqueID(tx); err != nil {
 			return PutResult{}, err
 		}
-		r.CreatedAt, r.Leaks = r.UpdatedAt, []Leak{}
+		r.CreatedAt, r.Leaks, r.UsedCount = r.UpdatedAt, []Leak{}, 0
 	}
 	var expires any
 	if r.ExpiresAt != nil {
@@ -468,11 +525,11 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	if err != nil {
 		return PutResult{}, err
 	}
-	_, err = tx.Exec(`INSERT INTO secrets(name,id,type,secret,created_at,updated_at,expires_at,allow_get,allow_exec,leaks)
- VALUES(?,?,?,?,?,?,?,?,?,?)
+	_, err = tx.Exec(`INSERT INTO secrets(name,id,type,secret,created_at,updated_at,expires_at,allow_get,allow_exec,max_uses,used_count,leaks)
+ VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
  ON CONFLICT(name) DO UPDATE SET id=excluded.id,type=excluded.type,secret=excluded.secret,created_at=excluded.created_at,
- updated_at=excluded.updated_at,expires_at=excluded.expires_at,allow_get=excluded.allow_get,allow_exec=excluded.allow_exec,leaks=excluded.leaks`,
-		r.Name, r.ID, r.Type, r.Secret, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt), expires, r.AllowGet, r.AllowExec, string(leaks))
+ updated_at=excluded.updated_at,expires_at=excluded.expires_at,allow_get=excluded.allow_get,allow_exec=excluded.allow_exec,max_uses=excluded.max_uses,used_count=excluded.used_count,leaks=excluded.leaks`,
+		r.Name, r.ID, r.Type, r.Secret, encodeTime(r.CreatedAt), encodeTime(r.UpdatedAt), expires, r.AllowGet, r.AllowExec, r.MaxUses, r.UsedCount, string(leaks))
 	if err != nil {
 		return PutResult{}, err
 	}
@@ -491,11 +548,16 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	return result, nil
 }
 
-// loosens reports whether after allows more than before: more access, or a
-// later expiry.
+// loosens reports whether after allows more access, a later expiry or more uses.
 func loosens(before, after Record) bool {
 	return after.AllowGet && !before.AllowGet || after.AllowExec && !before.AllowExec ||
-		before.ExpiresAt != nil && (after.ExpiresAt == nil || after.ExpiresAt.After(*before.ExpiresAt))
+		before.ExpiresAt != nil && (after.ExpiresAt == nil || after.ExpiresAt.After(*before.ExpiresAt)) ||
+		maxUsesLoosens(before.MaxUses, after.MaxUses)
+}
+
+func maxUsesLoosens(before, after int64) bool {
+	// Zero is the unlimited value and therefore the widest setting.
+	return before != 0 && (after == 0 || after > before)
 }
 
 func queryStrings(tx *sql.Tx, query string, args ...any) ([]string, error) {
@@ -530,7 +592,7 @@ func columns(includeSecret bool) string {
 	if includeSecret {
 		secret = "secret"
 	}
-	return "name,id,type," + secret + ",created_at,updated_at,expires_at,allow_get,allow_exec,leaks"
+	return "name,id,type," + secret + ",created_at,updated_at,expires_at,allow_get,allow_exec,max_uses,used_count,leaks"
 }
 
 func scanRecord(scanner interface{ Scan(...any) error }, includeSecret bool) (Record, error) {
@@ -538,7 +600,7 @@ func scanRecord(scanner interface{ Scan(...any) error }, includeSecret bool) (Re
 	var secret []byte
 	var created, updated, leaks string
 	var expires sql.NullString
-	if err := scanner.Scan(&r.Name, &r.ID, &r.Type, &secret, &created, &updated, &expires, &r.AllowGet, &r.AllowExec, &leaks); err != nil {
+	if err := scanner.Scan(&r.Name, &r.ID, &r.Type, &secret, &created, &updated, &expires, &r.AllowGet, &r.AllowExec, &r.MaxUses, &r.UsedCount, &leaks); err != nil {
 		return r, err
 	}
 	defer clear(secret)
@@ -617,6 +679,102 @@ func scanRecords(rows *sql.Rows, err error, includeSecret bool) ([]Record, error
 		return nil, err
 	}
 	return out, nil
+}
+
+// Consume atomically authorizes and records one use of ref for action. The
+// returned record includes its secret so the caller can immediately perform
+// the already-authorized action. action must be get, exec, or send.
+func (s *Store) Consume(ref, action string) (Record, error) {
+	records, err := s.ConsumeMany([]string{ref}, action)
+	if err != nil {
+		return Record{}, err
+	}
+	return records[0], nil
+}
+
+// ConsumeMany atomically authorizes and records one use for each distinct
+// credential named by refs. If any credential cannot be used, no counter is
+// changed. A credential repeated by name, ID, or both is counted once.
+func (s *Store) ConsumeMany(refs []string, action string) ([]Record, error) {
+	if action != "get" && action != "exec" && action != "send" {
+		return nil, fmt.Errorf("unknown consume action %q", action)
+	}
+	if len(refs) == 0 {
+		return []Record{}, nil
+	}
+	for _, ref := range refs {
+		if err := validateRef(ref); err != nil {
+			return nil, err
+		}
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	records := make([]Record, 0, len(refs))
+	seen := make(map[string]struct{}, len(refs))
+	committed := false
+	defer func() {
+		if !committed {
+			for i := range records {
+				clear(records[i].Secret)
+			}
+		}
+	}()
+	for _, ref := range refs {
+		r, err := getRecord(tx, ref, true)
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := seen[r.ID]; ok {
+			clear(r.Secret)
+			continue
+		}
+		seen[r.ID] = struct{}{}
+		records = append(records, r)
+	}
+	checkAt := time.Now().UTC()
+	for _, r := range records {
+		if r.Expired(checkAt) {
+			return nil, fmt.Errorf("secret %s (%s) %w", r.Name, r.ID, ErrExpired)
+		}
+		allowed := r.AllowExec
+		if action == "get" {
+			allowed = r.AllowGet
+		}
+		if !allowed {
+			return nil, fmt.Errorf("secret %s (%s) is %w for %s", r.Name, r.ID, ErrNotAllowed, action)
+		}
+		if r.MaxUses > 0 && r.UsedCount >= r.MaxUses {
+			return nil, fmt.Errorf("secret %s (%s) has %w", r.Name, r.ID, ErrNoUses)
+		}
+	}
+
+	updatedAt := checkAt.Truncate(time.Second)
+	for i := range records {
+		result, err := tx.Exec(`UPDATE secrets
+SET used_count=used_count+1, updated_at=?
+WHERE id=? AND (max_uses=0 OR used_count<max_uses)`, encodeTime(updatedAt), records[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		n, err := result.RowsAffected()
+		if err != nil {
+			return nil, err
+		}
+		if n != 1 {
+			return nil, fmt.Errorf("secret %s (%s) has %w", records[i].Name, records[i].ID, ErrNoUses)
+		}
+		records[i].UsedCount++
+		records[i].UpdatedAt = updatedAt
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	committed = true
+	return records, nil
 }
 
 func (s *Store) Delete(id string) error {
