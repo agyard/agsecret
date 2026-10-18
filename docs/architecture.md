@@ -107,13 +107,11 @@ value of a secret; it is not a password or capability.
 
 The database has a single `secrets` table: name, ID, type (`password`,
 `totp` or `plain`), value, timestamps in whole seconds, the two access options, and the
-leak reports as a JSON array of `reported_at` and `reason`. Format 2 adds
-`max_uses` (0 means unlimited) and `used_count`. Format 3 allows the plain type.
-Opening a format 1 or 2 vault rebuilds the table in an immediate transaction,
-rechecking the version under the lock so concurrent upgrades are safe. All
-records and their state are copied; format 1 records start at 0/0 uses. Unknown
-format versions are refused without modification; older binaries cannot read
-the upgraded format.
+leak reports as a JSON array of `reported_at` and `reason`. Usage is stored in
+`max_uses` (0 means unlimited) and `used_count`. Only format 3 is supported;
+opening a vault checks `PRAGMA user_version` and rejects every other version.
+There are no legacy schemas or migration paths. Rejection never rebuilds or
+replaces the vault.
 
 The `.unlock` file holds the random database key, encrypted with
 XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id (time

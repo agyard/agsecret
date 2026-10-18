@@ -150,7 +150,7 @@ You can narrow access, bring the expiry closer or reduce the use limit without t
 
 For example, `agsecret put api --ttl 1h --uses 2` sets both limits by name. Counters are atomic across concurrent commands. Each distinct ID in one `exec` costs one use, even if it appears in multiple arguments or environment variables. Authorization consumes the use before output or execution; downstream failure does not refund it. Rejected contexts, disabled/expired credentials, `ls`, `view`, and `report` consume nothing.
 
-For sensitive fields, `ls` and `view` show used/allowed counts; JSON includes `max_uses` and `used_count`. Resubmitting the same value preserves the counter. Replacing its value or type gives it a new ID and resets the counter, preserving omitted limits unless changed to plain. Existing vaults upgrade automatically on first open, preserving names, IDs, values, limits and history. The upgraded format requires the current binary.
+For sensitive fields, `ls` and `view` show used/allowed counts; JSON includes `max_uses` and `used_count`. Resubmitting the same value preserves the counter. Replacing its value or type gives it a new ID and resets the counter, preserving omitted limits unless changed to plain. Only the current vault format (3) is supported. Other formats are rejected without migration or replacement.
 
 ## Security
 

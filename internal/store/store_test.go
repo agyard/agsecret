@@ -80,6 +80,33 @@ func TestEncryptedRoundTripAndWrongPassphrase(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsUnsupportedFormatsWithoutChangingThem(t *testing.T) {
+	s, path := newTestStore(t)
+	id := put(t, s, "api", "synthetic-value").Record.ID
+	for _, version := range []int{0, 1, 2, SchemaVersion + 1} {
+		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version=%d", version)); err != nil {
+			t.Fatal(err)
+		}
+		opened, err := Open(path, []byte(testPass))
+		if err == nil {
+			opened.Close()
+			t.Fatalf("accepted unsupported format %d", version)
+		}
+		if !strings.Contains(err.Error(), fmt.Sprintf("format version %d", version)) {
+			t.Fatalf("unexpected format error: %v", err)
+		}
+		var actual int
+		if err := s.db.QueryRow("PRAGMA user_version").Scan(&actual); err != nil || actual != version {
+			t.Fatalf("rejected open changed version: got %d, want %d, err=%v", actual, version, err)
+		}
+		r, err := s.Get(id, true)
+		if err != nil || r.Name != "api" || string(r.Secret) != "synthetic-value" {
+			t.Fatalf("rejected open changed a record: %v", err)
+		}
+		clear(r.Secret)
+	}
+}
+
 func TestIDsChangeWithTheValue(t *testing.T) {
 	s, _ := newTestStore(t)
 	first := put(t, s, "api", "first-value")
@@ -547,44 +574,4 @@ func TestUsageLimitConcurrentConsumption(t *testing.T) {
 	if err != nil || r.UsedCount != max {
 		t.Fatalf("final usage count: %+v %v", r, err)
 	}
-}
-
-func TestMigrateV1UsageColumns(t *testing.T) {
-	s, path := newTestStore(t)
-	original := put(t, s, "api", "value")
-	v2Schema := strings.ReplaceAll(strings.ReplaceAll(schema, ",'plain'", ""), "user_version=3", "user_version=2")
-	if _, err := s.db.Exec("ALTER TABLE secrets RENAME TO v3_secrets;" + v2Schema +
-		`INSERT INTO secrets SELECT * FROM v3_secrets; DROP TABLE v3_secrets;
-ALTER TABLE secrets DROP COLUMN max_uses;
-ALTER TABLE secrets DROP COLUMN used_count;
-PRAGMA user_version=1;`); err != nil {
-		t.Fatal(err)
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	for range 2 {
-		wg.Go(func() {
-			migrated, err := Open(path, []byte(testPass))
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			defer migrated.Close()
-			r, err := migrated.Get("api", true)
-			defer clear(r.Secret)
-			if err != nil || r.MaxUses != 0 || r.UsedCount != 0 || r.ID != original.Record.ID || string(r.Secret) != "value" {
-				t.Errorf("migrated record: %+v %v", r, err)
-			}
-			var version int
-			if err := migrated.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != SchemaVersion {
-				t.Errorf("migrated schema version: %d %v", version, err)
-			}
-			if _, err := migrated.Put("username", Change{Secret: []byte("user"), Type: ptr("plain")}); err != nil {
-				t.Errorf("plain after v1 migration: %v", err)
-			}
-		})
-	}
-	wg.Wait()
 }

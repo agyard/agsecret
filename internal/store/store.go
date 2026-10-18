@@ -313,48 +313,10 @@ func checkSchema(db *sql.DB) error {
 	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		return errors.New("cannot read the vault; it may be damaged or not an agsecret vault")
 	}
-	if version == 1 || version == 2 {
-		if err := migrate(db); err != nil {
-			return fmt.Errorf("cannot migrate the vault to format version %d: %w", SchemaVersion, err)
-		}
-		version = SchemaVersion
-	}
 	if version != SchemaVersion {
 		return fmt.Errorf("the vault has format version %d, but this agsecret reads version %d", version, SchemaVersion)
 	}
 	return nil
-}
-
-func migrate(db *sql.DB) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	// Another opener may have finished migrating while we waited for the lock.
-	var version int
-	if err := tx.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return err
-	}
-	if version == SchemaVersion {
-		return nil
-	}
-	if version != 1 && version != 2 {
-		return fmt.Errorf("unexpected format version %d", version)
-	}
-	if _, err := tx.Exec("ALTER TABLE secrets RENAME TO previous_secrets;" + schema); err != nil {
-		return err
-	}
-	usage := "max_uses,used_count"
-	if version == 1 {
-		usage = "0,0"
-	}
-	if _, err := tx.Exec(`INSERT INTO secrets(name,id,type,secret,created_at,updated_at,expires_at,allow_get,allow_exec,max_uses,used_count,leaks)
-SELECT name,id,type,secret,created_at,updated_at,expires_at,allow_get,allow_exec,` + usage + `,leaks FROM previous_secrets;
-DROP TABLE previous_secrets;`); err != nil {
-		return err
-	}
-	return tx.Commit()
 }
 
 func (s *Store) Close() error {
