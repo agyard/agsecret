@@ -47,6 +47,7 @@ Key workflow:
 
 - Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints plain values and TOTP codes and refuses passwords by default, regardless of shell, terminal or pipe.
 - `exec` replaces IDs in command arguments and environment variables and redacts exact values in output, for example `agsecret exec -- agent-browser fill e1 ID`.
+- TOTP IDs expand to the current code, which remains visible in output. Redaction protects the seed, not the generated code. If those bytes also match a stored password, its redaction rule still applies.
 - If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
 - When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret ls --json` rather than remember them.
 - Metadata and credential commands accept `--json`. Errors and notes go to standard error.

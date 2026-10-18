@@ -35,10 +35,10 @@ func newExec(o *options) *cobra.Command {
 		Long: `Run a command, replacing each secret ID in its arguments and environment
 variables with the secret's value (for a TOTP secret, its current code).
 
-Matching sensitive values in the command's output are replaced with
+Matching passwords and TOTP seeds in the command's output are replaced with
 [REDACTED:ID], and a note on standard error lists the IDs. Only exact copies
 are caught: encoded values, files, network connections and writes straight to
-the terminal are not.
+the terminal are not. Current TOTP codes remain visible, just as with get.
 
 With -- COMMAND [ARG...], each argument stays separate; no shell is added.
 Use -c SCRIPT to run a command string through /bin/sh (cmd.exe on Windows).
@@ -178,7 +178,8 @@ func unsafeArgs(args []string) []string {
 
 // protectedValues lists what output filtering removes: unexpired passwords of
 // at least four bytes, and unexpired TOTP seeds as stored and in canonical
-// Base32. The caller adds the values it injects.
+// Base32. The caller also protects short passwords it injects. Generated
+// TOTP codes are intentionally visible, just as they are through get.
 func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, error) {
 	var protected []redact.Secret
 	for _, r := range records {
@@ -267,7 +268,7 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: note: no secret IDs found in the command or environment, so nothing was filled in")
 		}
 		for id, value := range injected {
-			if byID[id].Type != "plain" {
+			if byID[id].Type == "password" {
 				protected = append(protected, redact.Secret{ID: id, Value: value})
 			}
 		}

@@ -156,7 +156,9 @@ the number of secrets. A match becomes `[REDACTED:<id>]`. If a secret's value
 itself contains that marker, the filter falls back to shorter markers and
 finally to removing the match entirely. The filters cover every unexpired
 password of at least four bytes, every unexpired TOTP seed as stored and in
-canonical Base32, and every value this run injected. When several secrets share
+canonical Base32, and any shorter passwords injected by this run. Generated
+TOTP codes and plain values are not added to the filter. A matching password
+rule still takes precedence if those bytes coincide. When several secrets share
 a value, one ID labels the match, and reporting that ID reaches all of them.
 After both streams finish, a note on standard error lists the hidden IDs; the
 note passes through the filter too. Exact matching cannot catch encoded or

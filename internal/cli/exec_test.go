@@ -61,6 +61,32 @@ func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 	}
 }
 
+func TestExecTOTPCodeVisibleAndSeedRedacted(t *testing.T) {
+	c := newTestCLI(t)
+	const seed = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+	id := c.put("otp", "otpauth://totp/test?secret="+strings.ToLower(seed), "--type", "totp", "--uses", "2")["id"].(string)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGSECRET_EXEC_HELPER", "1")
+	t.Setenv("AGSECRET_EXEC_VALUE", id)
+	args := []string{"exec", "--", executable, "-test.run=^TestExecHelperProcess$", "--"}
+	out, diagnostic := c.ok("", append(args, "both", id)...)
+	codes := strings.Split(strings.TrimSpace(out), "|")
+	if len(codes) != 2 || len(codes[0]) != 6 || strings.Trim(codes[0], "0123456789") != "" || codes[0] != codes[1] || diagnostic != "other-secret" {
+		t.Fatalf("TOTP argv/environment output: out=%q err=%q", out, diagnostic)
+	}
+	c.assertUsage(id, 2, 1)
+	out, diagnostic = c.ok("", append(args, "seed", id)...)
+	parts := strings.Split(out, "|")
+	marker := "[REDACTED:" + id + "]"
+	if len(parts) != 3 || len(parts[0]) != 6 || strings.Trim(parts[0], "0123456789") != "" || parts[1] != marker || parts[2] != marker || !strings.Contains(diagnostic, "redacted "+id) {
+		t.Fatalf("TOTP code/seed output: out=%q err=%q", out, diagnostic)
+	}
+	c.assertUsage(id, 2, 2)
+}
+
 func TestExecHelperProcess(t *testing.T) {
 	if os.Getenv("AGSECRET_EXEC_HELPER") != "1" {
 		return

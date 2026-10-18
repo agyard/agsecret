@@ -188,6 +188,7 @@ Notes for agents:
     exec cost one use each; ls, view and report do not consume uses.
   - plain values are directly visible, never protected or counted. They do not
     support --access, --ttl or --uses. Use a plain field for a URL or note.
+  - TOTP codes remain visible; only the stored seed is protected from output.
   - If you see a password in plain text anyway, run "agsecret report ID" and
     tell the user.
   - Only exact copies are hidden. Encoded copies, files and network traffic are
