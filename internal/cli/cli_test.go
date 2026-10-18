@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -122,7 +123,7 @@ func TestWorkflow(t *testing.T) {
 	if view := c.record("view", id); view["name"] != "api" || view["value"] != nil {
 		t.Fatalf("view: %v", view)
 	}
-	if code, out, errText := c.call("", "get", id); code != 2 || out != "" || !strings.Contains(errText, "refused to print a password directly") {
+	if code, out, errText := c.call("", "get", id); code != 2 || out != "" || !strings.Contains(errText, "get does not print passwords by default") {
 		t.Fatalf("get: code=%d out=%q err=%s", code, out, errText)
 	}
 	if code, out, errText := c.call("replacement", "put", id, "--stdin"); code != 2 || out != "" || !strings.Contains(errText, "put takes a name, not an ID") {
@@ -196,6 +197,37 @@ func TestWorkflow(t *testing.T) {
 	if code, _, errText := c.call("", "view", "ags_123"); code != 1 || !strings.Contains(errText, "not a valid ID") {
 		t.Fatalf("malformed ID: code=%d err=%q", code, errText)
 	}
+}
+
+func TestPasswordGetRefusesFilesAndPipes(t *testing.T) {
+	c := newTestCLI(t)
+	id := c.put("private", "synthetic-output-value", "--uses", "1")["id"].(string)
+	file, err := os.CreateTemp(t.TempDir(), "output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+	for _, output := range []*os.File{file, w} {
+		var diagnostic bytes.Buffer
+		code := Execute([]string{"--db", c.db, "--pass-file", c.pass, "get", id}, strings.NewReader(""), output, &diagnostic)
+		if code != 2 || !strings.Contains(diagnostic.String(), "use agsecret exec or send") {
+			t.Fatalf("password get: code=%d err=%q", code, diagnostic.String())
+		}
+	}
+	if info, err := file.Stat(); err != nil || info.Size() != 0 {
+		t.Fatalf("get wrote to a file: %v", err)
+	}
+	w.Close()
+	if b, err := io.ReadAll(r); err != nil || len(b) != 0 {
+		t.Fatalf("get wrote to a pipe: bytes=%d err=%v", len(b), err)
+	}
+	c.assertUsage(id, 1, 0)
 }
 
 func TestDuplicatesReportsAndTOTP(t *testing.T) {

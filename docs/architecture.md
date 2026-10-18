@@ -2,7 +2,7 @@
 
 AG-Secret is a Go CLI built with Cobra. Each run opens one local SQLite vault,
 does its work and exits. Secret values stay in memory only as long as a
-command needs them. `get` checks its output context before printing a password;
+command needs them. Passwords go through `exec` or `send` by default;
 the CLI never prints a TOTP seed, only its current code. These checks reduce
 accidental exposure, not deliberate extraction by a receiving program.
 
@@ -55,7 +55,7 @@ read never write.
 - **report** looks up the password for an ID and adds the report to every
   password with that value, in a single transaction. Expired and disabled
   secrets are included; TOTP secrets are not. Reports never change access.
-- **get/send/exec** validate the output context or target and prepare the values.
+- **get/send/exec** validate the request or target and prepare the values.
   Immediately before handing them out, an immediate transaction rechecks all
   referenced IDs for expiry, access and remaining uses and increments each
   distinct ID's counter once. Any refusal rolls back the whole batch. IDs
@@ -154,17 +154,12 @@ its output pipes. exec is not a sandbox.
 
 ## get and send
 
-`get` on Linux finds the nearest shell (interactive, script or `-c`), using the final `)` to
-parse `/proc/PID/stat` even if the process name contains parentheses. A pipe
-different from that shell's stdout and stderr is treated as an indirect pipe
-or command substitution. Direct capture and regular-file redirection are
-refused. For terminal output it instead checks for any `-c` shell ancestor;
-without one, terminal output is permitted. Other
-platforms allow terminal output or require `--dangerously-skip-check`.
-TOTP codes bypass this output-context check. The consumer's output is never
-filtered, and an indirect consumer can print the password again. Process and
-TTY heuristics cannot distinguish every agent from a person and are not a
-security boundary.
+`get` refuses passwords by default on all platforms and in all output contexts.
+It prints TOTP codes subject to access, expiry and use limits. People may opt
+into unfiltered plaintext with `--dangerously-skip-check`; agents use `exec` or
+`send` instead. No process ancestry or shell detection is involved. A pipe or
+TTY cannot establish where a consumer will forward the value, so automatic
+output-context exceptions cannot reliably prevent accidental exposure.
 
 `send` refuses passwords with control characters before it runs tmux, because
 tmux's literal mode does not stop the terminal from acting on newlines or

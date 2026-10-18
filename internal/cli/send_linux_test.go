@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,6 +28,23 @@ func testPTY(t *testing.T) (int, string) {
 		t.Fatal(err)
 	}
 	return master, fmt.Sprintf("/dev/pts/%d", number)
+}
+
+func TestPasswordGetRefusesTerminal(t *testing.T) {
+	_, path := testPTY(t)
+	out, err := os.OpenFile(path, os.O_WRONLY|unix.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	c := newTestCLI(t)
+	id := c.put("private", "synthetic-terminal-value", "--uses", "1")["id"].(string)
+	var diagnostic bytes.Buffer
+	code := Execute([]string{"--db", c.db, "--pass-file", c.pass, "get", id}, strings.NewReader(""), out, &diagnostic)
+	if code != 2 || !strings.Contains(diagnostic.String(), "use agsecret exec or send") {
+		t.Fatalf("terminal get: code=%d err=%q", code, diagnostic.String())
+	}
+	c.assertUsage(id, 1, 0)
 }
 
 func setPTYMode(t *testing.T, master int, echo, canonical bool) {

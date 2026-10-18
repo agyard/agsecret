@@ -45,16 +45,16 @@ Tell your agent to run `agsecret --help`. The top of that page is written for ag
 
 Key workflow:
 
-- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` permits an interactive terminal and, on Linux, an indirect shell pipe or command substitution; direct captured output is refused.
-- `get` is useful when the surrounding shell passes the value to a consumer, for example `agent-browser fill e1 "$(agsecret get ID)"`. `exec` replaces IDs in command arguments and environment variables and redacts exact values in output.
+- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints TOTP codes and refuses passwords by default, regardless of shell, terminal or pipe.
+- `exec` replaces IDs in command arguments and environment variables and redacts exact values in output, for example `agsecret exec -- agent-browser fill e1 ID`.
 - If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
 - When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret list --json` rather than remember them.
 - `init`, `put`, `list`, `view`, `report` and `delete` accept `--json`. Errors and notes go to standard error.
 - Exit codes: `0` success, `1` error, `2` usage error. `exec` returns the command's own exit code, or `125`, `126` or `127` if agsecret fails or the command cannot be run.
 
-### Getting a password through a shell
+### Reading a password yourself
 
-`get` checks where its output is going. On Linux it permits indirect pipes and command substitutions; it refuses direct captured output and regular-file redirection. An interactive terminal is also allowed. The receiving program's output is not filtered. To bypass the check for a trusted destination:
+`get` does not infer whether a terminal, pipe or command substitution is safe. People who intentionally need plaintext can use the explicit override for a trusted destination:
 
 ```sh
 agsecret get github --dangerously-skip-check | pbcopy
@@ -79,7 +79,7 @@ IDs inside interpreter code, such as `bash -c 'echo ID'`, are refused because sh
 | `put NAME` | Add a secret, or change its value or options |
 | `list` | List secrets and their IDs |
 | `view NAME\|ID` | Show details about a secret, but not its value |
-| `get NAME\|ID` | Print a TOTP code or password when the output context allows it |
+| `get NAME\|ID` | Print a TOTP code; passwords require an explicit human override |
 | `exec -- COMMAND [ARG...]` / `exec -c SCRIPT` | Run a command with secrets filled in by ID |
 | `send tmux:PANE NAME\|ID` | Type a secret into a tmux password prompt |
 | `report ID` | Report that a password was exposed |

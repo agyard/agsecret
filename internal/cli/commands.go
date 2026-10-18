@@ -228,16 +228,13 @@ func newGet(o *options) *cobra.Command {
 	var skipCheck bool
 	c := &cobra.Command{
 		Use:   "get NAME|ID",
-		Short: "Print a TOTP code or password",
-		Long: `Print a TOTP code or password.
+		Short: "Print a TOTP code",
+		Long: `Print the current code of a TOTP secret.
 
-For passwords, the default check allows an interactive terminal and, on Linux,
-an indirect shell pipe or command substitution, but refuses direct captured
-output and file redirection. This keeps
-get useful for an agent-controlled workflow such as feeding a password to a
-program while catching accidental prints into the agent transcript. Use exec
-or send when they fit better. To bypass the context check, add
---dangerously-skip-check. The receiving program's output is not filtered.
+Passwords go to programs through exec or send. get refuses passwords by
+default in every shell and output context, including terminals, pipes and
+command substitutions. People who intentionally need plaintext may use
+--dangerously-skip-check; its output is not filtered. Agents must not use it.
 Each authorized get consumes one use, shared with exec and send.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -248,9 +245,7 @@ Each authorized get consumes one use, shared with exec and send.`,
 				}
 				defer clear(r.Secret)
 				if r.Type == "password" && !skipCheck {
-					if err := trustedTerminal(cmd.OutOrStdout()); err != nil {
-						return err
-					}
+					return &exitError{code: 2, err: errors.New("get does not print passwords by default; use agsecret exec or send (people: see agsecret get --help)")}
 				}
 				value, err := useValue(r, time.Now(), "get")
 				if err != nil {

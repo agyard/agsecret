@@ -158,8 +158,8 @@ Examples:
   # Type a password into a tmux pane that is waiting at a password prompt
   agsecret send tmux:PANE ID
 
-  # Let a shell pass a password to the next program (get checks the context)
-  agent-browser fill e1 "$(agsecret get ID)"
+  # Read a current TOTP code
+  agsecret get TOTP_ID
 
 Notes for agents:
   - [REDACTED:ID] in output means the value was hidden from you. That is not
@@ -167,16 +167,16 @@ Notes for agents:
   - If a secret is refused because it expired, is disabled or has no uses left,
     ask the user. put NAME --ttl 1h --uses 2 sets a lifetime and shared use cap.
     Never use options whose names start with --dangerously.
-  - get allows an interactive terminal or, on Linux, an indirect shell pipe
-    or command substitution. It does not filter the consumer's output.
-    exec substitutes IDs and filters its child's stdout/stderr instead.
+  - Use exec or send for passwords. get prints TOTP codes; it refuses passwords
+    by default in every shell, including pipes and command substitutions.
+    exec substitutes IDs and filters its child's stdout/stderr.
   - get, exec and send share one counter per ID. Each authorized invocation
     costs one use, even if the downstream command fails. Repeated IDs in one
     exec cost one use each; list, view and report do not consume uses.
   - If you see a password in plain text anyway, run "agsecret report ID" and
     tell the user.
   - Only exact copies are hidden. Encoded copies, files and network traffic are
-    not. exec and get are convenience checks, not a security boundary; do not
+    not. AG-Secret reduces accidental exposure, not deliberate extraction; do not
     use this tool for high-sensitivity secrets.`
 
 func newRoot(o *options) *cobra.Command {
