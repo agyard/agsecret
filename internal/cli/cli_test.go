@@ -350,7 +350,6 @@ func TestExecNoteIsRedactedAndExitCodes(t *testing.T) {
 		{[]string{"exec", "--", t.TempDir()}, 126, "cannot run"},
 		{[]string{"exec", "--", "echo", id + "0"}, 125, "not a valid ID"},
 		{[]string{"exec", "--", "echo", strings.ToUpper(id)}, 125, "not a valid ID"},
-		{[]string{"exec", "--", "env", "sh", "-c", "echo " + id}, 125, "environment variable instead"},
 		{[]string{"exec", "--", id}, 125, "command name cannot contain"},
 	} {
 		code, out, errText := c.call("", tc.args...)

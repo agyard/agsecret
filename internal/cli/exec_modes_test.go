@@ -88,16 +88,15 @@ func TestExecShellEnvironmentPreservesLiteralValue(t *testing.T) {
 	}
 }
 
-func TestExecRefusesCodeIDsAndImplicitShell(t *testing.T) {
+func TestExecRefusesIDsInExplicitScriptAndExecutable(t *testing.T) {
 	c := newTestCLI(t)
-	id := c.put("code", "synthetic-secret")["id"].(string)
+	id := c.put("code", "synthetic-secret", "--uses", "1")["id"].(string)
 	for _, tc := range []struct {
 		args []string
 		want string
 	}{
-		{[]string{"exec", "-c", "echo " + id}, "secret would be read as code"},
-		{[]string{"exec", "--command", "echo " + id}, "secret would be read as code"},
-		{[]string{"exec", "--", "bash", "-c", "echo " + id}, "secret would be read as code"},
+		{[]string{"exec", "-c", "echo " + id}, "environment variable"},
+		{[]string{"exec", "--command", "echo " + id}, "environment variable"},
 		{[]string{"exec", "--", "echo " + id}, "pass the command and each argument as separate words"},
 		{[]string{"exec", "--", id}, "command name cannot contain a secret ID"},
 	} {
@@ -105,8 +104,34 @@ func TestExecRefusesCodeIDsAndImplicitShell(t *testing.T) {
 		if code != 125 || out != "" || !strings.Contains(errText, tc.want) || strings.Contains(errText, "synthetic-secret") {
 			t.Fatalf("%v: code=%d out=%q err=%q", tc.args, code, out, errText)
 		}
+		c.assertUsage(id, 1, 0)
 	}
 	if code, out, errText := c.call("", "exec", "--", "echo ordinary-text"); code != 127 || out != "" || !strings.Contains(errText, "separate words") {
 		t.Fatalf("implicit shell: code=%d out=%q err=%q", code, out, errText)
+	}
+}
+
+func TestExecRejectsExplicitScriptIDsBeforeOpeningVault(t *testing.T) {
+	for _, flag := range []string{"-c", "--command"} {
+		code, out, errText := run("", "--db", filepath.Join(t.TempDir(), "missing.db"), "exec", flag, "echo ags_0123456789abcdef")
+		if code != 125 || out != "" || !strings.Contains(errText, "environment variable") {
+			t.Fatalf("%s: code=%d out=%q err=%q", flag, code, out, errText)
+		}
+	}
+}
+
+func TestExecDirectShellArgumentsAreExpanded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses POSIX sh and env")
+	}
+	c := newTestCLI(t)
+	id := c.put("code", "synthetic-secret", "--uses", "2")["id"].(string)
+	for i, command := range [][]string{{"sh"}, {"env", "sh"}} {
+		args := append([]string{"exec", "--"}, command...)
+		out, errText := c.ok("", append(args, "-c", "printf '%s\\n' "+id)...)
+		if out != "[REDACTED:"+id+"]\n" || !strings.Contains(errText, "redacted "+id) || strings.Contains(errText, "synthetic-secret") {
+			t.Fatalf("%v: out=%q err=%q", command, out, errText)
+		}
+		c.assertUsage(id, 2, int64(i+1))
 	}
 }

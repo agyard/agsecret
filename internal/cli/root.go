@@ -150,10 +150,7 @@ type assigns a new ID. put NAME VALUE also works for sensitive values, but
 prints a reminder to remove the command from shell history.
 
 Examples:
-  # Call an API with a token; exec hides the token if curl prints it
-  agsecret exec -- curl -H 'Authorization: Bearer ID' https://api.example.com
-
-  # Need a shell? Pass the ID in an environment variable
+  # Recommended: keep shell code fixed and pass IDs through the environment
   TOKEN=ID agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL | jq'
 
   # Pass a password as an ordinary argument, with output redaction
@@ -182,6 +179,10 @@ Notes for agents:
     it refuses passwords by default in every shell, including pipes and
     command substitutions.
     exec substitutes IDs and filters its child's stdout/stderr.
+  - Prefer exec -c with environment variables and quoted expansions. IDs in
+    its script are refused. exec -- substitutes arguments without classifying
+    code: bash -c, node -e and similar inputs can execute a substituted value.
+    Output redaction cannot prevent command injection. Avoid eval in scripts.
   - Passwords and TOTP share a counter per ID across get, exec and send.
     Each authorized invocation costs one use, even if the downstream command
     fails. Repeated IDs in one

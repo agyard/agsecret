@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"slices"
@@ -40,26 +39,26 @@ Matching passwords and TOTP seeds in the command's output are replaced with
 are caught: encoded values, files, network connections and writes straight to
 the terminal are not. Current TOTP codes remain visible, just as with get.
 
-With -- COMMAND [ARG...], each argument stays separate; no shell is added.
-Use -c SCRIPT to run a command string through /bin/sh (cmd.exe on Windows).
-There is no automatic detection or splitting of a quoted command string.
-IDs in ordinary arguments, such as echo ID or agent-browser fill e1 ID, work
-directly. Prefer an environment variable when a shell is needed:
+Prefer -c SCRIPT with IDs in environment variables. It uses /bin/sh (cmd.exe
+on Windows) and refuses IDs in SCRIPT itself before any substitution. POSIX
+example: keep the script single-quoted and quote each variable expansion:
 
-  TOKEN=ID agsecret exec -- sh -c 'curl -H "Authorization: Bearer $TOKEN" URL'
+  TOKEN=ID agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL'
 
-  TOKEN=ID agsecret exec -c 'echo "$TOKEN"'
-
-IDs placed inside interpreter code are refused: quotes, substitutions and
-shell operators in a password could execute commands. Pass them through
-arguments or environment variables instead.
-IDs in executable names and tmux/screen arguments are still refused; use send
-for terminal panes. Arguments can be visible to process inspectors.
+With -- COMMAND [ARG...], arguments stay separate and no shell is added.
+IDs in arguments are replaced without inspecting the command's semantics.
+For example, agent-browser fill e1 ID receives the value as one argument.
+But -- bash -c 'echo ID' inserts the value into Bash code: quotes, substitutions
+or operators in the value can execute commands. The caller is responsible for
+code/data boundaries in this mode; output redaction cannot prevent injection.
+Do not pass values to eval or another interpreter's code input in either mode.
+IDs in the executable name are refused. Arguments may be visible to process
+inspectors. For terminal injection, prefer send's target and prompt checks.
 
 Each distinct sensitive ID consumes one use, shared with get and send, before starting
 the command. Repeating it in arguments/environment costs no extra uses.
 After authorization, a failed command still consumes its uses. plain IDs
-expand without redaction or usage counting; code-position rules still apply.
+expand without redaction or usage counting; -c still refuses IDs in its script.
 
 The command's input and output go through pipes, and it runs without a
 controlling terminal, so it cannot write to the terminal past the filter.
@@ -85,6 +84,9 @@ any other agsecret error, it exits with 125.`,
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("command") {
+				if tokenPattern.MatchString(script) {
+					return &exitError{code: 125, err: errors.New(`exec -c does not substitute IDs in shell code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -c 'echo "$TOKEN"'`)}
+				}
 				args = []string{"/bin/sh", "-c", script}
 				if runtime.GOOS == "windows" {
 					args = []string{"cmd.exe", "/d", "/s", "/c", script}
@@ -142,40 +144,6 @@ func expandTokens(value string, records map[string]store.Record, now time.Time, 
 	return b.String(), nil
 }
 
-// codeRunners parse their options and first operand as code, so a secret
-// placed there would run instead of being passed as data.
-var codeRunners = []string{"sh", "bash", "dash", "ash", "zsh", "ksh", "mksh", "fish", "python", "python3", "node", "perl", "ruby", "php", "cmd", "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe"}
-
-// unsafeArgs returns the arguments in which an ID is refused: the code given
-// to a code runner, which may follow wrappers such as env, timeout or sudo,
-// and everything given to tmux or screen, which could type it into a pane
-// where send would refuse.
-func unsafeArgs(args []string) []string {
-	for i, arg := range args {
-		if strings.Contains(arg, "=") {
-			continue
-		}
-		switch name := filepath.Base(arg); {
-		case name == "tmux" || name == "screen":
-			return args[i:]
-		case slices.Contains(codeRunners, name):
-			if name == "cmd" || name == "cmd.exe" {
-				return args[i+1:]
-			}
-			for j := i + 1; j < len(args); j++ {
-				switch a := args[j]; {
-				case slices.Contains([]string{"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}, a):
-					j++ // The next argument is this option's value.
-				case !strings.HasPrefix(a, "-") && !strings.HasPrefix(a, "+"):
-					return args[i+1 : j+1]
-				}
-			}
-			return args[i+1:]
-		}
-	}
-	return nil
-}
-
 // protectedValues lists what output filtering removes: unexpired passwords of
 // at least four bytes, and unexpired TOTP seeds as stored and in canonical
 // Base32. The caller also protects short passwords it injects. Generated
@@ -209,16 +177,6 @@ func protectedValues(records []store.Record, now time.Time) ([]redact.Secret, er
 func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 	if tokenPattern.MatchString(args[0]) {
 		return errors.New("the command name cannot contain a secret ID; pass the command and each argument as separate words")
-	}
-	codeArgs := unsafeArgs(args)
-	for _, arg := range codeArgs {
-		if !tokenPattern.MatchString(arg) {
-			continue
-		}
-		if name := filepath.Base(codeArgs[0]); name == "tmux" || name == "screen" {
-			return errors.New("use agsecret send to type a secret into a terminal pane")
-		}
-		return errors.New(`the secret would be read as code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -c '... "$TOKEN" ...'`)
 	}
 	var records []store.Record
 	var protected []redact.Secret

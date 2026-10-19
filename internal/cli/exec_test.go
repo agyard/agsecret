@@ -100,6 +100,8 @@ func TestExecHelperProcess(t *testing.T) {
 	}
 	mode, value := args[1], args[2]
 	switch mode {
+	case "arguments":
+		fmt.Fprintln(os.Stdout, strings.Join(args[2:], "|"))
 	case "both":
 		fmt.Fprintf(os.Stdout, "%s|%s\n", value, os.Getenv("AGSECRET_EXEC_VALUE"))
 		fmt.Fprint(os.Stderr, "other-secret")
@@ -218,25 +220,18 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	}
 }
 
-func TestUnsafeArgs(t *testing.T) {
-	for _, tc := range []struct {
-		args []string
-		code string
-	}{
-		{[]string{"sh", "-c", "curl $1", "sh", "ags_x"}, "-c|curl $1"},
-		{[]string{"/bin/bash", "-o", "pipefail", "-ec", "script"}, "-o|pipefail|-ec|script"},
-		{[]string{"zsh", "script.sh", "ags_x"}, "script.sh"},
-		{[]string{"fish", "--command=echo"}, "--command=echo"},
-		{[]string{"env", "sh", "-c", "script"}, "-c|script"},
-		{[]string{"timeout", "5", "/bin/bash", "-lc", "script", "arg"}, "-lc|script"},
-		{[]string{"env", "SHELL=/bin/sh", "bash", "-c", "script"}, "-c|script"},
-		{[]string{"python3", "-c", "code", "arg"}, "-c|code"},
-		{[]string{"node", "-e", "code"}, "-e|code"},
-		{[]string{"tmux", "send-keys", "-t", "0", "x"}, "tmux|send-keys|-t|0|x"},
-		{[]string{"curl", "-H", "x", "sh"}, ""},
-	} {
-		if got := strings.Join(unsafeArgs(tc.args), "|"); got != tc.code {
-			t.Fatalf("%v: got %q, want %q", tc.args, got, tc.code)
+func TestExecInterpreterNamesAreOrdinaryArgumentData(t *testing.T) {
+	c := newTestCLI(t)
+	id := c.put("data", "synthetic-secret")["id"].(string)
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGSECRET_EXEC_HELPER", "1")
+	for _, name := range []string{"node", "sh", "tmux", "screen"} {
+		out, errText := c.ok("", "exec", "--", executable, "-test.run=^TestExecHelperProcess$", "--", "arguments", name, id)
+		if out != name+"|[REDACTED:"+id+"]\n" || !strings.Contains(errText, "redacted "+id) {
+			t.Fatalf("%s: out=%q err=%q", name, out, errText)
 		}
 	}
 }

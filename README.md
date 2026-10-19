@@ -25,10 +25,10 @@ agsecret init
 agsecret put api              # type the token at a hidden prompt
 ```
 
-`put` prints the secret's ID; `agsecret ls` shows it again later. Use the ID wherever the command needs the token:
+`put` prints the secret's ID; `agsecret ls` shows it again later. Prefer `exec -c` with the ID in an environment variable and a fixed, single-quoted script (POSIX shell):
 
 ```sh
-agsecret exec -- curl -H 'Authorization: Bearer ags_0123456789abcdef' https://api.example.com/
+TOKEN=ags_0123456789abcdef agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" https://api.example.com/'
 ```
 
 curl receives the real token. If the token appears in the output, it is replaced with `[REDACTED:ags_0123456789abcdef]`.
@@ -46,7 +46,8 @@ Tell your agent to run `agsecret --help`. The top of that page is written for ag
 Key workflow:
 
 - Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints plain values and TOTP codes and refuses passwords by default, regardless of shell, terminal or pipe.
-- `exec` replaces IDs in command arguments and environment variables and redacts exact values in output, for example `agsecret exec -- agent-browser fill e1 ID`.
+- Prefer `TOKEN=ID agsecret exec -c 'program "$TOKEN"'`: the script stays fixed while IDs are resolved in environment values. `exec` redacts matching passwords and TOTP seeds from stdout/stderr.
+- `exec -- COMMAND [ARG...]` also replaces IDs in arguments, but does not detect whether the receiving program treats those arguments as code. The caller must account for command injection when launching interpreters.
 - TOTP IDs expand to the current code, which remains visible in output. Redaction protects the seed, not the generated code. If those bytes also match a stored password, its redaction rule still applies.
 - If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
 - When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret ls --json` rather than remember them.
@@ -63,14 +64,23 @@ agsecret get github --dangerously-skip-check | pbcopy
 
 The flag is for people. The help tells agents never to use options that start with `--dangerously`, but agsecret cannot tell a person from an agent running as the same user, so keep an eye on what your agent runs.
 
-`exec --` preserves separate arguments. `exec -c` explicitly uses `/bin/sh` (`cmd.exe` on Windows); it never guesses whether a quoted argument is a command string:
+### Choosing an exec mode
+
+**Prefer `exec -c` with environment variables.** It uses `/bin/sh` (`cmd.exe` on Windows) and rejects IDs in its script text. In POSIX shells, keep the script single-quoted and quote variable expansions so the value stays data:
 
 ```sh
-agsecret exec -- agent-browser fill e1 ags_0123456789abcdef
 TOKEN=ags_0123456789abcdef agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL'
 ```
 
-IDs inside interpreter code, such as `bash -c 'echo ID'`, are refused because shell syntax in the substituted password could execute commands. Pass the ID as an argument or environment value instead.
+`exec --` runs a program directly and preserves argument boundaries. It replaces IDs without classifying the program or its options:
+
+```sh
+agsecret exec -- agent-browser fill e1 ags_0123456789abcdef
+```
+
+**Command injection risk:** `agsecret exec -- bash -c 'echo ID'` is allowed, but replaces the ID inside shell code. Quotes, substitutions and operators in the value can execute commands. The same concern applies to interpreter inputs such as `node -e` and `python -c`. Output redaction only filters emitted bytes; it cannot prevent that execution. `node ID` treats the expanded value as a script filename, not as text to print.
+
+Do not feed credential values into `eval`, nested interpreter code or command names, even when using `exec -c`. Its script check prevents direct ID substitution, not arbitrary behavior of the script. The examples above use POSIX quoting; Windows cmd.exe has different expansion rules. IDs in the executable name remain refused in direct mode; use `send` for its tmux target and prompt checks.
 
 ## Credentials and plain fields
 

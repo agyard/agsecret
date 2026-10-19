@@ -133,17 +133,23 @@ audit ACLs.
 
 ## exec
 
-`exec -- COMMAND [ARG...]` runs separate arguments directly; `exec -c SCRIPT`
-explicitly selects /bin/sh (cmd.exe on Windows). Quoted arguments are never
-automatically split. exec replaces IDs in arguments and environment in a single pass,
+`exec -c SCRIPT` selects /bin/sh (cmd.exe on Windows). It rejects IDs in SCRIPT
+before reading the vault or consuming uses. The recommended workflow keeps the
+script fixed and supplies IDs through environment values, with quoted variable
+expansions in POSIX shells. Scripts can still execute values via eval or nested
+interpreters; this is not a sandbox or a universal code/data guarantee.
+
+`exec -- COMMAND [ARG...]` runs separate arguments directly. Quoted arguments
+are never automatically split. exec replaces IDs in arguments and environment in a single pass,
 so an ID that appears inside a secret's value is never expanded. Text that
 looks like a mistyped ID (`ags_` plus eight or more hex digits in any case that
 do not form a valid ID) is an error rather than being passed through as literal
-text. IDs are also refused in the command name; in the options and first operand of
-a shell or interpreter such as `sh`, `python` or `node` (the `-c` or `-e` code,
-or a script path), because it would run the value as code; and in arguments to
-`tmux` or `screen`, which could type the value into a pane that `send` would
-refuse. The program can follow wrappers such as `env`, `timeout` or `sudo`. Other arguments and environment variables carry the value as data.
+text. IDs are refused in the executable name. All other direct-mode arguments
+are substituted without interpreter, option or wrapper detection. In particular,
+`exec -- bash -c 'echo ID'` substitutes a value into shell code and can cause
+command injection. Callers own that boundary; output redaction cannot prevent
+execution or side effects. Direct tmux/screen commands also receive normal
+argument substitution; send provides the separate target and prompt checks.
 Unknown, expired and disabled IDs fail before the command starts, with exit
 status 125. When nothing is filled in, exec says so, which catches a name used
 where an ID belongs.
