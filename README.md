@@ -96,7 +96,7 @@ agsecret credential view example --json
 
 `plain` values are shown directly by `ls`, `view` and `get`, can be expanded by `exec`, and can be typed into visible tmux prompts. They have no access, expiry or usage limits, are not counted, and are not added to redaction rules or leak reports. Supplying protection options on a plain field is an error. A plain value that matches a stored password can still be hidden by that password's redaction rule.
 
-`put NAME VALUE` accepts every type. For passwords and TOTP seeds it warns on stderr to remove the command from shell history; the warning never repeats the value. `--stdin` and the hidden prompt remain available. Changing a sensitive field to plain requires supplying its value and resets its ID and sensitive policies.
+`put NAME VALUE` accepts every type. For passwords and TOTP seeds it warns on stderr to remove the command from shell history; the warning never repeats the value. Use `--stdin` for piped input or omit VALUE to type at a terminal prompt. The prompt names the type: plain input is visible; passwords and TOTP seeds are hidden. This also applies to `--stdin` from a terminal. New fields default to password; existing fields keep their type unless `--type` is given. Changing a sensitive field to plain requires supplying its value and resets its ID and sensitive policies.
 
 ```sh
 agsecret rename existing-password example:password

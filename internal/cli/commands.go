@@ -27,13 +27,16 @@ func newPut(o *options) *cobra.Command {
 		Short:      "Add or update a secret",
 		Long: `Add or update a value by NAME or CREDENTIAL:FIELD.
 
-Provide VALUE directly, use --stdin, or type at the hidden terminal prompt.
+Provide VALUE directly, use --stdin, or type at the terminal prompt.
+The prompt shows the field's type: plain input is visible, while passwords
+and TOTP seeds are hidden. --stdin also uses this prompt when stdin is a terminal.
 Passwords and TOTP seeds passed as VALUE may remain in shell history; remove
 that command from history, or prefer --stdin/the hidden prompt. With --type
 totp, the value is a Base32 seed or an otpauth://totp/ URI. plain values are
 directly visible and accept no access, expiry or usage protection options.
 
-Options you leave out keep their current values. You can narrow access or
+New fields default to password. Options you leave out keep their current
+values, including the type of an existing field. You can narrow access or
 bring the expiry closer without the value, for example with --access exec.
 Widening access or extending the expiry needs the value to discourage
 accidental changes to the user's limits. Changing the value or type gives it a
@@ -68,6 +71,9 @@ A put always names the field; use its ID with get, view, send, exec or report.`,
 				return errors.New("use either VALUE or --stdin, not both")
 			}
 			if cmd.Flags().Changed("type") {
+				if kind != "password" && kind != "totp" && kind != "plain" {
+					return errors.New("the type must be password, totp or plain")
+				}
 				c.Type = &kind
 			}
 			if cmd.Flags().Changed("ttl") {
@@ -93,46 +99,59 @@ A put always names the field; use its ID with get, view, send, exec or report.`,
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := o.checkVault(); err != nil {
-				return err
-			}
-			// Without a value source, only options change, so prompt only
-			// when there is nothing else to do. Terminal stdin uses a hidden
-			// prompt; an explicit VALUE remains a separate input source.
-			in := cmd.InOrStdin()
-			var err error
-			switch {
-			case len(args) == 2:
-				c.Secret = []byte(args[1])
-			case !fromStdin && c.Type == nil && (c.ExpiresAt != nil || c.AllowGet != nil || c.MaxUses != nil):
-			case isTerminal(in):
-				c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "Value for "+args[0]+" (hidden): ")
-			case fromStdin:
-				c.Secret, err = readValue(in)
-			default:
-				return fmt.Errorf("give VALUE or --stdin, or run put in a terminal to type it")
-			}
-			if err != nil {
-				return err
-			}
-			defer func() { clear(c.Secret) }()
 			return o.withStore(func(s *store.Store) error {
 				effectiveType := kind
 				if c.Type == nil {
-					if previous, readErr := s.Get(args[0], false); readErr == nil {
+					previous, err := s.Get(args[0], false)
+					if err == nil {
 						effectiveType = previous.Type
 						clear(previous.Secret)
+					} else if !errors.Is(err, store.ErrNotFound) {
+						return err
 					}
 				}
-				if effectiveType == "plain" && cmd.Flags().Changed("dangerously-skip-check") {
-					return errors.New("plain values do not support bypass options")
+				if effectiveType == "plain" && (c.ExpiresAt != nil || c.AllowGet != nil || c.MaxUses != nil || cmd.Flags().Changed("dangerously-skip-check")) {
+					return errors.New("plain values do not support expiry, access restrictions, usage limits or bypass options")
 				}
+				in := cmd.InOrStdin()
+				prompt := func() ([]byte, error) {
+					// Store the type shown to the user even if another put changes
+					// this field while they are typing.
+					c.Type = &effectiveType
+					label := effectiveType + "; hidden"
+					if effectiveType == "plain" {
+						label = "plain; visible, not secret"
+					} else if effectiveType == "totp" {
+						label = "totp seed; hidden"
+					}
+					return promptValue(in, cmd.ErrOrStderr(), args[0]+" ["+label+"]: ", effectiveType == "plain")
+				}
+				var err error
+				// Policy-only edits need no value unless they loosen a limit.
+				switch {
+				case len(args) == 2:
+					c.Secret = []byte(args[1])
+				case !fromStdin && c.Type == nil && (c.ExpiresAt != nil || c.AllowGet != nil || c.MaxUses != nil):
+				case isTerminal(in):
+					c.Secret, err = prompt()
+				case fromStdin:
+					c.Secret, err = readValue(in)
+				default:
+					return errors.New("give VALUE or --stdin, or run put in a terminal to type it")
+				}
+				if err != nil {
+					return err
+				}
+				defer func() { clear(c.Secret) }()
 				if len(args) == 2 && effectiveType != "plain" {
 					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: warning: a sensitive value was supplied on the command line; remove this command from shell history. Prefer --stdin or the hidden prompt.")
 				}
 				result, err := s.Put(args[0], c)
 				if errors.Is(err, store.ErrNeedsValue) && isTerminal(in) {
-					if c.Secret, err = promptSecret(in, cmd.ErrOrStderr(), "This loosens the limits of "+args[0]+"; enter its value: "); err != nil {
+					if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "This loosens the limits; enter the value to confirm."); err != nil {
+						return err
+					}
+					if c.Secret, err = prompt(); err != nil {
 						return err
 					}
 					result, err = s.Put(args[0], c)
@@ -161,7 +180,7 @@ A put always names the field; use its ID with get, view, send, exec or report.`,
 		},
 	}
 	cmd.Flags().BoolVar(&fromStdin, "stdin", false, "read the value from standard input (a trailing newline is dropped)")
-	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password, totp or plain")
+	cmd.Flags().StringVarP(&kind, "type", "t", "password", "password, totp or plain (existing fields keep their type when omitted)")
 	cmd.Flags().StringVar(&ttlText, "ttl", "", "time until the secret expires, such as 12h, 7d or 2w, or 0 for never")
 	cmd.Flags().Int64Var(&maxUses, "uses", 0, "total get/exec/send authorizations allowed for this ID (0 means unlimited)")
 	cmd.Flags().StringVar(&accessText, "access", "", "what agents may do: get,exec (the default), exec (which includes send), get or none")

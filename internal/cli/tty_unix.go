@@ -4,7 +4,6 @@ package cli
 
 import (
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -45,23 +44,26 @@ func atPasswordPrompt(path string) (bool, error) {
 	return state.Lflag&unix.ECHO == 0 && state.Lflag&unix.ICANON != 0, nil
 }
 
-// readHidden reads a line with echo off. Unlike term.ReadPassword, it treats
-// Ctrl-D on an empty line as the end of input instead of ignoring it.
-func readHidden(f *os.File) ([]byte, error) {
+// readTerminal sets line input and the requested echo mode, then restores the
+// original settings. Ctrl-D on an empty line ends input, just like a shell.
+func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
 	fd := int(f.Fd())
 	old, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
 	if err != nil {
 		return nil, err
 	}
-	quiet := *old
-	quiet.Lflag = quiet.Lflag&^unix.ECHO | unix.ICANON | unix.ISIG
-	quiet.Iflag |= unix.ICRNL
-	if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &quiet); err != nil {
+	state := *old
+	state.Lflag = state.Lflag&^unix.ECHO | unix.ICANON | unix.ISIG
+	if echo {
+		state.Lflag |= unix.ECHO
+	}
+	state.Iflag |= unix.ICRNL
+	if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &state); err != nil {
 		return nil, err
 	}
 	restore := func() { _ = unix.IoctlSetTermios(fd, ioctlSetTermios, old) }
 	defer restore()
-	// Turn echo back on before Ctrl-C ends the process.
+	// Restore the original mode before Ctrl-C ends the process.
 	signals, done := make(chan os.Signal, 1), make(chan struct{})
 	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer signal.Stop(signals)
@@ -74,17 +76,8 @@ func readHidden(f *os.File) ([]byte, error) {
 		case <-done:
 		}
 	}()
-	var line []byte
-	b := make([]byte, 1)
-	for {
-		n, err := f.Read(b)
-		if n == 1 && b[0] == '\n' || err == io.EOF && len(line) > 0 {
-			return line, nil
-		}
-		line = append(line, b[:n]...)
-		if err != nil {
-			clear(line)
-			return nil, err
-		}
+	if err := prompt(); err != nil {
+		return nil, err
 	}
+	return readTerminalLine(f)
 }

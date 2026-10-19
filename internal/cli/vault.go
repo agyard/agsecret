@@ -24,7 +24,7 @@ func isTerminal(v any) bool {
 func (o *options) passphrase() ([]byte, error) {
 	f, err := store.OpenPrivateFile(o.passFile)
 	if errors.Is(err, os.ErrNotExist) && o.defaultPass && isTerminal(o.in) {
-		return promptSecret(o.in, o.errOut, "Vault passphrase: ")
+		return promptValue(o.in, o.errOut, "Vault passphrase (hidden): ", false)
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("pass file %s does not exist", o.passFile)
@@ -59,11 +59,15 @@ func readValue(in io.Reader) ([]byte, error) {
 	return b, nil
 }
 
-// promptSecret reads a line without echo; callers check isTerminal(in).
-func promptSecret(in io.Reader, errOut io.Writer, label string) ([]byte, error) {
-	_, _ = fmt.Fprint(errOut, label)
-	b, err := readHidden(in.(*os.File))
-	_, _ = fmt.Fprintln(errOut)
+// promptValue reads one terminal line; callers check isTerminal(in).
+func promptValue(in io.Reader, errOut io.Writer, label string, echo bool) ([]byte, error) {
+	b, err := readTerminal(in.(*os.File), echo, func() error {
+		_, err := fmt.Fprint(errOut, label)
+		return err
+	})
+	if !echo {
+		_, _ = fmt.Fprintln(errOut)
+	}
 	if err == io.EOF || err == nil && len(b) == 0 {
 		err = errors.New("nothing was entered")
 	}
@@ -72,6 +76,26 @@ func promptSecret(in io.Reader, errOut io.Writer, label string) ([]byte, error) 
 		return nil, err
 	}
 	return b, nil
+}
+
+// Read one byte at a time to leave subsequent input for the next prompt.
+func readTerminalLine(f *os.File) ([]byte, error) {
+	var line []byte
+	var b [1]byte
+	for {
+		n, err := f.Read(b[:])
+		if n == 1 && b[0] == '\n' || err == io.EOF && len(line) > 0 {
+			return bytes.TrimSuffix(line, []byte("\r")), nil
+		}
+		line = append(line, b[:n]...)
+		if len(line) > store.MaxSecretLen {
+			err = errors.New("the value is larger than 1 MiB")
+		}
+		if err != nil {
+			clear(line)
+			return nil, err
+		}
+	}
 }
 
 func (o *options) checkVault() error {

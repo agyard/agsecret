@@ -103,6 +103,7 @@ func TestHelpAndUsageErrors(t *testing.T) {
 		"send tmux:0 x --no-enter false": "write boolean flags as --flag=false",
 		"send screen:0 x":                "send needs a tmux pane",
 		"put x --ttl 1y":                 `invalid --ttl "1y"`,
+		"put x --type pass":              "the type must be password, totp or plain",
 		"put x --access all":             `invalid --access "all"`,
 		"report name":                    "report takes the exposed ID, not a name",
 	} {
