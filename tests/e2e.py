@@ -73,7 +73,7 @@ while not (root / 'prompt-stop').exists():
                            env=tmux_env, capture_output=True, check=True, timeout=5)
             time.sleep(0.5)
             result = run('send', 'tmux:selfcheck:1', secret_id, check=False, child_env=tmux_env)
-            assert result.returncode == 1 and 'not waiting at a password prompt' in result.stderr
+            assert result.returncode == 1 and 'requires a password prompt' in result.stderr
         subprocess.run([tmux, '-S', socket, 'select-pane', '-m', '-t', 'selfcheck:0.0'],
                        capture_output=True, check=True, timeout=5)
         result = run('send', 'tmux:{marked}', secret_id, child_env=tmux_env)
@@ -136,7 +136,7 @@ def main():
             assert normal.stdout == 'authenticated\n' and normal.stderr == ''
             debug = run('exec', '--', sys.executable, '-c', client, url+'/debug', first['id'])
             assert PASSWORD not in debug.stdout+debug.stderr
-            assert '[REDACTED:' in debug.stdout and debug.stderr.count('this is not a leak') == 1
+            assert '[REDACTED:' in debug.stdout and debug.stderr == 'agsecret: redacted '+first['id']+'\n'
             print('PASS: local HTTP authentication and response redaction')
         finally:
             server.shutdown()

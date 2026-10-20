@@ -401,7 +401,7 @@ type PutResult struct {
 // reports in the same transaction, so the old ID stops working.
 func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	if ValidID(ref) {
-		return PutResult{}, errors.New("put takes a name, not an ID; changing the value creates a new ID automatically")
+		return PutResult{}, errors.New("put requires a field name")
 	}
 	if err := ValidateName(ref); err != nil {
 		return PutResult{}, err

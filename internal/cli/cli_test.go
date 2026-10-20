@@ -105,7 +105,7 @@ func TestHelpAndUsageErrors(t *testing.T) {
 		"put x --ttl 1y":                 `invalid --ttl "1y"`,
 		"put x --type pass":              "the type must be password, totp or plain",
 		"put x --access all":             `invalid --access "all"`,
-		"report name":                    "report takes the exposed ID, not a name",
+		"report name":                    "report requires the exposed password's ID",
 	} {
 		code, out, errOut := run("", strings.Fields(args)...)
 		if code != 2 || out != "" || !strings.Contains(errOut, want) || strings.Count(errOut, "\n") != 1 {
@@ -127,7 +127,7 @@ func TestWorkflow(t *testing.T) {
 	if code, out, errText := c.call("", "get", id); code != 2 || out != "" || !strings.Contains(errText, "get does not print passwords by default") {
 		t.Fatalf("get: code=%d out=%q err=%s", code, out, errText)
 	}
-	if code, out, errText := c.call("replacement", "put", id, "--stdin"); code != 2 || out != "" || !strings.Contains(errText, "put takes a name, not an ID") {
+	if code, out, errText := c.call("replacement", "put", id, "--stdin"); code != 2 || out != "" || !strings.Contains(errText, "put requires a field name") {
 		t.Fatalf("put by ID: code=%d out=%q err=%q", code, out, errText)
 	}
 	if out, errText := c.ok("", "get", id, "--dangerously-skip-check"); out != "secret-value\n" || errText != "" {
@@ -319,23 +319,23 @@ func TestCLIOutputHelper(t *testing.T) {
 
 func TestExecNoteIsRedactedAndExitCodes(t *testing.T) {
 	c := newTestCLI(t)
-	// "leak" also occurs in the redaction note itself.
-	id := c.put("details", "leak")["id"].(string)
+	// "agsecret" also occurs in the redaction note itself.
+	id := c.put("details", "agsecret")["id"].(string)
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGSECRET_CLI_OUTPUT_HELPER", "1")
-	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "leak")
+	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "agsecret")
 	code, out, errText := c.call("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", id)
-	if code != 0 || out != "[REDACTED:"+id+"]\n" || strings.Contains(errText, "leak") || !strings.Contains(errText, "redacted "+id) {
+	if code != 0 || out != "[REDACTED:"+id+"]\n" || strings.Contains(errText, "agsecret") || !strings.Contains(errText, "redacted "+id) {
 		t.Fatalf("note leaked a secret: code=%d out=%q err=%q", code, out, errText)
 	}
 	// IDs are ordinary argument substitutions, including for browser and CLI
 	// tools that take several positional arguments.
-	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "fill e1 leak")
+	t.Setenv("AGSECRET_CLI_OUTPUT_VALUE", "fill e1 agsecret")
 	code, out, errText = c.call("", "exec", "--", executable, "-test.run=^TestCLIOutputHelper$", "fill", "e1", id)
-	if code != 0 || out != "fill e1 [REDACTED:"+id+"]\n" || strings.Contains(errText, "leak") {
+	if code != 0 || out != "fill e1 [REDACTED:"+id+"]\n" || strings.Contains(errText, "agsecret") {
 		t.Fatalf("multi-argument ID expansion: code=%d out=%q err=%q", code, out, errText)
 	}
 	if _, errText := c.ok("", "exec", "--", "true"); !strings.Contains(errText, "no secret IDs found") {

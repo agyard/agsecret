@@ -37,7 +37,7 @@ func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 	}
 	ids := []string{id, otherID}
 	slices.Sort(ids)
-	if errOut != "[REDACTED:"+otherID+"]\nagsecret: redacted "+ids[0]+", "+ids[1]+" in the output above; this is not a leak\n" {
+	if errOut != "[REDACTED:"+otherID+"]\nagsecret: redacted "+ids[0]+", "+ids[1]+"\n" {
 		t.Fatalf("unused stored secret or note not protected: %q", errOut)
 	}
 	code, out, errOut = call("silent")
@@ -45,7 +45,7 @@ func TestExecEnvironmentGlobalRedactionAndFooter(t *testing.T) {
 		t.Fatalf("no-hit output should have no footer: code=%d out=%q err=%q", code, out, errOut)
 	}
 	code, out, errOut = call("large")
-	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "this is not a leak\n") {
+	if code != 0 || out != strings.Repeat("x", 96*1024)+"[REDACTED:"+id+"]" || !strings.HasSuffix(errOut, "agsecret: redacted "+id+"\n") {
 		t.Fatalf("trailing output lost: code=%d output bytes=%d stderr=%q", code, len(out), errOut)
 	}
 	code, out, errOut = call("exit")

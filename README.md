@@ -22,7 +22,7 @@ Create a vault and store a token:
 
 ```sh
 agsecret init
-agsecret put api              # type the token at a hidden prompt
+agsecret put api              # masked token input
 ```
 
 `put` prints the secret's ID; `agsecret ls` shows it again later. Prefer `exec -c` with the ID in an environment variable and a fixed, single-quoted script (POSIX shell):
@@ -33,7 +33,7 @@ TOKEN=ags_0123456789abcdef agsecret exec -c 'curl -H "Authorization: Bearer $TOK
 
 curl receives the real token. If the token appears in the output, it is replaced with `[REDACTED:ags_0123456789abcdef]`.
 
-In scripts, pipe the value in instead of typing it:
+In scripts, pipe the value through stdin:
 
 ```sh
 printf '%s' "$API_TOKEN" | agsecret put api --stdin
@@ -41,28 +41,28 @@ printf '%s' "$API_TOKEN" | agsecret put api --stdin
 
 ## Using it with an agent
 
-Tell your agent to run `agsecret --help`. The top of that page is written for agents: how to use IDs, a few examples, and what to do when something is refused or leaks. Each command's `--help` has the details.
+Start with `agsecret --help` for the agent workflow and examples. Each command's `--help` has the details.
 
 Key workflow:
 
-- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints plain values and TOTP codes and refuses passwords by default, regardless of shell, terminal or pipe.
+- Agents use passwords through `exec`, or `send` for a password prompt in tmux. `get` prints plain values and TOTP codes; passwords require a human override.
 - Prefer `TOKEN=ID agsecret exec -c 'program "$TOKEN"'`: the script stays fixed while IDs are resolved in environment values. `exec` redacts matching passwords and TOTP seeds from stdout/stderr.
-- `exec -- COMMAND [ARG...]` also replaces IDs in arguments, but does not detect whether the receiving program treats those arguments as code. The caller must account for command injection when launching interpreters.
-- TOTP IDs expand to the current code, which remains visible in output. Redaction protects the seed, not the generated code. If those bytes also match a stored password, its redaction rule still applies.
-- If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. Reports never change access; you decide whether to replace the secret.
-- When a secret's value or type changes, it gets a new ID, so agents should look up IDs with `agsecret ls --json` rather than remember them.
+- `exec -- COMMAND [ARG...]` replaces IDs in arguments. Callers must account for command injection when an interpreter treats an argument as code.
+- TOTP IDs expand to the current code, which remains visible in output. Stored seeds are redacted. A code matching a stored password is subject to that password's redaction rule.
+- If an agent sees a password in plain text, it should run `agsecret report ID` and tell you. You decide whether to change access or replace the secret.
+- Changes to a secret's value or type assign a new ID. Look up current IDs with `agsecret ls --json`.
 - Metadata and credential commands accept `--json`. Errors and notes go to standard error.
 - Exit codes: `0` success, `1` error, `2` usage error. `exec` returns the command's own exit code, or `125`, `126` or `127` if agsecret fails or the command cannot be run.
 
 ### Reading a password yourself
 
-`get` does not infer whether a terminal, pipe or command substitution is safe. People who intentionally need plaintext can use the explicit override for a trusted destination:
+To send a password to a trusted destination, use the human override:
 
 ```sh
 agsecret get github --dangerously-skip-check | pbcopy
 ```
 
-The flag is for people. The help tells agents never to use options that start with `--dangerously`, but agsecret cannot tell a person from an agent running as the same user, so keep an eye on what your agent runs.
+Options starting with `--dangerously` are for human use. Agents running as your user have the same access, so review their commands.
 
 ### Choosing an exec mode
 
@@ -72,15 +72,15 @@ The flag is for people. The help tells agents never to use options that start wi
 TOKEN=ags_0123456789abcdef agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL'
 ```
 
-`exec --` runs a program directly and preserves argument boundaries. It replaces IDs without classifying the program or its options:
+`exec --` runs a program directly, replacing IDs and preserving argument boundaries:
 
 ```sh
 agsecret exec -- agent-browser fill e1 ags_0123456789abcdef
 ```
 
-**Command injection risk:** `agsecret exec -- bash -c 'echo ID'` is allowed, but replaces the ID inside shell code. Quotes, substitutions and operators in the value can execute commands. The same concern applies to interpreter inputs such as `node -e` and `python -c`. Output redaction only filters emitted bytes; it cannot prevent that execution. `node ID` treats the expanded value as a script filename, not as text to print.
+**Command injection risk:** `agsecret exec -- bash -c 'echo ID'` replaces the ID inside shell code. Quotes, substitutions and operators in the value can execute commands. The same risk applies to interpreter inputs such as `node -e` and `python -c`. Output redaction filters emitted bytes after execution. `node ID` uses the expanded value as a script filename.
 
-Do not feed credential values into `eval`, nested interpreter code or command names, even when using `exec -c`. Its script check prevents direct ID substitution, not arbitrary behavior of the script. The examples above use POSIX quoting; Windows cmd.exe has different expansion rules. IDs in the executable name remain refused in direct mode; use `send` for its tmux target and prompt checks.
+Keep credential values out of `eval`, nested interpreter code and command names, including with `exec -c`. Its script check covers direct ID substitution. The examples above use POSIX quoting; Windows cmd.exe has different expansion rules. Executable names must be literal. Use `send` for tmux prompts.
 
 ## Credentials and plain fields
 
@@ -94,9 +94,9 @@ agsecret put example:otp --type totp
 agsecret credential view example --json
 ```
 
-`plain` values are shown directly by `ls`, `view` and `get`, can be expanded by `exec`, and can be typed into visible tmux prompts. They have no access, expiry or usage limits, are not counted, and are not added to redaction rules or leak reports. Supplying protection options on a plain field is an error. A plain value that matches a stored password can still be hidden by that password's redaction rule.
+`plain` values are shown by `ls`, `view` and `get`, expanded by `exec`, and accepted at visible tmux prompts. They are unrestricted and excluded from redaction rules and leak reports. Protection options apply to password and TOTP fields. A plain value matching a stored password is still subject to that password's redaction rule.
 
-`put NAME VALUE` accepts every type. For passwords and TOTP seeds it warns on stderr to remove the command from shell history; the warning never repeats the value. Use `--stdin` for piped input or omit VALUE to type at a terminal prompt. The prompt names the type: plain input is visible; passwords and TOTP seeds are hidden. This also applies to `--stdin` from a terminal. New fields default to password; existing fields keep their type unless `--type` is given. Changing a sensitive field to plain requires supplying its value and resets its ID and sensitive policies.
+`put NAME VALUE` accepts every type. For passwords and TOTP seeds, remove the command from shell history when prompted. Use `--stdin` for piped input or omit VALUE for a terminal prompt. The prompt shows the type. Plain input is visible; password and TOTP input is masked. This also applies to `--stdin` from a terminal. New fields default to password; existing fields keep their type unless `--type` is given. Changing a sensitive field to plain requires its value and resets its ID and protection options.
 
 ```sh
 agsecret rename existing-password example:password
@@ -105,9 +105,9 @@ agsecret rename another:password standalone-password
 agsecret credential rename example work
 ```
 
-Renames preserve field IDs, values, counters, expiry and leak history. Existing destination names or credential groups are never overwritten or merged. Each record belongs to at most one group; equal password values remain independent records, with the existing duplicate warning and leak-report behavior.
+Renames preserve field IDs, values, counters, expiry and leak history. The destination name must be available. Each record belongs to at most one group. Storing a duplicate password produces a warning; reporting it adds a leak record to every matching password.
 
-`agsecret ls` shows standalone fields first, then credential headings; groups and their fields are sorted lexically. `ls --json` returns the same ordered records as a flat array with full names. `credential ls --json` returns `{name, fields}` summaries (field counts); `credential view --json` returns `{name, fields}` with a record array. Plain records include `value` and omit inapplicable protection fields. `list` is not an alias.
+`agsecret ls` shows standalone fields first, then credential headings; groups and their fields are sorted lexically. `ls --json` returns the same ordered records as a flat array with full names. `credential ls --json` returns `{name, fields}` summaries (field counts); `credential view --json` returns `{name, fields}` with a record array. Plain records include `value` and omit protection fields.
 
 ## tmux targets and sockets
 
@@ -118,7 +118,7 @@ AGSECRET_TMUX_SOCKET=/tmp/work.sock agsecret send 'tmux:{marked}' example:passwo
 agsecret send tmux:%3 example:username --no-enter
 ```
 
-`AGSECRET_TMUX_SOCKET` supplies tmux's `-S` socket path for every operation. When unset, tmux keeps its normal `TMUX` and `TMUX_TMPDIR` environment behavior. Plain values do not require hidden input; all types reject terminal control characters such as newlines.
+`AGSECRET_TMUX_SOCKET` supplies tmux's `-S` socket path for every operation. When unset, tmux uses `TMUX` and `TMUX_TMPDIR` as usual. Plain values can use visible prompts. All types reject terminal control characters such as newlines.
 
 ## Commands
 
@@ -152,7 +152,7 @@ Flags override environment variables. On Unix, the pass file must be private to 
 
 `put` sets options for passwords and TOTP fields:
 
-- `--type totp` stores a TOTP seed (Base32 or an `otpauth://totp/` URI) instead of a password.
+- `--type totp` stores a TOTP seed (Base32 or an `otpauth://totp/` URI).
 - `--ttl 7d` makes the secret expire after seven days. `90m`, `12h` and `2w` also work; `0` means never.
 - `--uses 2` permits two total authorizations for the current ID across `get`, `exec`, and `send`. `0` means unlimited.
 - `--access exec` lets agents use the secret only through `exec` and `send`. The other choices are `get,exec` (the default), `get` and `none`.
@@ -165,9 +165,9 @@ For sensitive fields, `ls` and `view` show used/allowed counts; JSON includes `m
 
 ## Security
 
-The vault is an SQLite database encrypted with Adiantum. Its key is encrypted with XChaCha20-Poly1305, under a key derived from the passphrase with Argon2id. The encryption hides your data, but it does not detect tampering or rollback.
+The vault is an SQLite database encrypted with Adiantum. Its key is encrypted with XChaCha20-Poly1305, under a key derived from the passphrase with Argon2id. Data is encrypted without tamper or rollback detection.
 
-AG-Secret balances convenience with reducing accidental exposure. It is not a security boundary and is not recommended for highly sensitive credentials. `exec` hides only exact copies of stored values; Base64, custom encodings, files and network traffic can bypass it. The command gets no controlling terminal; use `send` for password prompts. Any program that can read the pass file or agsecret's memory can get the secrets. Expiry and use limits govern AG-Secret authorizations, not what a receiving program does with a value it already has.
+AG-Secret reduces accidental exposure. Use a stronger isolation system for highly sensitive credentials. `exec` hides exact copies of stored values; Base64, custom encodings, files and network traffic can bypass it. Commands run detached from the terminal; use `send` for password prompts. Any program that can read the pass file or agsecret's memory can get the secrets. Expiry and use limits govern AG-Secret authorizations. Receiving programs can retain and reuse values.
 
 `send` checks for terminal settings typical of a password prompt for password and TOTP fields to reduce accidental typing into a shell. These settings cannot prove which program is receiving the value.
 

@@ -35,9 +35,9 @@ func newExec(o *options) *cobra.Command {
 variables with the secret's value (for a TOTP secret, its current code).
 
 Matching passwords and TOTP seeds in the command's output are replaced with
-[REDACTED:ID], and a note on standard error lists the IDs. Only exact copies
-are caught: encoded values, files, network connections and writes straight to
-the terminal are not. Current TOTP codes remain visible, just as with get.
+[REDACTED:ID], with a note on standard error listing the IDs. Redaction matches
+exact values; encodings, files and network traffic bypass it. Current TOTP
+codes remain visible, just as with get.
 
 Prefer -c SCRIPT with IDs in environment variables. It uses /bin/sh (cmd.exe
 on Windows) and refuses IDs in SCRIPT itself before any substitution. POSIX
@@ -45,26 +45,20 @@ example: keep the script single-quoted and quote each variable expansion:
 
   TOKEN=ID agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL'
 
-With -- COMMAND [ARG...], arguments stay separate and no shell is added.
-IDs in arguments are replaced without inspecting the command's semantics.
+With -- COMMAND [ARG...], the program receives each expanded argument directly.
 For example, agent-browser fill e1 ID receives the value as one argument.
-But -- bash -c 'echo ID' inserts the value into Bash code: quotes, substitutions
+-- bash -c 'echo ID' inserts the value into Bash code: quotes, substitutions
 or operators in the value can execute commands. The caller is responsible for
-code/data boundaries in this mode; output redaction cannot prevent injection.
-Do not pass values to eval or another interpreter's code input in either mode.
+keeping values out of code and eval in both modes.
 IDs in the executable name are refused. Arguments may be visible to process
-inspectors. For terminal injection, prefer send's target and prompt checks.
+inspectors. Use send for terminal prompts.
 
-Each distinct sensitive ID consumes one use, shared with get and send, before starting
-the command. Repeating it in arguments/environment costs no extra uses.
-After authorization, a failed command still consumes its uses. plain IDs
-expand without redaction or usage counting; -c still refuses IDs in its script.
+Each distinct sensitive ID consumes one use, shared with get and send, before
+starting the command. A failed command still consumes its uses. plain values
+remain visible and unlimited.
 
-The command's input and output go through pipes, and it runs without a
-controlling terminal, so it cannot write to the terminal past the filter.
-Programs that prompt on the terminal, such as ssh or sudo asking for a
-password, cannot prompt; use send for those. Pagers and REPLs may behave
-differently.
+The command uses pipes and runs detached from the terminal. Use send for ssh
+or sudo password prompts. Pagers and REPLs may behave differently.
 
 The exit status is the command's own, or 128+N if signal N killed it. If the
 command cannot be run, agsecret exits with 126, or 127 if it is not found. For
@@ -85,7 +79,7 @@ any other agsecret error, it exits with 125.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("command") {
 				if tokenPattern.MatchString(script) {
-					return &exitError{code: 125, err: errors.New(`exec -c does not substitute IDs in shell code; pass the ID in an environment variable instead, for example TOKEN=ID agsecret exec -c 'echo "$TOKEN"'`)}
+					return &exitError{code: 125, err: errors.New(`pass IDs in environment variables: TOKEN=ID agsecret exec -c 'echo "$TOKEN"'`)}
 				}
 				args = []string{"/bin/sh", "-c", script}
 				if runtime.GOOS == "windows" {
@@ -223,7 +217,7 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 			env[i] = key + "=" + value
 		}
 		if len(injected) == 0 {
-			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: note: no secret IDs found in the command or environment, so nothing was filled in")
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: no secret IDs found")
 		}
 		for id, value := range injected {
 			if byID[id].Type == "password" {
@@ -295,7 +289,7 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 		if stderr.last != '\n' {
 			prefix = "\n"
 		}
-		note := fmt.Sprintf("%sagsecret: redacted %s in the output above; this is not a leak\n", prefix, strings.Join(slices.Compact(ids), ", "))
+		note := fmt.Sprintf("%sagsecret: redacted %s\n", prefix, strings.Join(slices.Compact(ids), ", "))
 		stderrErr = errors.Join(stderrErr, stderr.emit(stderr.redactor.Feed([]byte(note), true)))
 	}
 	if state := child.ProcessState; state != nil && !state.Success() {

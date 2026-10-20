@@ -131,7 +131,7 @@ func TestIDsChangeWithTheValue(t *testing.T) {
 		if _, err := s.Report(ref, "late"); !errors.Is(err, ErrNotFound) {
 			t.Fatalf("stale report on %s: %v", ref, err)
 		}
-		if _, err := s.Put(ref, Change{Secret: []byte("x")}); err == nil || !strings.Contains(err.Error(), "put takes a name") {
+		if _, err := s.Put(ref, Change{Secret: []byte("x")}); err == nil || !strings.Contains(err.Error(), "put requires a field name") {
 			t.Fatalf("put by unknown ID %s: %v", ref, err)
 		}
 	}

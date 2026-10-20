@@ -7,7 +7,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
+func readTerminal(f *os.File, echo bool, read func() ([]byte, error)) ([]byte, error) {
 	handle := windows.Handle(f.Fd())
 	var old uint32
 	if err := windows.GetConsoleMode(handle, &old); err != nil {
@@ -17,6 +17,8 @@ func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
 	mode |= windows.ENABLE_LINE_INPUT | windows.ENABLE_PROCESSED_INPUT
 	if echo {
 		mode |= windows.ENABLE_ECHO_INPUT
+	} else {
+		mode &^= windows.ENABLE_LINE_INPUT | windows.ENABLE_PROCESSED_INPUT
 	}
 	if err := windows.SetConsoleMode(handle, mode); err != nil {
 		return nil, err
@@ -35,8 +37,5 @@ func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
 		case <-done:
 		}
 	}()
-	if err := prompt(); err != nil {
-		return nil, err
-	}
-	return readTerminalLine(f)
+	return read()
 }

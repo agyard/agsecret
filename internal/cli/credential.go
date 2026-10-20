@@ -13,9 +13,9 @@ func newRename(o *options) *cobra.Command {
 	return addJSONFlag(&cobra.Command{
 		Use:   "rename NAME|ID NEW_NAME",
 		Short: "Rename a secret or move it into or out of a credential",
-		Long: `Rename a secret without changing its ID, value, limits or leak reports.
-Use CREDENTIAL:FIELD as the new name to move it into a credential, or a name
-without a colon to make it independent. An existing name is never overwritten.`,
+		Long: `Rename a field, preserving its ID, value, limits and leak reports.
+Use CREDENTIAL:FIELD to move it into a credential, or FIELD to make it
+independent. The destination name must be available.`,
 		Example: "  agsecret rename password account:password\n  agsecret rename account:password password",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
@@ -107,7 +107,7 @@ while it has fields. Add fields with put and move them with rename.`,
 	}, o), addJSONFlag(&cobra.Command{
 		Use:   "view NAME",
 		Short: "Show a credential's fields, including plain values",
-		Long:  "Show all fields in a credential. Only plain values are displayed; passwords\nand TOTP seeds remain hidden. Viewing fields does not consume uses.",
+		Long:  "Show field metadata and plain values. Passwords and TOTP seeds stay hidden.\nViewing fields preserves usage counts.",
 		Args:  credentialArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {
@@ -124,7 +124,7 @@ while it has fields. Add fields with put and move them with rename.`,
 	}, o), addJSONFlag(&cobra.Command{
 		Use:   "rename NAME NEW_NAME",
 		Short: "Rename a credential and all its fields",
-		Long:  "Rename all fields together without changing their IDs, values or limits.\nThe destination credential must not exist; credentials are never merged.",
+		Long:  "Rename all fields together, preserving their IDs, values and limits.\nThe destination credential name must be available.",
 		Args:  credentialArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {

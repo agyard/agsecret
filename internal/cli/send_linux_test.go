@@ -154,7 +154,7 @@ esac
 	literal := "send-keys\n-t\n%9\n-l\n--\n" + secret + "\n"
 	enter := "send-keys\n-t\n%9\nEnter\n"
 	setPTYMode(t, master, false, false)
-	if code, out, errText := c.call("", "send", "tmux:dev:0.1", id); code == 0 || out != "" || !strings.Contains(errText, "not waiting at a password prompt") {
+	if code, out, errText := c.call("", "send", "tmux:dev:0.1", id); code == 0 || out != "" || !strings.Contains(errText, "requires a password prompt") {
 		t.Fatalf("echo check: code=%d out=%q err=%q", code, out, errText)
 	}
 	assertNoSend()
@@ -201,7 +201,7 @@ esac
 		t.Fatalf("missing pane: code=%d err=%q", code, errText)
 	}
 	setPTYMode(t, master, true, true)
-	if code, _, errText := c.call("", "send", "tmux:dev:0.1", limited); code != 1 || !strings.Contains(errText, "not waiting at a password prompt") {
+	if code, _, errText := c.call("", "send", "tmux:dev:0.1", limited); code != 1 || !strings.Contains(errText, "requires a password prompt") {
 		t.Fatalf("visible prompt: code=%d err=%q", code, errText)
 	}
 	assertNoSend()

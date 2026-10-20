@@ -28,27 +28,23 @@ func newPut(o *options) *cobra.Command {
 		Long: `Add or update a value by NAME or CREDENTIAL:FIELD.
 
 Provide VALUE directly, use --stdin, or type at the terminal prompt.
-The prompt shows the field's type: plain input is visible, while passwords
-and TOTP seeds are hidden. --stdin also uses this prompt when stdin is a terminal.
-Passwords and TOTP seeds passed as VALUE may remain in shell history; remove
-that command from history, or prefer --stdin/the hidden prompt. With --type
-totp, the value is a Base32 seed or an otpauth://totp/ URI. plain values are
-directly visible and accept no access, expiry or usage protection options.
+The prompt shows the type and masks password and TOTP input. --stdin uses
+the same prompt in a terminal. Remove sensitive VALUE commands from shell history.
+TOTP accepts a Base32 seed or otpauth://totp/ URI. Plain values are directly
+visible and unrestricted.
 
-New fields default to password. Options you leave out keep their current
-values, including the type of an existing field. You can narrow access or
-bring the expiry closer without the value, for example with --access exec.
-Widening access or extending the expiry needs the value to discourage
-accidental changes to the user's limits. Changing the value or type gives it a
-new ID, and the old ID stops working. --uses limits total get/exec/send
-authorizations for that ID (0 means unlimited). A changed value or type resets
-the counter; resubmitting the same value preserves it. Increasing the limit
-requires the value, just like extending expiry.
-A put always names the field; use its ID with get, view, send, exec or report.`,
+New fields default to password. Omitted options retain their existing values.
+Changing the value or type assigns a new ID and resets its use count and leak
+history. Resubmitting the same value preserves them.
+
+--uses limits total get/exec/send authorizations per ID (0 means unlimited).
+Restricting access, expiry or uses needs only the options. Widening those
+limits requires the value.
+put takes a field name; use IDs with get, view, send, exec or report.`,
 		Example: `  # Store a token from an environment variable
   printf '%s' "$GITHUB_TOKEN" | agsecret put github --stdin
 
-  # Type a TOTP seed at a hidden prompt; keep it for 30 days
+  # Store a TOTP seed for 30 days
   agsecret put github-otp --type totp --ttl 30d
 
   # Store a visible account name in a credential
@@ -62,13 +58,13 @@ A put always names the field; use its ID with get, view, send, exec or report.`,
 				return err
 			}
 			if store.ValidID(args[0]) {
-				return errors.New("put takes a name, not an ID; changing the value creates a new ID automatically")
+				return errors.New("put requires a field name; run agsecret ls to find it")
 			}
 			if err := store.ValidateName(args[0]); err != nil {
 				return err
 			}
 			if len(args) == 2 && fromStdin {
-				return errors.New("use either VALUE or --stdin, not both")
+				return errors.New("choose one input source: VALUE or --stdin")
 			}
 			if cmd.Flags().Changed("type") {
 				if kind != "password" && kind != "totp" && kind != "plain" {
@@ -118,13 +114,7 @@ A put always names the field; use its ID with get, view, send, exec or report.`,
 					// Store the type shown to the user even if another put changes
 					// this field while they are typing.
 					c.Type = &effectiveType
-					label := effectiveType + "; hidden"
-					if effectiveType == "plain" {
-						label = "plain; visible, not secret"
-					} else if effectiveType == "totp" {
-						label = "totp seed; hidden"
-					}
-					return promptValue(in, cmd.ErrOrStderr(), args[0]+" ["+label+"]: ", effectiveType == "plain")
+					return promptValue(in, cmd.ErrOrStderr(), effectiveType+": ", effectiveType == "plain")
 				}
 				var err error
 				// Policy-only edits need no value unless they loosen a limit.
@@ -144,11 +134,11 @@ A put always names the field; use its ID with get, view, send, exec or report.`,
 				}
 				defer func() { clear(c.Secret) }()
 				if len(args) == 2 && effectiveType != "plain" {
-					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: warning: a sensitive value was supplied on the command line; remove this command from shell history. Prefer --stdin or the hidden prompt.")
+					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: remove this command from shell history; use --stdin or the terminal prompt for sensitive values.")
 				}
 				result, err := s.Put(args[0], c)
 				if errors.Is(err, store.ErrNeedsValue) && isTerminal(in) {
-					if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "This loosens the limits; enter the value to confirm."); err != nil {
+					if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "Enter the value to confirm the new limits."); err != nil {
 						return err
 					}
 					if c.Secret, err = prompt(); err != nil {
@@ -462,15 +452,14 @@ func newReport(o *options) *cobra.Command {
 		Short: "Report that a password was exposed",
 		Long: `Record that a password was exposed in plain text, for example printed by a
 debug endpoint or written to a log. The report is added to every password with
-the same value. It does not change what agents may do with the secret; the
-user decides whether to replace it.
+the same value. Access settings stay unchanged; the user decides whether to
+replace the password.
 
-report takes the ID that was exposed, not a name. If the secret has been
-replaced since then, the exposed value is gone, and there is nothing to report.`,
+Use the exposed password's ID. Replacing or deleting it retires that ID.`,
 		Example: "  agsecret report ID --reason 'printed by a debug endpoint'",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 1 && !store.ValidID(args[0]) {
-				return fmt.Errorf("report takes the exposed ID, not a name, so a report never marks a newer value; run agsecret ls to find it")
+				return errors.New("report requires the exposed password's ID; run agsecret ls to find it")
 			}
 			return cobra.ExactArgs(1)(cmd, args)
 		},

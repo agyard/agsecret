@@ -199,7 +199,7 @@ func TestPositionalValuesWarnOnlyForSensitiveTypes(t *testing.T) {
 	if _, errText := c.ok("", "put", "password", "updated-synthetic-password"); !strings.Contains(errText, "shell history") || strings.Contains(errText, "updated-synthetic-password") {
 		t.Fatalf("existing password lacked a safe warning: %q", errText)
 	}
-	if code, out, errText := c.call("stdin-value", "put", "plain", "positional-value", "--stdin"); code != 2 || out != "" || !strings.Contains(errText, "either VALUE or --stdin") {
+	if code, out, errText := c.call("stdin-value", "put", "plain", "positional-value", "--stdin"); code != 2 || out != "" || !strings.Contains(errText, "choose one input source") {
 		t.Fatalf("ambiguous value source: code=%d out=%q err=%q", code, out, errText)
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"golang.org/x/sys/unix"
 )
@@ -53,6 +54,8 @@ func TestPutTerminalInput(t *testing.T) {
 		raw               bool
 		errorText         string
 		concurrentType    string
+		typed             string
+		cancelled         bool
 	}{
 		{name: "new-plain", kind: "plain", value: "visible-user", flags: []string{"--type", "plain"}},
 		{name: "new-password", kind: "password", value: "hidden-password"},
@@ -62,6 +65,8 @@ func TestPutTerminalInput(t *testing.T) {
 		{name: "to-plain", kind: "plain", value: "converted-user", flags: []string{"--type", "plain"}},
 		{name: "stdin-plain", kind: "plain", value: "stdin-user", flags: []string{"--type", "plain", "--stdin"}, raw: true},
 		{name: "stdin-password", kind: "password", value: "stdin-password-value", flags: []string{"--stdin"}},
+		{name: "edited-password", kind: "password", value: "ab\u8bed", typed: "ab\u754c\x7f\u8bed"},
+		{name: "cancelled-password", kind: "password", value: "cancel-me", cancelled: true, raw: true},
 		{name: "limited", kind: "password", value: "limited-password", flags: []string{"--access", "exec"}},
 		{name: "concurrent-password", kind: "password", value: "hidden-concurrent-password", concurrentType: "plain"},
 		{name: "concurrent-plain", kind: "plain", value: "visible-concurrent-user", flags: []string{"--type", "plain"}, concurrentType: "password"},
@@ -122,13 +127,7 @@ func TestPutTerminalInput(t *testing.T) {
 			}
 
 			if tc.errorText == "" {
-				label := tc.kind + "; hidden"
-				if tc.kind == "plain" {
-					label = "plain; visible, not secret"
-				} else if tc.kind == "totp" {
-					label = "totp seed; hidden"
-				}
-				prompt := tc.name + " [" + label + "]: "
+				prompt := tc.kind + ": "
 				for !strings.Contains(output.String(), prompt) && ctx.Err() == nil {
 					readOutput(20)
 				}
@@ -144,10 +143,30 @@ func TestPutTerminalInput(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if (state.Lflag&unix.ECHO != 0) != (tc.kind == "plain") || state.Lflag&unix.ICANON == 0 {
+				if (state.Lflag&unix.ECHO != 0) != (tc.kind == "plain") || (state.Lflag&unix.ICANON != 0) != (tc.kind == "plain") {
 					t.Fatalf("wrong input mode for %s: flags=%#x", tc.kind, state.Lflag)
 				}
-				if _, err := unix.Write(master, []byte(tc.value+"\n")); err != nil {
+				typed := tc.typed
+				if typed == "" {
+					typed = tc.value
+				}
+				if _, err := unix.Write(master, []byte(typed)); err != nil {
+					t.Fatal(err)
+				}
+				if tc.kind != "plain" {
+					masks := utf8.RuneCountInString(strings.ReplaceAll(typed, "\x7f", ""))
+					for strings.Count(output.String(), "•") < masks && ctx.Err() == nil {
+						readOutput(20)
+					}
+					if strings.Count(output.String(), "•") != masks {
+						t.Fatalf("missing live input mask: %q", output.String())
+					}
+				}
+				end := byte('\n')
+				if tc.cancelled {
+					end = 3
+				}
+				if _, err := unix.Write(master, []byte{end}); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -158,8 +177,16 @@ func TestPutTerminalInput(t *testing.T) {
 			if ctx.Err() != nil {
 				t.Fatalf("put did not finish without further input: %q", output.String())
 			}
-			if tc.errorText != "" {
-				if err == nil || !strings.Contains(output.String(), tc.errorText) || strings.Contains(output.String(), "]: ") {
+			if tc.cancelled {
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || exit.ExitCode() != 130 || !strings.Contains(output.String(), "input cancelled") {
+					t.Fatalf("expected cancellation: err=%v output=%q", err, output.String())
+				}
+				if code, _, _ := c.call("", "view", tc.name); code == 0 {
+					t.Fatal("cancelled input was stored")
+				}
+			} else if tc.errorText != "" {
+				if err == nil || !strings.Contains(output.String(), tc.errorText) || strings.Contains(output.String(), "plain: ") || strings.Contains(output.String(), "password: ") || strings.Contains(output.String(), "totp: ") {
 					t.Fatalf("expected rejection before prompting: err=%v output=%q", err, output.String())
 				}
 			} else {
@@ -171,6 +198,11 @@ func TestPutTerminalInput(t *testing.T) {
 				}
 				if r := c.record("view", tc.name); r["type"] != tc.kind {
 					t.Fatalf("stored type: %v", r)
+				}
+				if tc.typed != "" {
+					if got, _ := c.ok("", "get", tc.name, "--dangerously-skip-check"); got != tc.value+"\n" {
+						t.Fatalf("stored edited value: %q", got)
+					}
 				}
 			}
 			after, err := unix.IoctlGetTermios(master, unix.TCGETS)

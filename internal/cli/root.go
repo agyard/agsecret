@@ -134,20 +134,20 @@ func safeText(s string) string {
 }
 
 const guide = `Store passwords, TOTP seeds and visible plain values in an encrypted vault.
-Use CREDENTIAL:FIELD names to group an account's fields. There are no fixed
-field names or empty credentials. Run "agsecret ls" to see fields and IDs,
+Use CREDENTIAL:FIELD names to group an account's fields. Choose any field
+names; groups exist while they contain fields. Run "agsecret ls" for IDs,
 or "agsecret credential view NAME" to see one account.
 
 Getting started:
   agsecret init                              # create the vault
   agsecret put github:username alice --type plain
-  agsecret put github:password               # hidden password prompt
+  agsecret put github:password               # masked password input
   agsecret credential view github --json     # plain values and sensitive IDs
 
 Use rename OLD NEW to change a name or move a field into/out of a credential.
 Renaming preserves IDs, values, limits and leak reports. Changing a value or
-type assigns a new ID. put NAME VALUE also works for sensitive values, but
-prints a reminder to remove the command from shell history.
+type assigns a new ID. After put NAME VALUE, remove sensitive values from
+shell history.
 
 Examples:
   # Recommended: keep shell code fixed and pass IDs through the environment
@@ -159,7 +159,7 @@ Examples:
   # A TOTP ID becomes its current code
   agsecret exec -- curl "https://example.com/login?code=ID"
 
-  # Type a password into a tmux pane that is waiting at a password prompt
+  # Type a password at a tmux password prompt
   agsecret send tmux:PANE ID
 
   # Use tmux's marked pane on another server
@@ -170,31 +170,28 @@ Examples:
   agsecret get TOTP_ID
 
 Notes for agents:
-  - [REDACTED:ID] in output means the value was hidden from you. That is not
-    a leak, and there is nothing to report.
+  - [REDACTED:ID] marks a value that was successfully hidden. Report only
+    exposed passwords.
   - If a secret is refused because it expired, is disabled or has no uses left,
     ask the user. put NAME --ttl 1h --uses 2 sets a lifetime and shared use cap.
     Never use options whose names start with --dangerously.
   - Use exec or send for passwords. get prints plain values and TOTP codes;
-    it refuses passwords by default in every shell, including pipes and
-    command substitutions.
-    exec substitutes IDs and filters its child's stdout/stderr.
+    passwords require a human override. exec substitutes IDs and filters
+    its child's stdout/stderr.
   - Prefer exec -c with environment variables and quoted expansions. IDs in
-    its script are refused. exec -- substitutes arguments without classifying
-    code: bash -c, node -e and similar inputs can execute a substituted value.
-    Output redaction cannot prevent command injection. Avoid eval in scripts.
+    its script are refused. With exec --, bash -c, node -e and similar inputs
+    can execute a substituted value. Keep values out of code and eval.
   - Passwords and TOTP share a counter per ID across get, exec and send.
     Each authorized invocation costs one use, even if the downstream command
-    fails. Repeated IDs in one
-    exec cost one use each; ls, view and report do not consume uses.
-  - plain values are directly visible, never protected or counted. They do not
-    support --access, --ttl or --uses. Use a plain field for a URL or note.
-  - TOTP codes remain visible; only the stored seed is protected from output.
-  - If you see a password in plain text anyway, run "agsecret report ID" and
+    fails. Each distinct ID costs one use per exec. ls, view and report are free.
+  - plain values are directly visible and unlimited. Use them for URLs,
+    usernames or notes. Protection flags apply to password and TOTP fields.
+  - TOTP codes remain visible; stored seeds are redacted.
+  - If you see a password in plain text, run "agsecret report ID" and
     tell the user.
-  - Only exact copies are hidden. Encoded copies, files and network traffic are
-    not. AG-Secret reduces accidental exposure, not deliberate extraction; do not
-    use this tool for high-sensitivity secrets.`
+  - Redaction matches exact values; encodings, files and network traffic bypass
+    it. AG-Secret reduces accidental exposure. Use a stronger isolation system
+    for highly sensitive credentials.`
 
 func newRoot(o *options) *cobra.Command {
 	r := &cobra.Command{

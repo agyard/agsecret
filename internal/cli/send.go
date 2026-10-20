@@ -24,11 +24,11 @@ press Enter. PANE uses tmux target syntax, such as 0, work:1.0, %3 or {marked}.
 Set AGSECRET_TMUX_SOCKET to a socket path to select another tmux server.
 Otherwise tmux uses its usual environment, including TMUX and TMUX_TMPDIR.
 
-Passwords and TOTP codes require a password prompt that hides what you type,
-like the ones from sudo, ssh or psql. Plain values can be typed at any prompt.
+Passwords and TOTP codes require a password prompt, such as sudo, ssh or psql.
+Plain values can be typed at any prompt.
 
-Values containing newlines or other control characters cannot be typed safely;
-use exec for those. After the pane check passes, sending a password or TOTP code
+Use exec for values containing newlines or other control characters.
+After the pane check passes, sending a password or TOTP code
 consumes one use shared with get and exec, even if injection fails.`,
 		Example: "  agsecret send tmux:db ID\n  agsecret send tmux:%3 ID --no-enter",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -56,7 +56,7 @@ consumes one use shared with get and exec, even if injection fails.`,
 				// tmux's literal mode only disables key-name interpretation; the
 				// terminal still acts on newlines and interrupt keys.
 				if bytes.IndexFunc(value, unicode.IsControl) >= 0 {
-					return errors.New("cannot type this value because it contains control characters that the terminal would act on; use agsecret exec instead")
+					return errors.New("value contains control characters; use agsecret exec")
 				}
 				// display-message falls back to the current pane for unknown
 				// targets, so check the target with send-keys first.
@@ -78,7 +78,7 @@ consumes one use shared with get and exec, even if injection fails.`,
 						return err
 					}
 					if !prompt && !skipCheck {
-						return fmt.Errorf("tmux pane %q is not waiting at a password prompt, so the secret could be shown or run as a command", pane)
+						return fmt.Errorf("tmux pane %q requires a password prompt", pane)
 					}
 				}
 				if err := consumeUses(s, []string{r.ID}, "send"); err != nil {
@@ -96,8 +96,8 @@ consumes one use shared with get and exec, even if injection fails.`,
 			})
 		},
 	}
-	c.Flags().BoolVar(&noEnter, "no-enter", false, "do not press Enter after typing")
-	c.Flags().BoolVar(&skipCheck, "dangerously-skip-check", false, "type even if the pane is not at a password prompt (for people only, never for agents)")
+	c.Flags().BoolVar(&noEnter, "no-enter", false, "skip Enter after typing")
+	c.Flags().BoolVar(&skipCheck, "dangerously-skip-check", false, "skip the password prompt check (human use only)")
 	return c
 }
 

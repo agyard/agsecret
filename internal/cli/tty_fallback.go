@@ -8,12 +8,13 @@ import (
 	"golang.org/x/term"
 )
 
-func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
-	if err := prompt(); err != nil {
-		return nil, err
+func readTerminal(f *os.File, echo bool, read func() ([]byte, error)) ([]byte, error) {
+	if !echo {
+		state, err := term.MakeRaw(int(f.Fd()))
+		if err != nil {
+			return nil, err
+		}
+		defer term.Restore(int(f.Fd()), state)
 	}
-	if echo {
-		return readTerminalLine(f)
-	}
-	return term.ReadPassword(int(f.Fd()))
+	return read()
 }

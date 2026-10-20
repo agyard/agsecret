@@ -24,7 +24,7 @@ func isTerminal(v any) bool {
 func (o *options) passphrase() ([]byte, error) {
 	f, err := store.OpenPrivateFile(o.passFile)
 	if errors.Is(err, os.ErrNotExist) && o.defaultPass && isTerminal(o.in) {
-		return promptValue(o.in, o.errOut, "Vault passphrase (hidden): ", false)
+		return promptValue(o.in, o.errOut, "Passphrase: ", false)
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("pass file %s does not exist", o.passFile)
@@ -61,9 +61,14 @@ func readValue(in io.Reader) ([]byte, error) {
 
 // promptValue reads one terminal line; callers check isTerminal(in).
 func promptValue(in io.Reader, errOut io.Writer, label string, echo bool) ([]byte, error) {
-	b, err := readTerminal(in.(*os.File), echo, func() error {
-		_, err := fmt.Fprint(errOut, label)
-		return err
+	b, err := readTerminal(in.(*os.File), echo, func() ([]byte, error) {
+		if _, err := fmt.Fprint(errOut, label); err != nil {
+			return nil, err
+		}
+		if echo {
+			return readTerminalLine(in.(*os.File))
+		}
+		return readMasked(in, errOut)
 	})
 	if !echo {
 		_, _ = fmt.Fprintln(errOut)

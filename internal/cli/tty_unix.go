@@ -44,9 +44,8 @@ func atPasswordPrompt(path string) (bool, error) {
 	return state.Lflag&unix.ECHO == 0 && state.Lflag&unix.ICANON != 0, nil
 }
 
-// readTerminal sets line input and the requested echo mode, then restores the
-// original settings. Ctrl-D on an empty line ends input, just like a shell.
-func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
+// readTerminal prepares the input mode and restores it after the prompt.
+func readTerminal(f *os.File, echo bool, read func() ([]byte, error)) ([]byte, error) {
 	fd := int(f.Fd())
 	old, err := unix.IoctlGetTermios(fd, ioctlGetTermios)
 	if err != nil {
@@ -56,6 +55,10 @@ func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
 	state.Lflag = state.Lflag&^unix.ECHO | unix.ICANON | unix.ISIG
 	if echo {
 		state.Lflag |= unix.ECHO
+	} else {
+		state.Lflag &^= unix.ICANON | unix.ISIG | unix.IEXTEN | unix.ECHONL
+		state.Iflag &^= unix.IGNCR | unix.INLCR | unix.IXON | unix.ISTRIP
+		state.Cc[unix.VMIN], state.Cc[unix.VTIME] = 1, 0
 	}
 	state.Iflag |= unix.ICRNL
 	if err := unix.IoctlSetTermios(fd, ioctlSetTermios, &state); err != nil {
@@ -76,8 +79,5 @@ func readTerminal(f *os.File, echo bool, prompt func() error) ([]byte, error) {
 		case <-done:
 		}
 	}()
-	if err := prompt(); err != nil {
-		return nil, err
-	}
-	return readTerminalLine(f)
+	return read()
 }
