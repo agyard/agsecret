@@ -45,6 +45,7 @@ var (
 	ErrExpired    = errors.New("expired")
 	ErrNotAllowed = errors.New("not allowed")
 	ErrNoUses     = errors.New("no uses left")
+	ErrReportType = errors.New("only passwords can be reported")
 )
 
 // Record is a stored secret. Plain values are always included; sensitive
@@ -52,6 +53,7 @@ var (
 type Record struct {
 	Name      string
 	ID        string
+	Source    string `json:",omitempty"` // resolved client-side; never stored
 	Type      string // "password", "totp", or "plain"
 	CreatedAt time.Time
 	UpdatedAt time.Time
@@ -573,6 +575,7 @@ func scanRecord(scanner interface{ Scan(...any) error }, includeSecret bool) (Re
 	var created, updated, leaks string
 	var expires sql.NullString
 	if err := scanner.Scan(&r.Name, &r.ID, &r.Type, &secret, &created, &updated, &expires, &r.AllowGet, &r.AllowExec, &r.MaxUses, &r.UsedCount, &leaks); err != nil {
+		clear(secret)
 		return r, err
 	}
 	defer clear(secret)
@@ -624,9 +627,13 @@ func (s *Store) Get(ref string, includeSecret bool) (Record, error) {
 // List returns standalone secrets first, followed by credentials ordered by
 // name and field. Sensitive values require includeSecret.
 func (s *Store) List(includeSecret bool) ([]Record, error) {
-	rows, err := s.db.Query("SELECT " + columns(includeSecret) + ` FROM secrets ORDER BY instr(name,':')>0,
-CASE WHEN instr(name,':')>0 THEN substr(name,1,instr(name,':')-1) ELSE name END,name`)
+	rows, err := s.db.Query(listQuery(includeSecret))
 	return scanRecords(rows, err, includeSecret)
+}
+
+func listQuery(includeSecret bool) string {
+	return "SELECT " + columns(includeSecret) + ` FROM secrets ORDER BY instr(name,':')>0,
+CASE WHEN instr(name,':')>0 THEN substr(name,1,instr(name,':')-1) ELSE name END,name`
 }
 
 // scanRecords reads and closes rows. On failure it erases values already read.
@@ -686,21 +693,36 @@ func (s *Store) ConsumeMany(refs []string, action string) ([]Record, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
+	records, err := consumeMany(tx, refs, action, nil)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		clearRecords(records)
+		return nil, err
+	}
+	return records, nil
+}
 
+// consumeMany shares the caller's transaction, including any API authorization.
+// A non-nil scope is checked against the current name before access checks.
+func consumeMany(tx *sql.Tx, refs []string, action string, scope []string) ([]Record, error) {
 	records := make([]Record, 0, len(refs))
 	seen := make(map[string]struct{}, len(refs))
-	committed := false
+	ok := false
 	defer func() {
-		if !committed {
-			for i := range records {
-				clear(records[i].Secret)
-			}
+		if !ok {
+			clearRecords(records)
 		}
 	}()
 	for _, ref := range refs {
 		r, err := getRecord(tx, ref, true)
 		if err != nil {
 			return nil, err
+		}
+		if scope != nil && !rulesAllow(scope, r.Name) {
+			clear(r.Secret)
+			return nil, ErrNotFound
 		}
 		if _, ok := seen[r.ID]; ok {
 			clear(r.Secret)
@@ -750,11 +772,14 @@ WHERE id=? AND (max_uses=0 OR used_count<max_uses)`, encodeTime(updatedAt), reco
 		records[i].UsedCount++
 		records[i].UpdatedAt = updatedAt
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, err
-	}
-	committed = true
+	ok = true
 	return records, nil
+}
+
+func clearRecords(records []Record) {
+	for i := range records {
+		clear(records[i].Secret)
+	}
 }
 
 func (s *Store) Delete(id string) error {
@@ -780,13 +805,24 @@ func (s *Store) Report(ref, reason string) ([]Record, error) {
 		return nil, err
 	}
 	defer tx.Rollback()
+	records, err := report(tx, ref, reason, nil)
+	if err != nil {
+		return nil, err
+	}
+	return records, tx.Commit()
+}
+
+func report(tx *sql.Tx, ref, reason string, scope []string) ([]Record, error) {
 	r, err := getRecord(tx, ref, true)
 	if err != nil {
 		return nil, err
 	}
 	defer clear(r.Secret)
+	if scope != nil && !rulesAllow(scope, r.Name) {
+		return nil, ErrNotFound
+	}
 	if r.Type != "password" {
-		return nil, errors.New("only passwords can be reported")
+		return nil, ErrReportType
 	}
 	rows, err := tx.Query("SELECT "+columns(false)+" FROM secrets WHERE type='password' AND secret=? ORDER BY name", r.Secret)
 	records, err := scanRecords(rows, err, false)
@@ -805,5 +841,8 @@ func (s *Store) Report(ref, reason string) ([]Record, error) {
 			return nil, err
 		}
 	}
-	return records, tx.Commit()
+	if scope != nil {
+		records = scopedRecords(records, scope)
+	}
+	return records, nil
 }

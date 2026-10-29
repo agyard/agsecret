@@ -234,26 +234,28 @@ func access(r store.Record) string {
 	return "none"
 }
 
-// useValue returns the value that action ("get", "exec" or "send") hands out,
-// which is the current code for a TOTP secret. Refusals point people to the
-// fix without handing agents a command to lift the limit themselves.
-func useValue(r store.Record, now time.Time, action string) ([]byte, error) {
+// checkUse is a preflight check; the owning store rechecks when consuming a use.
+func checkUse(r store.Record, now time.Time, action string) error {
 	if r.Type == "plain" {
-		return bytes.Clone(r.Secret), nil
+		return nil
 	}
 	allowed := r.AllowExec
 	if action == "get" {
 		allowed = r.AllowGet
 	}
 	if r.Expired(now) {
-		return nil, fmt.Errorf("%s (%s) has expired; renewing it is up to the user (see agsecret put --help)", r.Name, r.ID)
+		return fmt.Errorf("%s (%s) has expired; renewing it is up to the user (see agsecret put --help)", r.Name, r.ID)
 	}
 	if !allowed {
-		return nil, fmt.Errorf("%s is turned off for %s (%s); turning it on is up to the user (see agsecret put --help)", action, r.Name, r.ID)
+		return fmt.Errorf("%s is turned off for %s (%s); turning it on is up to the user (see agsecret put --help)", action, r.Name, r.ID)
 	}
 	if r.MaxUses > 0 && r.UsedCount >= r.MaxUses {
-		return nil, fmt.Errorf("%s (%s) has no uses left; ask the user to change its limit", r.Name, r.ID)
+		return fmt.Errorf("%s (%s) has no uses left; ask the user to change its limit", r.Name, r.ID)
 	}
+	return nil
+}
+
+func currentValue(r store.Record, now time.Time) ([]byte, error) {
 	if r.Type == "totp" {
 		code, err := totp.Generate(string(r.Secret), now)
 		return []byte(code), err
@@ -276,8 +278,8 @@ Each authorized sensitive get consumes one use, shared with exec and send.
 plain values have no access, expiry or usage restrictions.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				r, err := s.Get(args[0], true)
+			return o.withSources(func(s *sources) error {
+				r, err := s.get(cmd.Context(), args[0])
 				if err != nil {
 					return err
 				}
@@ -285,15 +287,12 @@ plain values have no access, expiry or usage restrictions.`,
 				if r.Type == "password" && !skipCheck {
 					return &exitError{code: 2, err: errors.New("get does not print passwords by default; use agsecret exec or send (people: see agsecret get --help)")}
 				}
-				value, err := useValue(r, time.Now(), "get")
+				values, err := s.use(cmd.Context(), []store.Record{r}, "get")
 				if err != nil {
 					return err
 				}
-				defer clear(value)
-				if err := consumeUses(s, []string{r.ID}, "get"); err != nil {
-					return err
-				}
-				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", value)
+				defer clearRecords(values)
+				_, err = fmt.Fprintf(cmd.OutOrStdout(), "%s\n", values[0].Secret)
 				return err
 			})
 		},
@@ -310,8 +309,8 @@ func newView(o *options) *cobra.Command {
 		Long:       "Show a field's ID, type and metadata. plain values are displayed directly;\npasswords and TOTP seeds are never shown. Use credential view NAME for a group.",
 		Args:       cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				r, err := s.Get(args[0], false)
+			return o.withSources(func(s *sources) error {
+				r, err := s.get(cmd.Context(), args[0])
 				if err != nil {
 					return err
 				}
@@ -325,6 +324,9 @@ func newView(o *options) *cobra.Command {
 				}
 				w := newTable(cmd.OutOrStdout())
 				fmt.Fprintf(w, "Name:\t%s\nID:\t%s\nType:\t%s\n", r.Name, r.ID, r.Type)
+				if len(s.mounts) > 0 {
+					fmt.Fprintf(w, "Source:\t%s\n", r.Source)
+				}
 				if r.Type == "plain" {
 					fmt.Fprintf(w, "Value:\t%s\n", safeText(string(r.Secret)))
 				} else {
@@ -373,8 +375,8 @@ func newList(o *options) *cobra.Command {
 		Long:       "List standalone fields first, then credentials and their fields in lexical\norder. plain values are visible; sensitive values are represented by their IDs.",
 		Args:       cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return o.withStore(func(s *store.Store) error {
-				records, err := s.List(false)
+			return o.withSources(func(s *sources) error {
+				records, err := s.list(cmd.Context())
 				if err != nil {
 					return err
 				}
@@ -399,7 +401,12 @@ func newList(o *options) *cobra.Command {
 
 func renderRecords(out io.Writer, records []store.Record) error {
 	w := newTable(out)
-	fmt.Fprintln(w, "NAME\tID\tTYPE\tSTATUS\tACCESS\tUSES\tVALUE")
+	showSource := slices.ContainsFunc(records, func(r store.Record) bool { return r.Source != "" && r.Source != "local" })
+	header := "NAME\tID\tTYPE\tSTATUS\tACCESS\tUSES\tVALUE"
+	if showSource {
+		header += "\tSOURCE"
+	}
+	fmt.Fprintln(w, header)
 	previousGroup := ""
 	for _, r := range records {
 		group, field := store.SplitName(r.Name)
@@ -414,7 +421,11 @@ func renderRecords(out io.Writer, records []store.Record) error {
 		if r.Type == "plain" {
 			state, permissions, uses, value = "-", "-", "-", safeText(string(r.Secret))
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", field, r.ID, r.Type, state, permissions, uses, value)
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s", field, r.ID, r.Type, state, permissions, uses, value)
+		if showSource {
+			fmt.Fprintf(w, "\t%s", r.Source)
+		}
+		fmt.Fprintln(w)
 	}
 	return w.Flush()
 }
@@ -464,8 +475,8 @@ Use the exposed password's ID. Replacing or deleting it retires that ID.`,
 			return cobra.ExactArgs(1)(cmd, args)
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				records, err := s.Report(args[0], reason)
+			return o.withSources(func(s *sources) error {
+				records, err := s.report(cmd.Context(), args[0], reason)
 				if errors.Is(err, store.ErrNotFound) {
 					return fmt.Errorf("no secret has ID %s; if it was replaced or deleted, the exposed value is gone and needs no report", args[0])
 				}

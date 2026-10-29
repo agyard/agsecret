@@ -74,7 +74,7 @@ func (c testCLI) id(name string) string {
 }
 
 func TestHelpAndUsageErrors(t *testing.T) {
-	for _, command := range []string{"", "init", "put", "ls", "view", "get", "exec", "send", "report", "delete"} {
+	for _, command := range []string{"", "init", "put", "ls", "view", "get", "exec", "send", "report", "delete", "serve", "key", "remote"} {
 		helpArgs, flagArgs := []string{"help"}, []string{"--help"}
 		if command != "" {
 			helpArgs, flagArgs = []string{"help", command}, []string{command, "--help"}

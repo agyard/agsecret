@@ -198,6 +198,9 @@ func recordJSON(r store.Record) map[string]any {
 		"name": r.Name, "id": r.ID, "type": r.Type,
 		"created_at": r.CreatedAt, "updated_at": r.UpdatedAt,
 	}
+	if r.Source != "" {
+		value["source"] = r.Source
+	}
 	if r.Type == "plain" {
 		value["value"] = string(r.Secret)
 	} else {
@@ -206,16 +209,6 @@ func recordJSON(r store.Record) map[string]any {
 		value["max_uses"], value["used_count"] = r.MaxUses, r.UsedCount
 	}
 	return value
-}
-
-// Values were prepared from a snapshot. Recheck the current IDs and consume
-// all uses atomically before handing any value to another process or output.
-func consumeUses(s *store.Store, ids []string, action string) error {
-	records, err := s.ConsumeMany(ids, action)
-	for _, r := range records {
-		clear(r.Secret)
-	}
-	return err
 }
 
 func recordsJSON(records []store.Record) []map[string]any {

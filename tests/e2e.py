@@ -97,6 +97,77 @@ while not (root / 'prompt-stop').exists():
         subprocess.run([tmux, '-S', socket, 'kill-server'], capture_output=True, timeout=5)
 
 
+def check_remote(root, env, run):
+    host_env = dict(env, XDG_DATA_HOME=str(root / 'server-data'))
+    client_env = dict(env, XDG_DATA_HOME=str(root / 'client-data'))
+
+    def host(*args, **kwargs):
+        return run(*args, child_env=host_env, **kwargs)
+
+    def client(*args, **kwargs):
+        return run(*args, child_env=kwargs.pop('child_env', client_env), **kwargs)
+
+    host('init')
+    client('init')
+    password = json.loads(host('put', 'pku_test:password', '--stdin', '--json', data=PASSWORD).stdout)
+    otp = json.loads(host('put', 'pku_test:otp', '--type', 'totp', '--stdin', '--json', data=SEED).stdout)
+    host('put', 'pku_test:username', 'remote-user', '--type', 'plain')
+    local = json.loads(client('put', 'pku_test:password', '--stdin', '--json', data='local-only-password').stdout)
+    key = host('key', 'create', 'client', '--rule', 'pku_*:*', '--rule', '!pku_*:otp').stdout
+    process = subprocess.Popen([APP, 'serve', '--listen', '127.0.0.1:0'], env=host_env,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        deadline, startup = time.monotonic() + 5, b''
+        with selectors.DefaultSelector() as selected:
+            selected.register(process.stderr, selectors.EVENT_READ)
+            while b'\n' not in startup:
+                remaining = deadline - time.monotonic()
+                assert remaining > 0 and selected.select(remaining), 'credential server did not start'
+                chunk = os.read(process.stderr.fileno(), 4096)
+                assert chunk and len(startup) + len(chunk) <= 4096, 'invalid server startup output'
+                startup += chunk
+        line = startup.split(b'\n', 1)[0].decode()
+        assert line.startswith('Serving http://127.0.0.1:'), 'missing server address'
+        client('remote', 'add', '00_work', line.removeprefix('Serving '), '--key-stdin', data=key)
+        rows = json.loads(client('ls', '--json').stdout)
+        fields = {r['name']: r for r in rows}
+        assert set(fields) == {'pku_test:password', 'pku_test:username'}
+        assert fields['pku_test:password']['id'] == local['id']
+        assert fields['pku_test:password']['source'] == 'local'
+        assert fields['pku_test:username']['source'] == '00_work'
+        assert fields['pku_test:username']['value'] == 'remote-user'
+        remote = json.loads(client('view', password['id'], '--json').stdout)
+        assert remote['source'] == '00_work' and remote['id'] == password['id']
+        result = client('exec', '--', sys.executable, '-c', 'import sys; print(sys.argv[1])', password['id'])
+        assert result.stdout == '[REDACTED:' + password['id'] + ']\n'
+        assert PASSWORD not in result.stdout + result.stderr
+        remote = json.loads(host('view', password['id'], '--json').stdout)
+        assert remote['used_count'] == 1
+        client('report', password['id'], '--reason', 'synthetic integration report')
+        remote = json.loads(host('view', password['id'], '--json').stdout)
+        assert len(remote['leaks']) == 1
+        for ref in ('pku_test:otp', otp['id']):
+            result = client('get', ref, check=False)
+            assert result.returncode != 0 and result.stdout == ''
+            assert SEED not in result.stderr
+        pane_root = root / 'remote-tmux'
+        pane_root.mkdir()
+        check_tmux(pane_root, client_env, client, password['id'])
+        print('PASS: remote scope, local overlay, ID lookup, redaction, server usage and leak reports')
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=6)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+            raise AssertionError('credential server did not shut down')
+        finally:
+            process.stderr.close()
+        assert process.returncode == 0, 'credential server exited unsuccessfully'
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix='agsecret-selfcheck-') as directory:
         root = pathlib.Path(directory)
@@ -161,6 +232,7 @@ def main():
             process.communicate(timeout=3)
 
         check_tmux(root, env, run, first['id'])
+        check_remote(root, env, run)
 
 
 if __name__ == '__main__':

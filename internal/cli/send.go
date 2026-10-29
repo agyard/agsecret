@@ -42,21 +42,31 @@ consumes one use shared with get and exec, even if injection fails.`,
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			pane := strings.TrimPrefix(args[0], "tmux:")
-			return o.withStore(func(s *store.Store) error {
-				r, err := s.Get(args[1], true)
+			return o.withSources(func(s *sources) error {
+				r, err := s.get(cmd.Context(), args[1])
 				if err != nil {
 					return err
 				}
 				defer clear(r.Secret)
-				value, err := useValue(r, time.Now(), "send")
-				if err != nil {
+				if err := checkUse(r, time.Now(), "send"); err != nil {
 					return err
 				}
-				defer clear(value)
-				// tmux's literal mode only disables key-name interpretation; the
-				// terminal still acts on newlines and interrupt keys.
-				if bytes.IndexFunc(value, unicode.IsControl) >= 0 {
-					return errors.New("value contains control characters; use agsecret exec")
+				// Local values can be checked before consuming a use. Remote
+				// passwords become available only after server authorization.
+				if r.Source == "local" {
+					preview, err := s.local.Get(r.ID, true)
+					if err != nil {
+						return err
+					}
+					value, err := currentValue(preview, time.Now())
+					clear(preview.Secret)
+					if err == nil {
+						err = checkSendValue(value)
+					}
+					clear(value)
+					if err != nil {
+						return err
+					}
 				}
 				// display-message falls back to the current pane for unknown
 				// targets, so check the target with send-keys first.
@@ -81,8 +91,23 @@ consumes one use shared with get and exec, even if injection fails.`,
 						return fmt.Errorf("tmux pane %q requires a password prompt", pane)
 					}
 				}
-				if err := consumeUses(s, []string{r.ID}, "send"); err != nil {
+				values, err := s.use(cmd.Context(), []store.Record{r}, "send")
+				if err != nil {
 					return err
+				}
+				defer clearRecords(values)
+				value := values[0].Secret
+				if err := checkSendValue(value); err != nil {
+					return fmt.Errorf("%w; this use was consumed", err)
+				}
+				if r.Source != "local" && r.Type != "plain" && !skipCheck {
+					prompt, err := atPasswordPrompt(ttyPath)
+					if err != nil {
+						return err
+					}
+					if !prompt {
+						return fmt.Errorf("tmux pane %q requires a password prompt; this use was consumed", pane)
+					}
 				}
 				if err := tmuxCommand("send-keys", "-t", paneID, "-l", "--", string(value)).Run(); err != nil {
 					return fmt.Errorf("cannot type into tmux pane %q: %w", pane, err)
@@ -106,4 +131,12 @@ func tmuxCommand(args ...string) *exec.Cmd {
 		args = append([]string{"-S", socket}, args...)
 	}
 	return exec.Command("tmux", args...)
+}
+
+func checkSendValue(value []byte) error {
+	// tmux literal mode still passes terminal control characters through.
+	if bytes.IndexFunc(value, unicode.IsControl) >= 0 {
+		return errors.New("value contains control characters; use agsecret exec")
+	}
+	return nil
 }

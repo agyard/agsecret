@@ -73,11 +73,12 @@ while it has fields. Add fields with put and move them with rename.`,
 		Short: "List credentials and their field counts",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return o.withStore(func(s *store.Store) error {
-				records, err := s.List(false)
+			return o.withSources(func(s *sources) error {
+				records, err := s.list(cmd.Context())
 				if err != nil {
 					return err
 				}
+				defer clearRecords(records)
 				counts := make(map[string]int)
 				for _, r := range records {
 					if name, _ := store.SplitName(r.Name); name != "" {
@@ -110,15 +111,25 @@ while it has fields. Add fields with put and move them with rename.`,
 		Long:  "Show field metadata and plain values. Passwords and TOTP seeds stay hidden.\nViewing fields preserves usage counts.",
 		Args:  credentialArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				records, err := s.Credential(args[0])
+			return o.withSources(func(s *sources) error {
+				records, err := s.list(cmd.Context())
 				if err != nil {
 					return err
 				}
-				if o.json {
-					return encodeJSON(cmd.OutOrStdout(), map[string]any{"name": args[0], "fields": recordsJSON(records)})
+				defer clearRecords(records)
+				fields := []store.Record{}
+				for _, r := range records {
+					if group, _ := store.SplitName(r.Name); group == args[0] {
+						fields = append(fields, r)
+					}
 				}
-				return renderRecords(cmd.OutOrStdout(), records)
+				if len(fields) == 0 {
+					return fmt.Errorf("credential %s %w", args[0], store.ErrNotFound)
+				}
+				if o.json {
+					return encodeJSON(cmd.OutOrStdout(), map[string]any{"name": args[0], "fields": recordsJSON(fields)})
+				}
+				return renderRecords(cmd.OutOrStdout(), fields)
 			})
 		},
 	}, o), addJSONFlag(&cobra.Command{

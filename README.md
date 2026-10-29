@@ -4,7 +4,7 @@
 [![Go 1.26+](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/dl/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue)](LICENSE)
 
-AG-Secret keeps passwords, TOTP seeds and visible plain fields in an encrypted local vault and helps AI agents use them while reducing accidental plaintext exposure. An agent refers to a field by its ID. `agsecret exec` fills in its value when starting a command and hides matching sensitive values from the output.
+AG-Secret manages passwords, TOTP seeds and visible plain fields for AI agents. Use an encrypted local vault, mount remote vaults, or serve selected fields through API keys. Agents refer to fields by ID; `agsecret exec` fills in their values and filters sensitive output.
 
 ## Installation
 
@@ -105,9 +105,42 @@ agsecret rename another:password standalone-password
 agsecret credential rename example work
 ```
 
-Renames preserve field IDs, values, counters, expiry and leak history. The destination name must be available. Each record belongs to at most one group. Storing a duplicate password produces a warning; reporting it adds a leak record to every matching password.
+Renames preserve field IDs, values, counters, expiry and leak history. The destination name must be available. Each record belongs to at most one group. Storing a duplicate password produces a warning; reporting it adds a leak record to every matching password in that vault.
 
 `agsecret ls` shows standalone fields first, then credential headings; groups and their fields are sorted lexically. `ls --json` returns the same ordered records as a flat array with full names. `credential ls --json` returns `{name, fields}` summaries (field counts); `credential view --json` returns `{name, fields}` with a record array. Plain records include `value` and omit protection fields.
+
+## Remote vaults
+
+On the server, create an API key and start serving the local vault:
+
+```sh
+agsecret key create laptop --rule 'pku_*:*' --rule '!pku_*:otp'
+agsecret serve --listen :8765 --tls-cert server.crt --tls-key server.key
+```
+
+Key creation prints the key once. The server stores its digest. `agsecret key ls` shows names and rules; `agsecret key delete laptop` revokes the key.
+
+`agsecret serve` defaults to HTTP on `127.0.0.1:8765`. Listening beyond loopback requires TLS. Clients verify the certificate and require HTTPS, with HTTP allowed for loopback connections. A server exposes its local fields; mounted vaults stay private to its client commands.
+
+On the client, initialize its vault and enter the API key at the masked prompt:
+
+```sh
+agsecret init
+agsecret remote add 00_work https://secrets.example.com:8765
+agsecret ls
+```
+
+Use `remote add NAME URL --key-stdin` for piped key input. Mount addresses and keys are stored in the client's encrypted vault. `remote ls` shows names and URLs; `remote delete NAME` removes a mount.
+
+Rules are shell-style patterns matched against complete field names, case-sensitively. `*` matches any string, including `:` and `/`; `?` matches one character, and `[]` matches a character class. Access starts denied. Ordinary rules allow, a leading `!` excludes, and the last matching rule wins. Rules apply dynamically to added and renamed fields, including requests by ID. The example allows `pku_*` credential fields except those named `otp`; `--rule '*'` allows every field. Quote rules to preserve them for AG-Secret.
+
+Local fields take precedence, followed by remote names in lexical order, such as `00_work`, then `10_home`. Matching full field names override one another individually, so a credential can combine sources. Results identify their `source` in JSON and show a source column when remote fields are present. IDs continue to address their original records, even when a local field covers their names.
+
+`put`, `rename`, `delete` and credential changes affect the local vault. `report ID` goes to the owning source; its response includes only fields authorized by the key. Removing a local field reveals any remote field with the same name. Unavailable higher-priority sources block name resolution; local matches work independently. `ls` requires all sources to respond.
+
+The owning server checks scope, access, expiry and use counts before returning a value. TOTP seeds stay on that server; clients receive the current code. Password access lets the API key holder obtain the password. `exec` runs locally and filters all eligible local values plus the remote passwords used by that invocation.
+
+Each source authorizes a batch atomically. A failure across sources may leave some uses consumed, and mutations are never retried automatically. For remote `send`, a value rejected after retrieval, such as one containing a newline, has already consumed its use.
 
 ## tmux targets and sockets
 
@@ -138,6 +171,11 @@ agsecret send tmux:%3 example:username --no-enter
 | `credential view NAME` | Show a complete credential |
 | `credential rename NAME NEW_NAME` | Rename a credential and all its fields atomically |
 | `credential delete NAME` | Delete a credential and all its fields |
+| `serve` | Serve local fields through API keys |
+| `key create NAME --rule PATTERN [--rule PATTERN...]` | Create an API key with ordered field rules |
+| `key ls` / `key delete NAME` | Inspect or revoke API keys |
+| `remote add NAME URL` | Mount a remote vault using an API key |
+| `remote ls` / `remote delete NAME` | Inspect or remove mounts |
 
 ## Configuration
 
@@ -159,7 +197,7 @@ Flags override environment variables. On Unix, the pass file must be private to 
 
 You can narrow access, bring the expiry closer or reduce the use limit without the value. Widening these limits needs the value (`put` asks for it in a terminal), or the explicit `--dangerously-skip-check` override.
 
-For example, `agsecret put api --ttl 1h --uses 2` sets both limits by name. Counters are atomic across concurrent commands. Each distinct ID in one `exec` costs one use, even if it appears in multiple arguments or environment variables. Authorization consumes the use before output or execution; downstream failure does not refund it. Rejected contexts, disabled/expired credentials, `ls`, `view`, and `report` consume nothing.
+For example, `agsecret put api --ttl 1h --uses 2` sets both limits by name. Counters are atomic across concurrent commands. Each distinct ID in one `exec` costs one use, even if it appears in multiple arguments or environment variables. Authorization consumes the use before output or execution; downstream failure does not refund it. Refusals before authorization and metadata operations (`ls`, `view`, `report`) consume nothing.
 
 For sensitive fields, `ls` and `view` show used/allowed counts; JSON includes `max_uses` and `used_count`. Resubmitting the same value preserves the counter. Replacing its value or type gives it a new ID and resets the counter, preserving omitted limits unless changed to plain.
 
@@ -167,7 +205,7 @@ For sensitive fields, `ls` and `view` show used/allowed counts; JSON includes `m
 
 The vault is an SQLite database encrypted with Adiantum. Its key is encrypted with XChaCha20-Poly1305, under a key derived from the passphrase with Argon2id. Data is encrypted without tamper or rollback detection.
 
-AG-Secret reduces accidental exposure. Use a stronger isolation system for highly sensitive credentials. `exec` hides exact copies of stored values; Base64, custom encodings, files and network traffic can bypass it. Commands run detached from the terminal; use `send` for password prompts. Any program that can read the pass file or agsecret's memory can get the secrets. Expiry and use limits govern AG-Secret authorizations. Receiving programs can retain and reuse values.
+AG-Secret reduces accidental exposure. Use a stronger isolation system for highly sensitive credentials. `exec` hides exact copies of protected local values and the remote passwords it receives; Base64, custom encodings, files and network traffic can bypass it. Commands run detached from the terminal; use `send` for password prompts. Any program that can read the pass file or agsecret's memory can get the secrets. Expiry and use limits govern AG-Secret authorizations. Receiving programs can retain and reuse values.
 
 `send` checks for terminal settings typical of a password prompt for password and TOTP fields to reduce accidental typing into a shell. These settings cannot prove which program is receiving the value.
 
@@ -189,11 +227,11 @@ The checks run with memory, CPU and time limits (see `scripts/bounded-check.sh`)
 To publish a release, wait until CI passes on `main`, then push an annotated tag:
 
 ```sh
-git tag -a v1.2.3 -m 'Release v1.2.3'
-git push origin v1.2.3
+git tag -a v0.1.0 -m 'Release v0.1.0'
+git push origin v0.1.0
 ```
 
-The release workflow builds archives for Linux, macOS and Windows on amd64 and arm64, with SHA-256 checksums. Tags such as `v1.3.0-rc.1` are published as prereleases. Never reuse a tag.
+The release workflow builds archives for Linux, macOS and Windows on amd64 and arm64, with SHA-256 checksums. Tags such as `v0.2.0-rc.1` are published as prereleases. Never reuse a tag.
 
 ## License
 

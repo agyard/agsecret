@@ -149,6 +149,10 @@ Renaming preserves IDs, values, limits and leak reports. Changing a value or
 type assigns a new ID. After put NAME VALUE, remove sensitive values from
 shell history.
 
+Mounted servers join the same namespace: local fields take precedence, then
+remote names in lexical order. IDs address their original source. Management
+changes affect the local vault; report goes to the source that owns the ID.
+
 Examples:
   # Recommended: keep shell code fixed and pass IDs through the environment
   TOKEN=ID agsecret exec -c 'curl -H "Authorization: Bearer $TOKEN" URL | jq'
@@ -219,7 +223,7 @@ func newRoot(o *options) *cobra.Command {
 		target.InitDefaultVersionFlag()
 		return target.Help()
 	}})
-	r.AddCommand(newInit(o), newPut(o), newList(o), newView(o), newGet(o), newExec(o), newSend(o), newReport(o), newDelete(o), newRename(o), newCredential(o))
+	r.AddCommand(newInit(o), newPut(o), newList(o), newView(o), newGet(o), newExec(o), newSend(o), newReport(o), newDelete(o), newRename(o), newCredential(o), newServe(o), newKey(o), newRemote(o))
 	var markStarted func(*cobra.Command)
 	markStarted = func(c *cobra.Command) {
 		// Cobra validates flag groups after the pre-run hooks, so only the

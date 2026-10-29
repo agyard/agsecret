@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"maps"
 	"net/url"
 	"os"
 	"os/exec"
@@ -34,10 +33,10 @@ func newExec(o *options) *cobra.Command {
 		Long: `Run a command, replacing each secret ID in its arguments and environment
 variables with the secret's value (for a TOTP secret, its current code).
 
-Matching passwords and TOTP seeds in the command's output are replaced with
-[REDACTED:ID], with a note on standard error listing the IDs. Redaction matches
-exact values; encodings, files and network traffic bypass it. Current TOTP
-codes remain visible, just as with get.
+Local passwords and TOTP seeds, plus remote passwords used by this command,
+are replaced with [REDACTED:ID] in output. A note on standard error lists the
+IDs. Redaction matches exact values; encodings, files and network traffic
+bypass it. Current TOTP codes remain visible, just as with get.
 
 Prefer -c SCRIPT with IDs in environment variables. It uses /bin/sh (cmd.exe
 on Windows) and refuses IDs in SCRIPT itself before any substitution. POSIX
@@ -55,7 +54,8 @@ inspectors. Use send for terminal prompts.
 
 Each distinct sensitive ID consumes one use, shared with get and send, before
 starting the command. A failed command still consumes its uses. plain values
-remain visible and unlimited.
+remain visible and unlimited. Cross-source failures may consume some uses;
+the command starts only after all values arrive.
 
 The command uses pipes and runs detached from the terminal. Use send for ssh
 or sudo password prompts. Pagers and REPLs may behave differently.
@@ -104,7 +104,7 @@ var tokenPattern = regexp.MustCompile(`(?i)\bags_[0-9a-f]{8,}`)
 
 // expandTokens performs a single pass so a secret that happens to contain a
 // different record ID is never interpreted recursively.
-func expandTokens(value string, records map[string]store.Record, now time.Time, injected map[string][]byte) (string, error) {
+func expandTokens(value string, resolve func(string) ([]byte, error)) (string, error) {
 	if !strings.Contains(strings.ToLower(value), "ags_") {
 		return value, nil // Skips the regexp for most environment values.
 	}
@@ -115,17 +115,9 @@ func expandTokens(value string, records map[string]store.Record, now time.Time, 
 		if err := store.CheckID(id); err != nil {
 			return "", err
 		}
-		r, found := records[id]
-		if !found {
-			return "", fmt.Errorf("secret %s %w", id, store.ErrNotFound)
-		}
-		secret, resolved := injected[id]
-		if !resolved {
-			var err error
-			if secret, err = useValue(r, now, "exec"); err != nil {
-				return "", err
-			}
-			injected[id] = secret
+		secret, err := resolve(id)
+		if err != nil {
+			return "", err
 		}
 		b.WriteString(value[last:idx[0]])
 		b.Write(secret)
@@ -188,43 +180,68 @@ func runExpanded(o *options, cmd *cobra.Command, args []string) error {
 			clear(value)
 		}
 	}()
-	err := o.withStore(func(s *store.Store) error {
+	err := o.withSources(func(s *sources) error {
 		var err error
-		if records, err = s.List(true); err != nil {
+		if records, err = s.local.List(true); err != nil {
 			return err
 		}
-		now := time.Now()
-		if protected, err = protectedValues(records, now); err != nil {
+		if protected, err = protectedValues(records, time.Now()); err != nil {
 			return err
 		}
-		byID := make(map[string]store.Record, len(records))
-		for _, r := range records {
-			byID[r.ID] = r
+		selected := []store.Record{}
+		defer func() { clearRecords(selected) }()
+		seen := make(map[string]bool)
+		resolve := func(id string) ([]byte, error) {
+			if seen[id] {
+				return nil, nil
+			}
+			r, err := s.get(cmd.Context(), id)
+			if err != nil {
+				return nil, err
+			}
+			selected = append(selected, r)
+			seen[id] = true
+			return nil, checkUse(r, time.Now(), "exec")
 		}
-		for i, arg := range args {
-			if expanded[i], err = expandTokens(arg, byID, now, injected); err != nil {
+		// Resolve every ID and validate every argument before consuming uses.
+		for _, arg := range args {
+			if _, err := expandTokens(arg, resolve); err != nil {
 				return err
 			}
 		}
-		for i, item := range env {
+		for _, item := range env {
 			key, value, found := strings.Cut(item, "=")
-			if !found {
-				continue
+			if found {
+				if _, err := expandTokens(value, resolve); err != nil {
+					return fmt.Errorf("in environment variable %s: %w", key, err)
+				}
 			}
-			if value, err = expandTokens(value, byID, now, injected); err != nil {
-				return fmt.Errorf("in environment variable %s: %w", key, err)
-			}
-			env[i] = key + "=" + value
 		}
-		if len(injected) == 0 {
+		if len(selected) == 0 {
 			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: no secret IDs found")
 		}
-		for id, value := range injected {
-			if byID[id].Type == "password" {
-				protected = append(protected, redact.Secret{ID: id, Value: value})
+		values, err := s.use(cmd.Context(), selected, "exec")
+		if err != nil {
+			return err
+		}
+		for _, r := range values {
+			injected[r.ID] = r.Secret
+			if r.Type == "password" {
+				protected = append(protected, redact.Secret{ID: r.ID, Value: r.Secret})
 			}
 		}
-		return consumeUses(s, slices.Sorted(maps.Keys(injected)), "exec")
+		resolve = func(id string) ([]byte, error) { return injected[id], nil }
+		for i, arg := range args {
+			expanded[i], _ = expandTokens(arg, resolve)
+		}
+		for i, item := range env {
+			key, value, found := strings.Cut(item, "=")
+			if found {
+				value, _ = expandTokens(value, resolve)
+				env[i] = key + "=" + value
+			}
+		}
+		return nil
 	})
 	if err != nil {
 		return err

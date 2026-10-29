@@ -1,10 +1,10 @@
 # Architecture
 
-AG-Secret is a Go CLI built with Cobra. Each run opens one local SQLite vault,
-does its work and exits. Secret values stay in memory only as long as a
-command needs them. Passwords go through `exec` or `send` by default;
-the CLI never prints a TOTP seed, only its current code. These checks reduce
-accidental exposure, not deliberate extraction by a receiving program.
+AG-Secret is a Go CLI built with Cobra. Commands open a local SQLite vault;
+`serve` keeps it open while handling API requests. Client commands can also
+resolve fields from mounted servers. Values remain in memory for the operation.
+Passwords go through `exec` or `send` by default, and TOTP seeds stay at their
+owning source. Receiving programs are trusted with the values they receive.
 
 Each field has a name and a random ID. The ID stays the same while the value
 and type stay the same. Changing either one assigns a new ID, and the old ID
@@ -31,16 +31,18 @@ sensitive type to plain requires the value, creates a new ID, and clears the old
 controls and history. Plain values are excluded from the redaction patterns,
 including injected values, but a matching password pattern still takes effect.
 
-ls orders standalone fields first, then namespaces and local fields lexically.
+ls orders standalone fields first, then namespaces and their fields lexically.
 Its JSON is a flat record array in the same order; credential view wraps a
 record array with the namespace name. Viewing a group never generates OTP
-codes or consumes uses. No import, export or sharing protocol is implemented.
+codes or consumes uses. Import and export are outside the current scope.
 
 ```mermaid
 flowchart LR
   A[Agent or user] --> C[CLI]
   C --> U[Argon2id and authenticated key unwrap]
   U --> S[(Encrypted SQLite and WAL)]
+  C --> H[HTTPS client]
+  H --> V[Remote server and its local vault]
   C --> X[Child command with expanded argv and env]
   X --> R[Output filter per stream]
   R --> O[Output, plus a note when values were hidden]
@@ -86,7 +88,9 @@ read never write.
   referenced IDs for expiry, access and remaining uses and increments each
   distinct sensitive ID's counter once. Plain fields are not counted. Any refusal rolls back the whole batch. IDs
   invalidated by a concurrent rotation are rejected. Downstream failures do not
-  refund a committed authorization. Exec closes the vault before child launch.
+  refund a committed authorization. Exec closes the local vault and network
+  connections before child launch. The server also checks API key scope inside
+  the transaction.
 
 `--uses 0` means unlimited. Same-value updates retain the count, while a changed
 value or type resets it with the new ID. Limits omitted from put stay unchanged.
@@ -105,11 +109,18 @@ value of a secret; it is not a password or capability.
 
 ## File formats
 
-The database has a single `secrets` table: name, ID, type (`password`,
+The `secrets` table holds name, ID, type (`password`,
 `totp` or `plain`), value, timestamps in whole seconds, the two access options, and the
 leak reports as a JSON array of `reported_at` and `reason`. Usage is stored in
 `max_uses` (0 means unlimited) and `used_count`. The vault format is version 1.
 Opening a vault validates `PRAGMA user_version` without rewriting it.
+
+Management writes create two additional tables with `CREATE TABLE IF NOT EXISTS`:
+`api_keys` stores names, SHA-256 token digests and ordered rules as JSON;
+`remotes` stores mount names, URLs and API keys. Reads tolerate absent management
+tables. New and existing vaults share these version 1 operations. Management
+records share the vault's encryption and stay outside field listings and token
+substitution.
 
 The version 1 `.unlock` file holds the random database key, encrypted with
 XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id (time
@@ -130,6 +141,54 @@ AG-Secret cannot tell a person from an agent running as the same user. Hiding TO
 likewise does not protect them from code that can read the database or process
 memory. On Windows, use a private directory; the Unix permission checks do not
 audit ACLs.
+
+## Servers and sources
+
+`internal/remote` provides a small standard-library HTTP/JSON protocol:
+
+| Request | Operation |
+| --- | --- |
+| `GET /v1/fields` | List authorized field metadata and plain values |
+| `GET /v1/field?ref=NAME_OR_ID` | Resolve one authorized field |
+| `POST /v1/use` | Authorize a batch of IDs and return their values |
+| `POST /v1/report` | Record a password leak and return authorized matches |
+
+Every request uses a Bearer API key. Keys contain 32 random bytes; creation
+returns the token once, and the server stores only its SHA-256 digest. Deleting
+a key prevents subsequent authorizations. The service exposes its local vault
+and never forwards requests to mounts. Management remains local.
+
+Rules match complete names using `*`, `?` and `[]`, including across `:` and `/`.
+They are case-sensitive, start denied, and apply in order: ordinary rules allow,
+`!` rules exclude, and the last match wins. ID requests check the record's
+current name. New fields, renames and rotations therefore follow the same
+dynamic rules. Reports mark every matching password in the owning vault, while
+responses reveal only records within the key's scope.
+
+The client resolves names locally first, then by lexical mount name, merging
+individual fields. Expired, disabled or exhausted fields retain precedence.
+Metadata carries a source, which pins subsequent use to that source and ID.
+Direct ID requests can find records hidden by a same-name field. Name lookups
+stop at an unavailable higher-priority source; ID lookups may continue for an
+exact match. An unresolved ID with unavailable sources produces an incomplete
+lookup error. Full listings require every source to respond.
+
+The owning source atomically checks permissions, expiry and counts for each
+batch. The server returns passwords and plain values, and computes current
+TOTP codes without sending seeds. Cross-source requests commit independently:
+if a later source fails, earlier uses remain consumed and the child never
+starts. Mutation requests have no automatic retries. A lost response may leave
+a use consumed or a report recorded. Remote values have no persistent cache.
+
+The default listener is HTTP on `127.0.0.1:8765`; external listeners require a
+certificate and private key. Clients accept HTTPS and loopback HTTP, verify
+certificates, and refuse redirects. TLS requires version 1.2 or newer. The
+server uses bounded headers and request bodies (16 KiB and 1 MiB), header/read/
+write/idle timeouts (5/15/30/60 seconds), and a five-second graceful shutdown.
+Clients have a ten-second request timeout and a 64 MiB response limit; idle
+connections close when the command finishes. API errors use fixed codes to
+keep credential values out of diagnostics. API key holders can obtain passwords
+within scope; client-side execution and redaction remain their responsibility.
 
 ## exec
 
@@ -161,8 +220,9 @@ once. Rules are indexed by their first byte, so throughput does not fall with
 the number of secrets. A match becomes `[REDACTED:<id>]`. If a secret's value
 itself contains that marker, the filter falls back to shorter markers and
 finally to removing the match entirely. The filters cover every unexpired
-password of at least four bytes, every unexpired TOTP seed as stored and in
-canonical Base32, and any shorter passwords injected by this run. Generated
+local password of at least four bytes, every unexpired local TOTP seed as stored
+and in canonical Base32, and every password injected by this run, including
+remote passwords. Other remote values are never fetched for redaction. Generated
 TOTP codes and plain values are not added to the filter. A matching password
 rule still takes precedence if those bytes coincide. When several secrets share
 a value, one ID labels the match, and reporting that ID reaches all of them.
@@ -192,7 +252,7 @@ into unfiltered plaintext with `--dangerously-skip-check`; agents use `exec` or
 TTY cannot establish where a consumer will forward the value, so automatic
 output-context exceptions cannot reliably prevent accidental exposure.
 
-`send` refuses passwords with control characters before it runs tmux, because
+`send` checks local values for control characters before it runs tmux, because
 tmux's literal mode does not stop the terminal from acting on newlines or
 Ctrl-C. It confirms the pane exists with `send-keys -t` (`display-message`
 falls back to the current pane), then opens the pane's terminal with
@@ -205,6 +265,10 @@ Plain fields bypass the hidden-prompt check, but still reject terminal control
 characters. tmux targets are passed literally and resolved to a pane ID before
 typing. AGSECRET_TMUX_SOCKET adds `-S SOCKET` to every tmux invocation; absent
 that override, tmux inherits TMUX/TMUX_TMPDIR normally.
+
+Remote metadata and the target pane are checked before value retrieval. After
+retrieval, sensitive remote sends recheck the prompt and all values are checked
+for control characters. A rejection at that stage has already consumed its use.
 
 Tests never touch a real tmux session. Unit tests use a private pseudo-terminal
 and a fake tmux; `make integration` starts a separate tmux server on a

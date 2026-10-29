@@ -182,40 +182,49 @@ func TestExpandTokensIsSinglePassAndChecksPolicy(t *testing.T) {
 	records := map[string]store.Record{
 		id: {ID: id, Type: "password", Secret: []byte("literal ags_fedcba9876543210"), AllowExec: true},
 	}
-	got, err := expandTokens("prefix="+id+":suffix", records, now, make(map[string][]byte))
+	resolve := func(id string) ([]byte, error) {
+		r, found := records[id]
+		if !found {
+			return nil, store.ErrNotFound
+		}
+		if err := checkUse(r, now, "exec"); err != nil {
+			return nil, err
+		}
+		return currentValue(r, now)
+	}
+	got, err := expandTokens("prefix="+id+":suffix", resolve)
 	if err != nil || got != "prefix=literal ags_fedcba9876543210:suffix" {
 		t.Fatalf("single-pass expansion: %q %v", got, err)
 	}
 	for _, literal := range []string{"flags_deadbeefcafe", "ags_project", "x" + id} {
-		got, err := expandTokens(literal, records, now, make(map[string][]byte))
+		got, err := expandTokens(literal, resolve)
 		if err != nil || got != literal {
 			t.Fatalf("literal text was interpreted as an ID: %q %v", got, err)
 		}
 	}
-	if _, err := expandTokens("ags_fedcba9876543210", records, now, make(map[string][]byte)); !errors.Is(err, store.ErrNotFound) {
+	if _, err := expandTokens("ags_fedcba9876543210", resolve); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("missing ID: %v", err)
 	}
 	for _, typo := range []string{"ags_0123456789abcde", "ags_0123456789ABCDEF", "AGS_0123456789abcdef", id + "0"} {
-		if _, err := expandTokens("Bearer "+typo, records, now, make(map[string][]byte)); err == nil || !strings.Contains(err.Error(), "not a valid ID") {
+		if _, err := expandTokens("Bearer "+typo, resolve); err == nil || !strings.Contains(err.Error(), "not a valid ID") {
 			t.Fatalf("near-miss ID %q: %v", typo, err)
 		}
 	}
 	r := records[id]
 	r.AllowExec = false
 	records[id] = r
-	if _, err := expandTokens(id, records, now, make(map[string][]byte)); err == nil {
+	if _, err := expandTokens(id, resolve); err == nil {
 		t.Fatal("disabled execution was allowed")
 	}
 	r.AllowExec, r.ExpiresAt = true, &now
 	records[id] = r
-	if _, err := expandTokens(id, records, now, make(map[string][]byte)); err == nil || !strings.Contains(err.Error(), "expired") {
+	if _, err := expandTokens(id, resolve); err == nil || !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("expired ID: %v", err)
 	}
 	r.Type, r.ExpiresAt, r.Secret = "totp", nil, []byte("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
 	records[id] = r
-	otp := make(map[string][]byte)
-	got, err = expandTokens(id, records, now, otp)
-	if err != nil || got != "287082" || !bytes.Equal(otp[id], []byte(got)) {
+	got, err = expandTokens(id, resolve)
+	if err != nil || got != "287082" {
 		t.Fatalf("TOTP expansion: %q %v", got, err)
 	}
 }
