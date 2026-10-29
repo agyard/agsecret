@@ -113,6 +113,9 @@ func TestNetworkUsageValidation(t *testing.T) {
 }
 
 func TestServeLoopbackAndShutdown(t *testing.T) {
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	t.Setenv("AGSECRET_DB", "")
+	t.Setenv("AGSECRET_PASS_FILE", "")
 	c := newTestCLI(t)
 	if code, out, errOut := c.call("", "serve", "--listen", "0.0.0.0:0"); code != 1 || out != "" || !strings.Contains(errOut, "TLS is required") {
 		t.Fatalf("public plaintext bind: %d, %q, %q", code, out, errOut)
@@ -125,8 +128,8 @@ func TestServeLoopbackAndShutdown(t *testing.T) {
 	defer write.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	root := newRoot(&options{db: c.db, passFile: c.pass, in: strings.NewReader(""), out: io.Discard, errOut: write})
-	root.SetArgs([]string{"serve", "--listen", "127.0.0.1:0"})
+	root := newRoot(&options{in: strings.NewReader(""), out: io.Discard, errOut: write})
+	root.SetArgs([]string{"--db", c.db, "--pass-file", c.pass, "serve", "--listen", "127.0.0.1:0"})
 	done := make(chan error, 1)
 	finished := make(chan struct{})
 	go func() {
