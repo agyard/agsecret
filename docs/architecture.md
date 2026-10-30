@@ -41,7 +41,7 @@ flowchart LR
   A[Agent or user] --> C[CLI]
   C --> U[Argon2id and authenticated key unwrap]
   U --> S[(Encrypted SQLite and WAL)]
-  C --> H[HTTPS client]
+  C --> H[HTTP/S client]
   H --> V[Remote server and its local vault]
   C --> X[Child command with expanded argv and env]
   X --> R[Output filter per stream]
@@ -180,9 +180,10 @@ if a later source fails, earlier uses remain consumed and the child never
 starts. Mutation requests have no automatic retries. A lost response may leave
 a use consumed or a report recorded. Remote values have no persistent cache.
 
-The default listener is HTTP on `127.0.0.1:8765`; external listeners require a
-certificate and private key. Clients accept HTTPS and loopback HTTP, verify
-certificates, and refuse redirects. TLS requires version 1.2 or newer. The
+The default listener is HTTP on `127.0.0.1:8765`. Other interfaces support HTTP
+for encrypted private networks, or HTTPS with a certificate and private key.
+Clients verify HTTPS certificates, bypass environment proxies for HTTP, and
+refuse redirects. TLS requires version 1.2 or newer. The
 server uses bounded headers and request bodies (16 KiB and 1 MiB), header/read/
 write/idle timeouts (5/15/30/60 seconds), and a five-second graceful shutdown.
 Clients have a ten-second request timeout and a 64 MiB response limit; idle

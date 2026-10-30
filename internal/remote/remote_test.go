@@ -23,12 +23,12 @@ import (
 const syntheticKey = "agk_0000000000000000000000000000000000000000000000000000000000000000"
 
 func TestURLPolicy(t *testing.T) {
-	for _, address := range []string{"https://secrets.example.com", "https://secrets.example.com:8443/", "http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"} {
+	for _, address := range []string{"https://secrets.example.com", "https://secrets.example.com:8443/", "http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080", "http://secrets.example.com", "http://192.168.0.1:8765"} {
 		if err := ValidateURL(address); err != nil {
 			t.Errorf("rejected %q: %v", address, err)
 		}
 	}
-	for _, address := range []string{"http://secrets.example.com", "http://localhost.example.com", "http://127.0.0.1.example.com", "http://192.168.0.1", "http://127.0.0.1@elsewhere", "https://key@localhost", "https://host/api", "https://host?key=value", "https://host?", "https://host#fragment", "https://host#", "http://localhost:8765#", "file:///tmp/socket", "://host"} {
+	for _, address := range []string{"http://127.0.0.1@elsewhere", "https://key@localhost", "https://host/api", "https://host?key=value", "https://host?", "https://host#fragment", "https://host#", "http://localhost:8765#", "file:///tmp/socket", "://host"} {
 		if err := ValidateURL(address); err == nil {
 			t.Errorf("accepted %q", address)
 		}

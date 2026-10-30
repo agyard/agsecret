@@ -97,7 +97,7 @@ func TestNetworkUsageValidation(t *testing.T) {
 		{"key", "create", "laptop", "--rule", "!*"},
 		{"remote", "add", "local", "https://example.com", "--key-stdin"},
 		{"remote", "add", "invalid name", "https://example.com", "--key-stdin"},
-		{"remote", "add", "work", "http://example.com", "--key-stdin"},
+		{"remote", "add", "work", "ftp://example.com", "--key-stdin"},
 		{"remote", "add", "work", "https://user:pass@example.com", "--key-stdin"},
 		{"remote", "add", "work", "https://example.com?key=private", "--key-stdin"},
 		{"serve", "--tls-cert", "cert.pem"},
@@ -112,14 +112,11 @@ func TestNetworkUsageValidation(t *testing.T) {
 	}
 }
 
-func TestServeLoopbackAndShutdown(t *testing.T) {
+func TestServeHTTPAndShutdown(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", t.TempDir())
 	t.Setenv("AGSECRET_DB", "")
 	t.Setenv("AGSECRET_PASS_FILE", "")
 	c := newTestCLI(t)
-	if code, out, errOut := c.call("", "serve", "--listen", "0.0.0.0:0"); code != 1 || out != "" || !strings.Contains(errOut, "TLS is required") {
-		t.Fatalf("public plaintext bind: %d, %q, %q", code, out, errOut)
-	}
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -129,7 +126,7 @@ func TestServeLoopbackAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	root := newRoot(&options{in: strings.NewReader(""), out: io.Discard, errOut: write})
-	root.SetArgs([]string{"--db", c.db, "--pass-file", c.pass, "serve", "--listen", "127.0.0.1:0"})
+	root.SetArgs([]string{"--db", c.db, "--pass-file", c.pass, "serve", "--listen", "0.0.0.0:0"})
 	done := make(chan error, 1)
 	finished := make(chan struct{})
 	go func() {
@@ -158,6 +155,7 @@ func TestServeLoopbackAndShutdown(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("serve startup timed out")
 	}
+	address = strings.Replace(address, "http://0.0.0.0:", "http://127.0.0.1:", 1)
 	client := &http.Client{Timeout: time.Second}
 	response, err := client.Get(address + "/v1/fields")
 	if err != nil {

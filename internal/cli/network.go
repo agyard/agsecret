@@ -23,7 +23,7 @@ func newServe(o *options) *cobra.Command {
 	c := &cobra.Command{
 		Use:   "serve",
 		Short: "Serve the local vault through API keys",
-		Long:  "Serve local fields for viewing, use and leak reports. API key rules control access.\nUse TLS certificates when listening beyond the loopback interface.",
+		Long:  "Serve local fields for viewing, use and leak reports. API key rules control access.\nUse HTTPS or an encrypted private network to protect API keys and values in transit.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.NoArgs(cmd, args); err != nil {
 				return err
@@ -50,9 +50,6 @@ func newServe(o *options) *cobra.Command {
 					return err
 				}
 				defer listener.Close()
-				if config == nil && !listener.Addr().(*net.TCPAddr).IP.IsLoopback() {
-					return errors.New("TLS is required beyond the loopback interface; provide --tls-cert and --tls-key")
-				}
 				server := &http.Server{
 					Handler:           remote.NewHandler(s),
 					TLSConfig:         config,
@@ -187,7 +184,7 @@ func newRemote(o *options) *cobra.Command {
 	add := &cobra.Command{
 		Use:   "add NAME URL",
 		Short: "Mount a remote vault",
-		Long:  "Read the API key from a masked terminal prompt or --key-stdin.\nURLs require HTTPS, with HTTP allowed on loopback addresses.",
+		Long:  "Read the API key from a masked terminal prompt or --key-stdin.\nUse HTTPS or HTTP over an encrypted private network.",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if err := cobra.ExactArgs(2)(cmd, args); err != nil {
 				return err

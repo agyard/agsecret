@@ -120,7 +120,7 @@ agsecret serve --listen :8765 --tls-cert server.crt --tls-key server.key
 
 Key creation prints the key once. The server stores its digest. `agsecret key ls` shows names and rules; `agsecret key delete laptop` revokes the key.
 
-`agsecret serve` defaults to HTTP on `127.0.0.1:8765`. Listening beyond loopback requires TLS. Clients verify the certificate and require HTTPS, with HTTP allowed for loopback connections. A server exposes its local fields; mounted vaults stay private to its client commands.
+`agsecret serve` defaults to HTTP on `127.0.0.1:8765`. Use HTTPS or HTTP over an encrypted private network. For a private network, bind its interface explicitly, such as `agsecret serve --listen 192.168.0.1:8765`, and mount `http://192.168.0.1:8765`. HTTPS clients verify certificates. A server exposes its local fields; mounted vaults stay private to its client commands.
 
 On the client, initialize its vault and enter the API key at the masked prompt:
 

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -25,22 +24,16 @@ type Client struct {
 	http    *http.Client
 }
 
-// ValidateURL accepts HTTPS origins and local HTTP origins.
+// ValidateURL accepts HTTP(S) origins.
 func ValidateURL(address string) error {
 	u, err := url.Parse(address)
 	if err != nil || strings.Contains(address, "#") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.RawFragment != "" || u.Opaque != "" || (u.Path != "" && u.Path != "/") || u.RawPath != "" {
 		return errors.New("remote URL must be an HTTP(S) origin, such as https://secrets.example.com")
 	}
-	if u.Scheme == "https" {
+	if u.Scheme == "https" || u.Scheme == "http" {
 		return nil
 	}
-	if u.Scheme == "http" {
-		host := u.Hostname()
-		if strings.EqualFold(host, "localhost") || net.ParseIP(host).IsLoopback() {
-			return nil
-		}
-	}
-	return errors.New("remote URLs require HTTPS; local connections also support HTTP")
+	return errors.New("remote URL must use HTTP or HTTPS")
 }
 
 func NewClient(address, key string) (*Client, error) {
@@ -55,23 +48,9 @@ func NewClient(address, key string) (*Client, error) {
 	transport.DisableCompression = true
 	u, _ := url.Parse(address)
 	if u.Scheme == "http" {
+		// Private networks may provide transport encryption themselves. Keep
+		// API keys and values off environment-configured HTTP proxies.
 		transport.Proxy = nil
-		// HTTP stays on loopback, including when localhost resolves elsewhere.
-		dialer := &net.Dialer{Timeout: 10 * time.Second}
-		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(address)
-			if err != nil {
-				return nil, err
-			}
-			if strings.EqualFold(host, "localhost") {
-				conn, err := dialer.DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
-				if err == nil {
-					return conn, nil
-				}
-				return dialer.DialContext(ctx, network, net.JoinHostPort("::1", port))
-			}
-			return dialer.DialContext(ctx, network, address)
-		}
 	}
 	return &Client{
 		address: strings.TrimSuffix(address, "/"), key: key,
