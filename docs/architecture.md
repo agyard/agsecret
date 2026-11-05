@@ -115,12 +115,17 @@ leak reports as a JSON array of `reported_at` and `reason`. Usage is stored in
 `max_uses` (0 means unlimited) and `used_count`. The vault format is version 1.
 Opening a vault validates `PRAGMA user_version` without rewriting it.
 
-Management writes create two additional tables with `CREATE TABLE IF NOT EXISTS`:
+Management writes create additional tables with `CREATE TABLE IF NOT EXISTS`:
 `api_keys` stores names, SHA-256 token digests and ordered rules as JSON;
-`remotes` stores mount names, URLs and API keys. Reads tolerate absent management
+`api_key_permissions` stores independent `allow_edit` and `allow_create` bits,
+keyed by token digest; `remotes` stores mount names, URLs and API keys.
+Missing permission rows or the absent permissions table deny both capabilities,
+so legacy keys remain read/use/report only. Reads tolerate absent management
 tables. New and existing vaults share these version 1 operations. Management
 records share the vault's encryption and stay outside field listings and token
-substitution.
+substitution. Deleting a key explicitly removes its permission row in the same
+transaction. Digest identity also prevents an older binary's delete/recreate of
+the same key name from inheriting the previous token's permissions.
 
 The version 1 `.unlock` file holds the random database key, encrypted with
 XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id (time
@@ -152,11 +157,22 @@ audit ACLs.
 | `GET /v1/field?ref=NAME_OR_ID` | Resolve one authorized field |
 | `POST /v1/use` | Authorize a batch of IDs and return their values |
 | `POST /v1/report` | Record a password leak and return authorized matches |
+| `GET /v1/capabilities` | Return the authenticated key's name, rules and write permissions |
+| `POST /v1/put` | Create or update a field, subject to scope and write permissions |
+| `POST /v1/rename` | Rename one field by ID within the server's vault |
+| `POST /v1/delete` | Delete one field by ID |
+| `POST /v1/credential/rename` | Rename a complete credential atomically |
+| `POST /v1/credential/delete` | Delete a complete credential atomically |
 
 Every request uses a Bearer API key. Keys contain 32 random bytes; creation
 returns the token once, and the server stores only its SHA-256 digest. Deleting
 a key prevents subsequent authorizations. The service exposes its local vault
-and never forwards requests to mounts. Management remains local.
+and never forwards requests to mounts. Key/mount administration, initialization
+and serving remain local. Each key defaults to read/use/report; `allow_edit`
+grants updates (including value, type and policy), renames and deletion, while
+`allow_create` independently permits new fields. Create permission never permits
+overwriting an existing record. Local `key update` atomically replaces provided
+rules and permission flags without rotating the token; omitted flags stay intact.
 
 Rules match complete names using `*`, `?` and `[]`, including across `:` and `/`.
 They are case-sensitive, start denied, and apply in order: ordinary rules allow,
@@ -164,6 +180,22 @@ They are case-sensitive, start denied, and apply in order: ordinary rules allow,
 current name. New fields, renames and rotations therefore follow the same
 dynamic rules. Reports mark every matching password in the owning vault, while
 responses reveal only records within the key's scope.
+
+Every write authenticates the current key, checks permissions and scope, then
+mutates inside one immediate transaction. Rename checks both old and new names.
+Credential writes require authorization for every source member and destination
+field; a partially visible group is rejected in full. Duplicate notes from put
+are filtered by scope. Write responses contain metadata and plain values only.
+API puts enforce the same type, expiry, access, use-limit and identity rules as
+local puts. Remote requests cannot opt into `--dangerously-skip-check`.
+
+Puts include `expected_id`: the resolved current ID, or an empty string requiring
+the name to remain absent. The check runs in the write transaction. A rotation,
+rename away or competing creation causes a conflict instead of overwriting a
+different record. Credential requests carry the complete member-ID set; an
+addition, removal or rotation between listing and mutation causes a conflict.
+Name clashes return a distinct conflict. Field rename/delete requests use IDs,
+so a concurrent rotation cannot redirect them to a replacement value.
 
 The client resolves names locally first, then by lexical mount name, merging
 individual fields. Expired, disabled or exhausted fields retain precedence.
@@ -173,18 +205,32 @@ stop at an unavailable higher-priority source; ID lookups may continue for an
 exact match. An unresolved ID with unavailable sources produces an incomplete
 lookup error. Full listings require every source to respond.
 
+For existing fields, put/rename/delete use the same resolution and pin their
+write to the resulting source. New names default to local. `--source local` or
+`--source REMOTE` restricts data operations to one vault, bypassing shadowing and
+unrelated outages; it is required to choose a remote for creation. A merged
+credential with fields from several sources refuses rename/delete until the
+caller chooses a source. There are no automatic cross-vault mutations or
+fallback writes. Local put retains its existing concurrent option-update
+semantics; network puts additionally check the resolved ID.
+
 The owning source atomically checks permissions, expiry and counts for each
 batch. The server returns passwords and plain values, and computes current
 TOTP codes without sending seeds. Cross-source requests commit independently:
 if a later source fails, earlier uses remain consumed and the child never
 starts. Mutation requests have no automatic retries. A lost response may leave
-a use consumed or a report recorded. Remote values have no persistent cache.
+a use consumed, a report recorded or a write applied; the error describes the
+uncertain result and asks callers to inspect the source before retrying. Remote
+values and permission policies have no persistent cache. The existing read/use/
+report endpoints remain wire compatible; unknown write/capability endpoints on
+older servers produce a specific upgrade-required error, not field-not-found.
 
 The default listener is HTTP on `127.0.0.1:8765`. Other interfaces support HTTP
 for encrypted private networks, or HTTPS with a certificate and private key.
 Clients verify HTTPS certificates, bypass environment proxies for HTTP, and
 refuse redirects. TLS requires version 1.2 or newer. The
-server uses bounded headers and request bodies (16 KiB and 1 MiB), header/read/
+server uses bounded headers and request bodies (16 KiB and 1 MiB, or 2 MiB for
+put to carry a Base64-encoded 1 MiB field plus policy metadata), header/read/
 write/idle timeouts (5/15/30/60 seconds), and a five-second graceful shutdown.
 Clients have a ten-second request timeout and a 64 MiB response limit; idle
 connections close when the command finishes. API errors use fixed codes to

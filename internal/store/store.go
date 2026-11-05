@@ -41,11 +41,14 @@ const (
 var (
 	ErrNotFound = errors.New("not found")
 	// ErrNeedsValue means a change without the value would loosen limits.
-	ErrNeedsValue = errors.New("put needs the value")
-	ErrExpired    = errors.New("expired")
-	ErrNotAllowed = errors.New("not allowed")
-	ErrNoUses     = errors.New("no uses left")
-	ErrReportType = errors.New("only passwords can be reported")
+	ErrNeedsValue    = errors.New("put needs the value")
+	ErrExpired       = errors.New("expired")
+	ErrNotAllowed    = errors.New("not allowed")
+	ErrNoUses        = errors.New("no uses left")
+	ErrReportType    = errors.New("only passwords can be reported")
+	ErrConflict      = errors.New("the field or credential changed; refresh and retry")
+	ErrAlreadyExists = errors.New("destination already exists")
+	ErrInvalidChange = errors.New("invalid field change")
 )
 
 // Record is a stored secret. Plain values are always included; sensitive
@@ -378,11 +381,14 @@ func decodeTime(s string) (time.Time, error) { return time.Parse(time.RFC3339, s
 // Secret, a change may only narrow access or bring the expiry closer, unless
 // SkipCheck is set: knowing the value shows the caller could already use it.
 type Change struct {
-	Secret    []byte
-	Type      *string
-	ExpiresAt **time.Time
-	AllowGet  *bool
-	AllowExec *bool
+	// ExpectedID pins a write to the value resolved by the caller. An empty
+	// string requires creation; nil retains local unconditional put semantics.
+	ExpectedID *string
+	Secret     []byte
+	Type       *string
+	ExpiresAt  **time.Time
+	AllowGet   *bool
+	AllowExec  *bool
 	// MaxUses is the total number of authorized get/exec/send attempts. A
 	// value of zero means unlimited. Extending a finite limit requires Secret
 	// or SkipCheck, just like widening access.
@@ -402,6 +408,23 @@ type PutResult struct {
 // options change. A new value or type assigns a new ID and clears the leak
 // reports in the same transaction, so the old ID stops working.
 func (s *Store) Put(ref string, c Change) (PutResult, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return PutResult{}, err
+	}
+	defer tx.Rollback()
+	result, err := putInTransaction(tx, ref, c)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		clear(result.Record.Secret)
+		return PutResult{}, err
+	}
+	return result, nil
+}
+
+func putInTransaction(tx *sql.Tx, ref string, c Change) (PutResult, error) {
 	if ValidID(ref) {
 		return PutResult{}, errors.New("put requires a field name")
 	}
@@ -409,22 +432,23 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		return PutResult{}, err
 	}
 	if c.Secret != nil && (!validSize(c.Secret) || !utf8.Valid(c.Secret)) {
-		return PutResult{}, errors.New("the value must be 1 byte to 1 MiB of UTF-8 text without NUL bytes")
+		return PutResult{}, fmt.Errorf("%w: the value must be 1 byte to 1 MiB of UTF-8 text without NUL bytes", ErrInvalidChange)
 	}
 	if c.MaxUses != nil && *c.MaxUses < 0 {
-		return PutResult{}, errors.New("max uses must be zero or greater")
+		return PutResult{}, fmt.Errorf("%w: max uses must be zero or greater", ErrInvalidChange)
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return PutResult{}, err
-	}
-	defer tx.Rollback()
 	r, err := getRecord(tx, ref, true)
 	defer clear(r.Secret)
 	created := errors.Is(err, ErrNotFound)
+	if err != nil && !created {
+		return PutResult{}, err
+	}
+	if c.ExpectedID != nil && (created && *c.ExpectedID != "" || !created && r.ID != *c.ExpectedID) {
+		return PutResult{}, ErrConflict
+	}
 	switch {
 	case created && c.Secret == nil:
-		return PutResult{}, fmt.Errorf("secret %s does not exist yet, so it needs a value", ref)
+		return PutResult{}, fmt.Errorf("secret %s does not exist yet, so it needs a value: %w", ref, ErrNeedsValue)
 	case created:
 		r = Record{Name: ref, Type: "password", AllowGet: true, AllowExec: true, Leaks: []Leak{}}
 	case err != nil:
@@ -439,7 +463,7 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	}
 	if r.Type == "plain" {
 		if c.ExpiresAt != nil || c.AllowGet != nil || c.AllowExec != nil || c.MaxUses != nil || c.SkipCheck {
-			return PutResult{}, errors.New("plain values do not support expiry, access restrictions, usage limits or bypass options")
+			return PutResult{}, fmt.Errorf("%w: plain values do not support expiry, access restrictions, usage limits or bypass options", ErrInvalidChange)
 		}
 		if !created && previous.Type != "plain" && c.Secret == nil {
 			return PutResult{}, fmt.Errorf("%w of %s to change its type to plain", ErrNeedsValue, r.Name)
@@ -463,11 +487,11 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 	case "totp":
 		config, err := totp.Parse(string(r.Secret))
 		if err != nil {
-			return PutResult{}, err
+			return PutResult{}, fmt.Errorf("%w: invalid TOTP seed or URI", ErrInvalidChange)
 		}
 		config.Clear()
 	default:
-		return PutResult{}, errors.New("the type must be password, totp or plain")
+		return PutResult{}, fmt.Errorf("%w: the type must be password, totp or plain", ErrInvalidChange)
 	}
 	if r.ExpiresAt != nil {
 		expires := r.ExpiresAt.UTC().Truncate(time.Second)
@@ -509,9 +533,6 @@ func (s *Store) Put(ref string, c Change) (PutResult, error) {
 		if result.Duplicates, err = queryStrings(tx, "SELECT name FROM secrets WHERE type='password' AND secret=? AND id<>? ORDER BY name", r.Secret, r.ID); err != nil {
 			return PutResult{}, err
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return PutResult{}, err
 	}
 	if r.Type == "plain" {
 		r.Secret = bytes.Clone(r.Secret)

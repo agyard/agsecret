@@ -24,11 +24,12 @@ independent. The destination name must be available.`,
 			return store.ValidateName(args[1])
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				r, err := s.Rename(args[0], args[1])
+			return o.withSources(func(s *sources) error {
+				r, err := s.rename(cmd.Context(), args[0], args[1])
 				if err != nil {
 					return err
 				}
+				defer clear(r.Secret)
 				if o.json {
 					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
 				}
@@ -135,14 +136,15 @@ while it has fields. Add fields with put and move them with rename.`,
 	}, o), addJSONFlag(&cobra.Command{
 		Use:   "rename NAME NEW_NAME",
 		Short: "Rename a credential and all its fields",
-		Long:  "Rename all fields together, preserving their IDs, values and limits.\nThe destination credential name must be available.",
+		Long:  "Rename all fields together, preserving their IDs, values and limits.\nThe destination credential name must be available. All fields must belong\nto one source; use --source to select a vault for a mixed credential.",
 		Args:  credentialArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				records, err := s.RenameCredential(args[0], args[1])
+			return o.withSources(func(s *sources) error {
+				records, err := s.renameCredential(cmd.Context(), args[0], args[1])
 				if err != nil {
 					return err
 				}
+				defer clearRecords(records)
 				if o.json {
 					return encodeJSON(cmd.OutOrStdout(), map[string]any{"name": args[1], "fields": recordsJSON(records)})
 				}
@@ -156,8 +158,8 @@ while it has fields. Add fields with put and move them with rename.`,
 		Short:   "Delete a credential and all its fields",
 		Args:    credentialArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				count, err := s.DeleteCredential(args[0])
+			return o.withSources(func(s *sources) error {
+				count, err := s.deleteCredential(cmd.Context(), args[0])
 				if err != nil {
 					return err
 				}

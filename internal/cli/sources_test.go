@@ -99,7 +99,7 @@ func TestRemoteOverlayAndIdentity(t *testing.T) {
 	if out, _ := local.ok("", "get", secondID); out != "independent-value\n" {
 		t.Fatalf("known ID blocked by unrelated outage: %q", out)
 	}
-	local.put("pku:user", "offline-local", "--type", "plain")
+	local.put("pku:user", "offline-local", "--type", "plain", "--source", "local")
 	if out, _ := local.ok("", "get", "pku:user"); out != "offline-local\n" {
 		t.Fatalf("local field blocked by outage: %q", out)
 	}

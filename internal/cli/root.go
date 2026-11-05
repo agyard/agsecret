@@ -21,6 +21,7 @@ var Version = "dev"
 
 type options struct {
 	db          string
+	source      string
 	passFile    string
 	defaultPass bool // passFile was not chosen by the user
 	json        bool
@@ -150,8 +151,10 @@ type assigns a new ID. After put NAME VALUE, remove sensitive values from
 shell history.
 
 Mounted servers join the same namespace: local fields take precedence, then
-remote names in lexical order. IDs address their original source. Management
-changes affect the local vault; report goes to the source that owns the ID.
+remote names in lexical order. IDs address their original source. Changes to
+existing fields go to their owning source, subject to the API key's permissions.
+Use --source local|REMOTE to select one vault, including for new remote fields.
+New names default to local. Credential changes require one source.
 
 Examples:
   # Recommended: keep shell code fixed and pass IDs through the environment
@@ -199,19 +202,37 @@ Notes for agents:
 
 func newRoot(o *options) *cobra.Command {
 	r := &cobra.Command{
-		Use:               "agsecret",
-		Short:             "Use credentials in agent workflows with less accidental exposure",
-		Long:              guide,
-		Version:           Version,
-		SilenceUsage:      true,
-		SilenceErrors:     true,
-		PersistentPreRunE: func(*cobra.Command, []string) error { return o.resolve() },
+		Use:           "agsecret",
+		Short:         "Use credentials in agent workflows with less accidental exposure",
+		Long:          guide,
+		Version:       Version,
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, _ []string) error {
+			if o.source != "" {
+				if o.source != "local" {
+					if err := store.ValidateRemoteName(o.source); err != nil {
+						return err
+					}
+				}
+				top := cmd
+				for top.Parent() != nil && top.Parent().Parent() != nil {
+					top = top.Parent()
+				}
+				switch top.Name() {
+				case "init", "serve", "key", "remote":
+					return errors.New("--source applies only to field and credential commands; server and mount administration is local")
+				}
+			}
+			return o.resolve()
+		},
 	}
 	r.SetVersionTemplate("agsecret {{.Version}}\n")
 	r.SetIn(o.in)
 	r.SetOut(o.out)
 	r.SetErr(o.errOut)
 	r.PersistentFlags().StringVar(&o.db, "db", "", "vault file (default $AGSECRET_DB or $XDG_DATA_HOME/agsecret/secrets.db)")
+	r.PersistentFlags().StringVar(&o.source, "source", "", "select local or a mounted remote for field and credential commands")
 	r.PersistentFlags().StringVar(&o.passFile, "pass-file", "", "file with the vault passphrase (default $AGSECRET_PASS_FILE or the vault path with its extension changed to .pass)")
 	r.CompletionOptions.DisableDefaultCmd = true
 	r.SetHelpCommand(&cobra.Command{Use: "help [COMMAND]", Short: "Show help for a command", RunE: func(_ *cobra.Command, args []string) error {

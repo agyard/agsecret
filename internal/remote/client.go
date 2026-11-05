@@ -1,7 +1,6 @@
 package remote
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -15,6 +14,8 @@ import (
 
 	"github.com/agyard/agsecret/internal/store"
 )
+
+var ErrUnsupported = errors.New("the remote server does not support this operation; upgrade the server")
 
 // Client talks to a single origin. It never follows redirects or retries a
 // mutation, whose result may already have been committed by the server.
@@ -137,12 +138,18 @@ func (c *Client) request(ctx context.Context, path string, input, output any) er
 	if input != nil {
 		method = http.MethodPost
 		data, err := json.Marshal(input)
-		if err != nil || len(data) > maxRequestBytes {
-			return errors.New("remote request exceeds 1 MiB")
+		limit := maxRequestBytes
+		if path == "/v1/put" {
+			limit = maxPutRequestBytes
+		}
+		if err != nil || len(data) > limit {
+			clear(data)
+			return errors.New("remote request exceeds its size limit")
 		}
 		size = int64(len(data))
 		// An opaque reader keeps GetBody nil, so the transport cannot replay it.
-		body = io.NopCloser(bytes.NewReader(data))
+		body = newRequestBody(data)
+		defer body.Close()
 	}
 	r, err := http.NewRequestWithContext(ctx, method, c.address+path, body)
 	if err != nil {
@@ -166,10 +173,31 @@ func (c *Client) request(ctx context.Context, path string, input, output any) er
 		var problem errorResponse
 		limited := &io.LimitedReader{R: response.Body, N: 4097}
 		decodeErr := decodeJSON(limited, &problem)
-		switch {
-		case response.StatusCode == http.StatusUnauthorized:
+		if response.StatusCode >= 300 && response.StatusCode < 400 {
+			return errors.New("remote redirects are refused")
+		}
+		if response.StatusCode == http.StatusUnauthorized {
 			return store.ErrUnauthorized
-		case response.StatusCode == http.StatusNotFound && decodeErr == nil && limited.N > 0 && problem.Error == "not_found":
+		}
+		if decodeErr != nil || limited.N <= 0 {
+			return uncertainMutation(path, fmt.Errorf("remote returned HTTP %d with an invalid error response", response.StatusCode))
+		}
+		switch {
+		case response.StatusCode == http.StatusNotFound && problem.Error == "unknown_endpoint":
+			return ErrUnsupported
+		case response.StatusCode == http.StatusForbidden && problem.Error == "edit_not_allowed":
+			return store.ErrEditNotAllowed
+		case response.StatusCode == http.StatusForbidden && problem.Error == "create_not_allowed":
+			return store.ErrCreateNotAllowed
+		case response.StatusCode == http.StatusConflict && problem.Error == "conflict":
+			return store.ErrConflict
+		case response.StatusCode == http.StatusConflict && problem.Error == "already_exists":
+			return store.ErrAlreadyExists
+		case response.StatusCode == http.StatusBadRequest && problem.Error == "needs_value":
+			return store.ErrNeedsValue
+		case response.StatusCode == http.StatusBadRequest && (problem.Error == "invalid_change" || problem.Error == "invalid_request"):
+			return store.ErrInvalidChange
+		case response.StatusCode == http.StatusNotFound && problem.Error == "not_found":
 			return store.ErrNotFound
 		case response.StatusCode == http.StatusForbidden && problem.Error == "expired":
 			return store.ErrExpired
@@ -179,8 +207,6 @@ func (c *Client) request(ctx context.Context, path string, input, output any) er
 			return store.ErrNotAllowed
 		case response.StatusCode == http.StatusBadRequest && problem.Error == "report_type":
 			return store.ErrReportType
-		case response.StatusCode >= 300 && response.StatusCode < 400:
-			return errors.New("remote redirects are refused")
 		default:
 			return uncertainMutation(path, fmt.Errorf("remote returned HTTP %d", response.StatusCode))
 		}
@@ -198,6 +224,8 @@ func uncertainMutation(path string, err error) error {
 		return fmt.Errorf("%w; uses may have been consumed", err)
 	case "/v1/report":
 		return fmt.Errorf("%w; the report may have been recorded", err)
+	case "/v1/put", "/v1/rename", "/v1/delete", "/v1/credential/rename", "/v1/credential/delete":
+		return fmt.Errorf("%w; the change may have been applied; inspect the source before retrying", err)
 	default:
 		return err
 	}

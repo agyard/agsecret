@@ -136,7 +136,48 @@ Rules are shell-style patterns matched against complete field names, case-sensit
 
 Local fields take precedence, followed by remote names in lexical order, such as `00_work`, then `10_home`. Matching full field names override one another individually, so a credential can combine sources. Results identify their `source` in JSON and show a source column when remote fields are present. IDs continue to address their original records, even when a local field covers their names.
 
-`put`, `rename`, `delete` and credential changes affect the local vault. `report ID` goes to the owning source; its response includes only fields authorized by the key. Removing a local field reveals any remote field with the same name. Unavailable higher-priority sources block name resolution; local matches work independently. `ls` requires all sources to respond.
+Changes to existing fields (`put`, `rename`, `delete`) and `report ID` go to the owning source. `put` of a new name defaults to the local vault. Select a target with `--source local` or `--source REMOTE`; this also works with `ls`, `view`, `get`, `exec`, `send`, `report` and credential commands. Explicit selection contacts only that source. Use `--source local` to create a local field that covers a remote name. Removing a local field reveals any remote field with the same name. Unavailable higher-priority sources block name resolution; local matches work independently. A merged `ls` requires all sources to respond. Permission failures and connection errors never fall back to writing another vault.
+
+### Client write permissions
+
+Each client's API key starts with scoped read/use/report access. The server independently controls editing existing fields and creating new fields. Existing keys retain both permissions disabled after an upgrade. Grant only the capabilities the client needs:
+
+```sh
+# On the server: create an editor that can also add new fields
+agsecret key create laptop --rule 'pku_*:*' --allow-edit --allow-create
+
+# Change an existing key without replacing its token
+agsecret key update laptop --allow-edit --allow-create
+agsecret key update laptop --allow-create=false
+
+# Replace its entire rule list; omitted permission flags stay unchanged
+agsecret key update laptop --rule 'pku_*:*' --rule '!pku_*:otp'
+agsecret key ls
+
+# On the client: inspect effective server policy, then target the remote
+agsecret remote info 00_work
+agsecret put pku_work:username alice --type plain --source 00_work
+agsecret credential rename pku_work pku_home --source 00_work
+```
+
+`key ls --json` includes `allow_edit` and `allow_create`; `remote info NAME --json` reports the mount and its authenticated key policy, without its token. Permission and scope updates take effect at the next server authorization. Client configuration cannot grant these permissions. Key administration, mounts, initialization and serving remain local operations.
+
+| Operation within the field rules | Default key | Edit only | Create only | Edit + create |
+| --- | --- | --- | --- | --- |
+| `ls`, `view`, `credential ls/view` | Yes | Yes | Yes | Yes |
+| `get`, `exec`, `send` | Field policy | Field policy | Field policy | Field policy |
+| `report ID` | Yes | Yes | Yes | Yes |
+| `put` an existing field (value, type or policy) | No | Yes | No | Yes |
+| `put` a new field | No | No | Yes | Yes |
+| Field `rename`, `delete` | No | Yes | No | Yes |
+| `credential rename/delete` | No | Yes | No | Yes |
+| `init`, `key`, `remote`, `serve` through the API | No | No | No | No |
+
+All operations also check the key's current field-name rules; use continues to enforce access, expiry and counters. A rename requires both the original and destination names to be allowed. Renames preserve IDs and never transfer fields between vaults. A create-only key cannot overwrite an existing field, even with the same value. Write responses contain metadata and plain values; passwords and TOTP seeds stay hidden. Duplicate-password notes name only authorized fields. Remote policy changes retain the requirement to supply the value before loosening limits; `--dangerously-skip-check` is local only.
+
+Credential rename/delete is atomic within one source and requires permission for every member. A credential assembled from multiple sources requires `--source`; partially authorized groups are refused rather than partially changed. Remote puts are pinned to the resolved ID (or require the name to remain absent), and group changes are pinned to the complete member-ID set. A concurrent rotation, creation or membership change yields a conflict to refresh before retrying.
+
+Upgrade the server and client to use remote writes. New clients can still read/use/report against older servers; unsupported write or capability endpoints explicitly ask for a server upgrade. Older clients remain compatible with the new server's existing endpoints. Writes are never retried automatically; after an interrupted response, inspect the selected source before deciding whether to retry.
 
 The owning server checks scope, access, expiry and use counts before returning a value. TOTP seeds stay on that server; clients receive the current code. Password access lets the API key holder obtain the password. `exec` runs locally and filters all eligible local values plus the remote passwords used by that invocation.
 
@@ -173,9 +214,11 @@ agsecret send tmux:%3 example:username --no-enter
 | `credential delete NAME` | Delete a credential and all its fields |
 | `serve` | Serve local fields through API keys |
 | `key create NAME --rule PATTERN [--rule PATTERN...]` | Create an API key with ordered field rules |
+| `key update NAME [--rule PATTERN...] [--allow-edit[=false]] [--allow-create[=false]]` | Update a key's scope or independent write permissions |
 | `key ls` / `key delete NAME` | Inspect or revoke API keys |
 | `remote add NAME URL` | Mount a remote vault using an API key |
 | `remote ls` / `remote delete NAME` | Inspect or remove mounts |
+| `remote info NAME` | Query the server for this client's effective rules and write permissions |
 
 ## Configuration
 

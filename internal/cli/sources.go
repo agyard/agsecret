@@ -16,9 +16,10 @@ import (
 // sources lives for one CLI operation. Records carry their resolved source so
 // a later rename, rotation or outage cannot change the destination of a use.
 type sources struct {
-	local   *store.Store
-	mounts  []store.Remote
-	clients map[string]*remote.Client
+	local    *store.Store
+	selected string
+	mounts   []store.Remote
+	clients  map[string]*remote.Client
 }
 
 func (o *options) withSources(fn func(*sources) error) error {
@@ -27,7 +28,16 @@ func (o *options) withSources(fn func(*sources) error) error {
 		if err != nil {
 			return err
 		}
-		all := &sources{local: s, mounts: mounts, clients: make(map[string]*remote.Client)}
+		if o.source == "local" {
+			mounts = nil
+		} else if o.source != "" {
+			selected := slices.IndexFunc(mounts, func(m store.Remote) bool { return m.Name == o.source })
+			if selected < 0 {
+				return fmt.Errorf("remote %s is not mounted; run agsecret remote ls", o.source)
+			}
+			mounts = mounts[selected : selected+1]
+		}
+		all := &sources{local: s, selected: o.source, mounts: mounts, clients: make(map[string]*remote.Client)}
 		defer func() {
 			for _, c := range all.clients {
 				c.Close()
@@ -55,13 +65,17 @@ func (s *sources) client(name string) (*remote.Client, error) {
 }
 
 func (s *sources) get(ctx context.Context, ref string) (store.Record, error) {
-	r, err := s.local.Get(ref, false)
-	if err == nil {
-		r.Source = "local"
-		return r, nil
-	}
-	if !errors.Is(err, store.ErrNotFound) {
-		return store.Record{}, err
+	var r store.Record
+	var err error
+	if s.selected == "" || s.selected == "local" {
+		r, err = s.local.Get(ref, false)
+		if err == nil {
+			r.Source = "local"
+			return r, nil
+		}
+		if !errors.Is(err, store.ErrNotFound) {
+			return store.Record{}, err
+		}
 	}
 	var failures []error
 	for _, m := range s.mounts {
@@ -95,9 +109,13 @@ func clearRecords(records []store.Record) {
 }
 
 func (s *sources) list(ctx context.Context) ([]store.Record, error) {
-	local, err := s.local.List(false)
-	if err != nil {
-		return nil, err
+	var local []store.Record
+	if s.selected == "" || s.selected == "local" {
+		var err error
+		local, err = s.local.List(false)
+		if err != nil {
+			return nil, err
+		}
 	}
 	out := []store.Record{}
 	seen := make(map[string]bool)

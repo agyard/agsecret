@@ -195,7 +195,7 @@ func TestClientRejectsRedirectsAndDoesNotReplayMutations(t *testing.T) {
 	if _, err := client.List(context.Background()); err == nil || redirected.Load() != 0 {
 		t.Fatalf("followed redirect: %v", err)
 	}
-	for _, action := range []string{"use", "report"} {
+	for _, action := range []string{"use", "report", "put", "rename", "delete", "credential rename", "credential delete"} {
 		t.Run(action, func(t *testing.T) {
 			var attempts atomic.Int32
 			client := testClient(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -216,10 +216,22 @@ func TestClientRejectsRedirectsAndDoesNotReplayMutations(t *testing.T) {
 				t.Fatal(err)
 			}
 			var err error
-			if action == "use" {
+			switch action {
+			case "use":
 				_, err = client.Use(context.Background(), []string{"ags_0123456789abcdef"}, "exec")
-			} else {
+			case "report":
 				_, err = client.Report(context.Background(), "ags_0123456789abcdef", "synthetic")
+			case "put":
+				expected := ""
+				_, err = client.Put(context.Background(), "password", store.Change{ExpectedID: &expected, Secret: []byte("synthetic")})
+			case "rename":
+				_, err = client.Rename(context.Background(), "ags_0123456789abcdef", "renamed")
+			case "delete":
+				_, err = client.Delete(context.Background(), "ags_0123456789abcdef")
+			case "credential rename":
+				_, err = client.RenameCredential(context.Background(), "account", "renamed", []string{"ags_0123456789abcdef"})
+			case "credential delete":
+				_, err = client.DeleteCredential(context.Background(), "account", []string{"ags_0123456789abcdef"})
 			}
 			if err == nil || !strings.Contains(err.Error(), "may have been") || attempts.Load() != 1 {
 				t.Fatalf("mutation attempts=%d, error=%v", attempts.Load(), err)

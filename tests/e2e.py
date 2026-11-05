@@ -154,6 +154,48 @@ def check_remote(root, env, run):
         pane_root.mkdir()
         check_tmux(pane_root, client_env, client, password['id'])
         print('PASS: remote scope, local overlay, ID lookup, redaction, server usage and leak reports')
+
+        result = client('put', 'pku_test:username', '--stdin', data='denied-update', check=False)
+        assert result.returncode == 1 and 'does not allow editing' in result.stderr
+        result = client('put', 'pku_upload:username', '--stdin', '--source', '00_work', data='denied-create', check=False)
+        assert result.returncode == 1 and 'does not allow creating' in result.stderr
+        host('key', 'update', 'client', '--allow-create')
+        uploaded = json.loads(client('put', 'pku_upload:username', '--type', 'plain', '--stdin',
+                                    '--source', '00_work', '--json', data='uploaded-user').stdout)
+        assert uploaded['source'] == '00_work'
+        result = client('put', 'pku_upload:username', '--stdin', data='denied-overwrite', check=False)
+        assert result.returncode == 1 and 'does not allow editing' in result.stderr
+
+        host('key', 'update', 'client', '--allow-edit', '--allow-create=false')
+        policy = json.loads(client('remote', 'info', '00_work', '--json').stdout)['key']
+        assert policy['allow_edit'] and not policy['allow_create']
+        client('credential', 'rename', 'pku_upload', 'pku_uploaded')
+        assert json.loads(host('view', uploaded['id'], '--json').stdout)['name'] == 'pku_uploaded:username'
+        client('credential', 'delete', 'pku_uploaded')
+        result = client('credential', 'rename', 'pku_test', 'pku_renamed', check=False)
+        assert result.returncode == 1 and 'multiple sources' in result.stderr
+        result = client('credential', 'rename', 'pku_test', 'pku_renamed', '--source', '00_work', check=False)
+        assert result.returncode == 1 and 'not allowed' in result.stderr
+        assert json.loads(host('view', password['id'], '--json').stdout)['name'] == 'pku_test:password'
+
+        host('key', 'update', 'client', '--rule', 'pku_*:*', '--allow-create')
+        group = json.loads(client('credential', 'rename', 'pku_test', 'pku_renamed', '--source', '00_work', '--json').stdout)
+        assert len(group['fields']) == 3
+        assert json.loads(client('view', 'pku_test:password', '--source', 'local', '--json').stdout)['id'] == local['id']
+        current = json.loads(host('view', password['id'], '--json').stdout)
+        assert current['name'] == 'pku_renamed:password' and len(current['leaks']) == 1 and current['used_count'] >= 1
+        rotated = json.loads(client('put', 'pku_renamed:password', '--stdin', '--json', data='updated-synthetic-password').stdout)
+        assert rotated['id'] != password['id'] and rotated['source'] == '00_work'
+        client('put', 'pku_renamed:password', '--uses', '5')
+        client('rename', rotated['id'], 'pku_renamed:pass')
+        client('delete', rotated['id'])
+        deleted = json.loads(client('credential', 'delete', 'pku_renamed', '--json').stdout)
+        assert deleted['fields'] == 2
+        assert json.loads(host('credential', 'ls', '--json').stdout) == []
+        host('key', 'update', 'client', '--allow-edit=false', '--allow-create=false')
+        result = client('put', 'pku_new:password', '--stdin', '--source', '00_work', data='denied-after-revocation', check=False)
+        assert result.returncode == 1 and 'does not allow creating' in result.stderr
+        print('PASS: live per-client edit/create matrix, remote put/rename/delete, atomic groups and scoped refusal')
     finally:
         if process.poll() is None:
             process.terminate()

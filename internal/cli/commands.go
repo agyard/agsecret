@@ -40,7 +40,9 @@ history. Resubmitting the same value preserves them.
 --uses limits total get/exec/send authorizations per ID (0 means unlimited).
 Restricting access, expiry or uses needs only the options. Widening those
 limits requires the value.
-put takes a field name; use IDs with get, view, send, exec or report.`,
+put takes a field name; use IDs with get, view, send, exec or report.
+Existing names update their owning source. New names default to local;
+use --source REMOTE to create a field on a mounted server.`,
 		Example: `  # Store a token from an environment variable
   printf '%s' "$GITHUB_TOKEN" | agsecret put github --stdin
 
@@ -95,16 +97,18 @@ put takes a field name; use IDs with get, view, send, exec or report.`,
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
+			return o.withSources(func(s *sources) error {
+				target, err := s.putTarget(cmd.Context(), args[0])
+				if err != nil {
+					return err
+				}
+				defer clear(target.Secret)
+				if target.Source != "local" && c.SkipCheck {
+					return errors.New("--dangerously-skip-check is available only for local writes")
+				}
 				effectiveType := kind
 				if c.Type == nil {
-					previous, err := s.Get(args[0], false)
-					if err == nil {
-						effectiveType = previous.Type
-						clear(previous.Secret)
-					} else if !errors.Is(err, store.ErrNotFound) {
-						return err
-					}
+					effectiveType = target.Type
 				}
 				if effectiveType == "plain" && (c.ExpiresAt != nil || c.AllowGet != nil || c.MaxUses != nil || cmd.Flags().Changed("dangerously-skip-check")) {
 					return errors.New("plain values do not support expiry, access restrictions, usage limits or bypass options")
@@ -116,7 +120,6 @@ put takes a field name; use IDs with get, view, send, exec or report.`,
 					c.Type = &effectiveType
 					return promptValue(in, cmd.ErrOrStderr(), effectiveType+": ", effectiveType == "plain")
 				}
-				var err error
 				// Policy-only edits need no value unless they loosen a limit.
 				switch {
 				case len(args) == 2:
@@ -136,7 +139,7 @@ put takes a field name; use IDs with get, view, send, exec or report.`,
 				if len(args) == 2 && effectiveType != "plain" {
 					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "agsecret: remove this command from shell history; use --stdin or the terminal prompt for sensitive values.")
 				}
-				result, err := s.Put(args[0], c)
+				result, err := s.put(cmd.Context(), target, c)
 				if errors.Is(err, store.ErrNeedsValue) && isTerminal(in) {
 					if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "Enter the value to confirm the new limits."); err != nil {
 						return err
@@ -144,7 +147,7 @@ put takes a field name; use IDs with get, view, send, exec or report.`,
 					if c.Secret, err = prompt(); err != nil {
 						return err
 					}
-					result, err = s.Put(args[0], c)
+					result, err = s.put(cmd.Context(), target, c)
 				}
 				if err != nil {
 					return err
@@ -438,14 +441,12 @@ func newDelete(o *options) *cobra.Command {
 		Short:      "Delete a secret",
 		Args:       cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return o.withStore(func(s *store.Store) error {
-				r, err := s.Get(args[0], false)
+			return o.withSources(func(s *sources) error {
+				r, err := s.delete(cmd.Context(), args[0])
 				if err != nil {
 					return err
 				}
-				if err := s.Delete(r.ID); err != nil {
-					return err
-				}
+				defer clear(r.Secret)
 				if o.json {
 					return encodeJSON(cmd.OutOrStdout(), recordJSON(r))
 				}

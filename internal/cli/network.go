@@ -102,12 +102,16 @@ func newKey(o *options) *cobra.Command {
 		RunE:  func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
 	var rules []string
+	var permissions store.KeyPermissions
 	create := &cobra.Command{
 		Use:   "create NAME --rule PATTERN [--rule PATTERN...]",
 		Short: "Create an API key and print it once",
 		Long: `Rules match complete field names with *, ? and []. Wildcards also match : and /.
 A leading ! excludes.
 The last matching rule wins; access starts denied. Rules apply dynamically.
+Keys default to read/use/report access. --allow-edit grants updates, renames
+and deletion of existing fields. --allow-create grants new fields, without
+allowing overwrites. Both capabilities are limited by the field rules.
 Store the printed key for remote add.`,
 		Example: "  agsecret key create laptop --rule 'pku_*:*' --rule '!pku_*:otp'",
 		Args: func(cmd *cobra.Command, args []string) error {
@@ -121,7 +125,7 @@ Store the printed key for remote add.`,
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return o.withStore(func(s *store.Store) error {
-				key, err := s.CreateAPIKey(args[0], rules)
+				key, err := s.CreateAPIKeyWithPermissions(args[0], rules, permissions)
 				if err != nil {
 					return err
 				}
@@ -131,7 +135,52 @@ Store the printed key for remote add.`,
 		},
 	}
 	create.Flags().StringArrayVar(&rules, "rule", nil, "ordered field pattern; prefix ! to exclude (repeatable)")
-	c.AddCommand(create, addJSONFlag(&cobra.Command{
+	create.Flags().BoolVar(&permissions.AllowEdit, "allow-edit", false, "allow updating, renaming and deleting existing fields")
+	create.Flags().BoolVar(&permissions.AllowCreate, "allow-create", false, "allow creating new fields (overwrites require --allow-edit)")
+	var updateRules []string
+	var edit, createFields bool
+	update := &cobra.Command{
+		Use:   "update NAME",
+		Short: "Change a key's rules or write permissions without rotating it",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if err := cobra.ExactArgs(1)(cmd, args); err != nil {
+				return err
+			}
+			if err := store.ValidateAPIKeyName(args[0]); err != nil {
+				return err
+			}
+			if !cmd.Flags().Changed("rule") && !cmd.Flags().Changed("allow-edit") && !cmd.Flags().Changed("allow-create") {
+				return errors.New("provide --rule, --allow-edit or --allow-create (use =false to revoke)")
+			}
+			if cmd.Flags().Changed("rule") {
+				return store.ValidateRules(updateRules)
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			change := store.APIKeyChange{}
+			if cmd.Flags().Changed("rule") {
+				change.Rules = &updateRules
+			}
+			if cmd.Flags().Changed("allow-edit") {
+				change.AllowEdit = &edit
+			}
+			if cmd.Flags().Changed("allow-create") {
+				change.AllowCreate = &createFields
+			}
+			return o.withStore(func(s *store.Store) error {
+				if err := s.UpdateAPIKey(args[0], change); err != nil {
+					return err
+				}
+				_, err := fmt.Fprintf(cmd.OutOrStdout(), "Updated API key %s\n", args[0])
+				return err
+			})
+		},
+	}
+	update.Flags().StringArrayVar(&updateRules, "rule", nil, "replace the ordered rules (repeatable)")
+	update.Flags().BoolVar(&edit, "allow-edit", false, "allow editing existing fields; =false revokes")
+	update.Flags().BoolVar(&createFields, "allow-create", false, "allow creating new fields; =false revokes")
+	c.AddCommand(create, update, addJSONFlag(&cobra.Command{
 		Use:   "ls",
 		Short: "List API key names and rules",
 		Args:  cobra.NoArgs,
@@ -145,9 +194,9 @@ Store the printed key for remote add.`,
 					return encodeJSON(cmd.OutOrStdout(), keys)
 				}
 				w := newTable(cmd.OutOrStdout())
-				fmt.Fprintln(w, "NAME\tRULES")
+				fmt.Fprintln(w, "NAME\tEDIT\tCREATE\tRULES")
 				for _, key := range keys {
-					fmt.Fprintf(w, "%s\t%s\n", safeText(key.Name), safeText(strings.Join(key.Rules, ", ")))
+					fmt.Fprintf(w, "%s\t%t\t%t\t%s\n", safeText(key.Name), key.AllowEdit, key.AllowCreate, safeText(strings.Join(key.Rules, ", ")))
 				}
 				return w.Flush()
 			})
@@ -180,6 +229,40 @@ func newRemote(o *options) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE:  func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
+	info := &cobra.Command{
+		Use:   "info NAME",
+		Short: "Query a mounted server for this client's rules and write permissions",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return o.withStore(func(s *store.Store) error {
+				mounts, err := s.Remotes()
+				if err != nil {
+					return err
+				}
+				for _, mount := range mounts {
+					if mount.Name != args[0] {
+						continue
+					}
+					client, err := remote.NewClient(mount.URL, mount.Key)
+					if err != nil {
+						return err
+					}
+					defer client.Close()
+					key, err := client.Capabilities(cmd.Context())
+					if err != nil {
+						return err
+					}
+					if o.json {
+						return encodeJSON(cmd.OutOrStdout(), map[string]any{"source": mount.Name, "url": mount.URL, "key": key})
+					}
+					_, err = fmt.Fprintf(cmd.OutOrStdout(), "Source: %s\nAPI key: %s\nEdit existing fields: %t\nCreate new fields: %t\nRules: %s\n", mount.Name, key.Name, key.AllowEdit, key.AllowCreate, safeText(strings.Join(key.Rules, ", ")))
+					return err
+				}
+				return fmt.Errorf("remote %s is not mounted; run agsecret remote ls", args[0])
+			})
+		},
+	}
+	c.AddCommand(addJSONFlag(info, o))
 	var keyStdin bool
 	add := &cobra.Command{
 		Use:   "add NAME URL",

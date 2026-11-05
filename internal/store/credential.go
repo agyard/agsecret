@@ -1,8 +1,10 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -49,33 +51,48 @@ func ValidateCredential(name string) error {
 
 // Rename moves a secret without changing its value, identity or policies.
 func (s *Store) Rename(ref, newName string) (Record, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return Record{}, err
+	}
+	defer tx.Rollback()
+	r, err := rename(tx, ref, newName)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		clear(r.Secret)
+		return Record{}, err
+	}
+	return r, err
+}
+
+func rename(tx *sql.Tx, ref, newName string) (Record, error) {
 	if err := validateRef(ref); err != nil {
 		return Record{}, err
 	}
 	if err := ValidateName(newName); err != nil {
 		return Record{}, err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return Record{}, err
-	}
-	defer tx.Rollback()
 	r, err := getRecord(tx, ref, false)
 	if err != nil || r.Name == newName {
 		return r, err
 	}
 	var exists bool
 	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM secrets WHERE name=?)", newName).Scan(&exists); err != nil {
+		clear(r.Secret)
 		return Record{}, err
 	}
 	if exists {
-		return Record{}, fmt.Errorf("secret %s already exists", newName)
+		clear(r.Secret)
+		return Record{}, fmt.Errorf("secret %s already exists: %w", newName, ErrAlreadyExists)
 	}
 	r.Name, r.UpdatedAt = newName, now()
 	if _, err := tx.Exec("UPDATE secrets SET name=?,updated_at=? WHERE id=?", r.Name, encodeTime(r.UpdatedAt), r.ID); err != nil {
+		clear(r.Secret)
 		return Record{}, err
 	}
-	return r, tx.Commit()
+	return r, nil
 }
 
 const credentialWhere = "substr(name,1,instr(name,':'))=?"
@@ -95,55 +112,126 @@ func (s *Store) Credential(name string) ([]Record, error) {
 
 // RenameCredential atomically moves all fields to an unused namespace.
 func (s *Store) RenameCredential(name, newName string) ([]Record, error) {
+	return s.RenameCredentialChecked(name, newName, nil)
+}
+
+// RenameCredentialChecked also rejects changed group membership or rotated IDs.
+func (s *Store) RenameCredentialChecked(name, newName string, ids []string) ([]Record, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	records, err := renameCredential(tx, name, newName, ids)
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		clearRecords(records)
+		return nil, err
+	}
+	return records, nil
+}
+
+func credentialRecords(tx *sql.Tx, name string) ([]Record, error) {
+	rows, err := tx.Query("SELECT "+columns(false)+" FROM secrets WHERE "+credentialWhere+" ORDER BY name", name+":")
+	return scanRecords(rows, err, false)
+}
+
+func checkCredentialIDs(records []Record, expected []string) error {
+	if expected == nil {
+		return nil
+	}
+	ids := make([]string, len(records))
+	for i, r := range records {
+		ids[i] = r.ID
+	}
+	slices.Sort(ids)
+	want := slices.Clone(expected)
+	slices.Sort(want)
+	if !slices.Equal(ids, want) {
+		return ErrConflict
+	}
+	return nil
+}
+
+func renameCredential(tx *sql.Tx, name, newName string, ids []string) ([]Record, error) {
 	if err := ValidateCredential(name); err != nil {
 		return nil, err
 	}
 	if err := ValidateCredential(newName); err != nil {
 		return nil, err
 	}
-	tx, err := s.db.Begin()
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	rows, err := tx.Query("SELECT "+columns(false)+" FROM secrets WHERE "+credentialWhere+" ORDER BY name", name+":")
-	records, err := scanRecords(rows, err, false)
+	records, err := credentialRecords(tx, name)
 	if err != nil {
 		return nil, err
 	}
 	if len(records) == 0 {
 		return nil, fmt.Errorf("credential %s %w", name, ErrNotFound)
 	}
+	if err := checkCredentialIDs(records, ids); err != nil {
+		clearRecords(records)
+		return nil, err
+	}
 	if name == newName {
 		return records, nil
 	}
 	var exists bool
 	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM secrets WHERE "+credentialWhere+")", newName+":").Scan(&exists); err != nil {
+		clearRecords(records)
 		return nil, err
 	}
 	if exists {
-		return nil, fmt.Errorf("credential %s already exists", newName)
+		clearRecords(records)
+		return nil, fmt.Errorf("credential %s already exists: %w", newName, ErrAlreadyExists)
 	}
 	updated := now()
 	for i := range records {
 		_, field := SplitName(records[i].Name)
 		records[i].Name, records[i].UpdatedAt = newName+":"+field, updated
 		if err := ValidateName(records[i].Name); err != nil {
+			clearRecords(records)
 			return nil, err
 		}
 	}
 	if _, err := tx.Exec("UPDATE secrets SET name=?||substr(name,instr(name,':')),updated_at=? WHERE "+credentialWhere, newName, encodeTime(updated), name+":"); err != nil {
+		clearRecords(records)
 		return nil, err
 	}
-	return records, tx.Commit()
+	return records, nil
 }
 
 // DeleteCredential atomically deletes all fields in a namespace.
 func (s *Store) DeleteCredential(name string) (int64, error) {
+	return s.DeleteCredentialChecked(name, nil)
+}
+
+func (s *Store) DeleteCredentialChecked(name string, ids []string) (int64, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	count, err := deleteCredential(tx, name, ids)
+	if err == nil {
+		err = tx.Commit()
+	}
+	return count, err
+}
+
+func deleteCredential(tx *sql.Tx, name string, ids []string) (int64, error) {
 	if err := ValidateCredential(name); err != nil {
 		return 0, err
 	}
-	result, err := s.db.Exec("DELETE FROM secrets WHERE "+credentialWhere, name+":")
+	records, err := credentialRecords(tx, name)
+	if err != nil {
+		return 0, err
+	}
+	defer clearRecords(records)
+	if err := checkCredentialIDs(records, ids); err != nil {
+		return 0, err
+	}
+	result, err := tx.Exec("DELETE FROM secrets WHERE "+credentialWhere, name+":")
 	if err != nil {
 		return 0, err
 	}

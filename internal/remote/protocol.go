@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	maxRequestBytes  = 1 << 20
-	maxResponseBytes = 64 << 20
+	maxRequestBytes = 1 << 20
+	// A maximum-size field is Base64 on the wire, plus small policy metadata.
+	maxPutRequestBytes = 2 << 20
+	maxResponseBytes   = 64 << 20
 )
 
 // field separates the wire format from the vault model. Value is present for
@@ -42,6 +44,48 @@ type useRequest struct {
 type reportRequest struct {
 	ID     string `json:"id"`
 	Reason string `json:"reason"`
+}
+
+type expiryChange struct {
+	At *time.Time `json:"at"`
+}
+
+type putRequest struct {
+	Name       string        `json:"name"`
+	ExpectedID *string       `json:"expected_id"`
+	Value      []byte        `json:"value,omitempty"`
+	Type       *string       `json:"type,omitempty"`
+	Expiry     *expiryChange `json:"expiry,omitempty"`
+	AllowGet   *bool         `json:"allow_get,omitempty"`
+	AllowExec  *bool         `json:"allow_exec,omitempty"`
+	MaxUses    *int64        `json:"max_uses,omitempty"`
+}
+
+type putResponse struct {
+	Field      field    `json:"field"`
+	Created    bool     `json:"created"`
+	PreviousID string   `json:"previous_id,omitempty"`
+	Duplicates []string `json:"duplicates"`
+}
+
+type renameRequest struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type deleteRequest struct {
+	ID string `json:"id"`
+}
+
+type credentialRequest struct {
+	Name    string   `json:"name"`
+	NewName string   `json:"new_name,omitempty"`
+	IDs     []string `json:"ids"`
+}
+
+type credentialDeleted struct {
+	Name   string `json:"name"`
+	Fields int64  `json:"fields"`
 }
 
 type errorResponse struct {

@@ -28,6 +28,104 @@ func NewHandler(s *store.Store) http.Handler {
 		var err error
 		used := false
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/capabilities":
+			key, err := s.APICapabilities(token)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(key)
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/put":
+			var request putRequest
+			defer func() { clear(request.Value) }()
+			if !readRequestLimit(w, r, &request, maxPutRequestBytes) {
+				return
+			}
+			if store.ValidateName(request.Name) != nil || request.ExpectedID == nil || *request.ExpectedID != "" && !store.ValidID(*request.ExpectedID) {
+				writeStatus(w, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			change := store.Change{ExpectedID: request.ExpectedID, Secret: request.Value, Type: request.Type, AllowGet: request.AllowGet, AllowExec: request.AllowExec, MaxUses: request.MaxUses}
+			if request.Expiry != nil {
+				change.ExpiresAt = &request.Expiry.At
+			}
+			result, err := s.APIPut(token, request.Name, change)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			defer clear(result.Record.Secret)
+			_ = json.NewEncoder(w).Encode(putResponse{Field: toField(result.Record, false), Created: result.Created, PreviousID: result.PreviousID, Duplicates: result.Duplicates})
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/rename":
+			var request renameRequest
+			if !readRequest(w, r, &request) {
+				return
+			}
+			if !store.ValidID(request.ID) || store.ValidateName(request.Name) != nil {
+				writeStatus(w, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			record, err := s.APIRename(token, request.ID, request.Name)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			defer clear(record.Secret)
+			_ = json.NewEncoder(w).Encode(toField(record, false))
+			return
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/delete":
+			var request deleteRequest
+			if !readRequest(w, r, &request) {
+				return
+			}
+			if !store.ValidID(request.ID) {
+				writeStatus(w, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			record, err := s.APIDelete(token, request.ID)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			defer clear(record.Secret)
+			_ = json.NewEncoder(w).Encode(toField(record, false))
+			return
+		case r.Method == http.MethodPost && (r.URL.Path == "/v1/credential/rename" || r.URL.Path == "/v1/credential/delete"):
+			var request credentialRequest
+			if !readRequest(w, r, &request) {
+				return
+			}
+			if store.ValidateCredential(request.Name) != nil || len(request.IDs) == 0 {
+				writeStatus(w, http.StatusBadRequest, "invalid_request")
+				return
+			}
+			for _, id := range request.IDs {
+				if !store.ValidID(id) {
+					writeStatus(w, http.StatusBadRequest, "invalid_request")
+					return
+				}
+			}
+			if r.URL.Path == "/v1/credential/rename" {
+				if store.ValidateCredential(request.NewName) != nil {
+					writeStatus(w, http.StatusBadRequest, "invalid_request")
+					return
+				}
+				records, err = s.APIRenameCredential(token, request.Name, request.NewName, request.IDs)
+			} else {
+				if request.NewName != "" {
+					writeStatus(w, http.StatusBadRequest, "invalid_request")
+					return
+				}
+				count, err := s.APIDeleteCredential(token, request.Name, request.IDs)
+				if err != nil {
+					writeError(w, err)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(credentialDeleted{Name: request.Name, Fields: count})
+				return
+			}
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/fields":
 			records, err = s.APIList(token)
 		case r.Method == http.MethodGet && r.URL.Path == "/v1/field":
@@ -102,12 +200,16 @@ func NewHandler(s *store.Store) http.Handler {
 }
 
 func readRequest(w http.ResponseWriter, r *http.Request, dst any) bool {
+	return readRequestLimit(w, r, dst, maxRequestBytes)
+}
+
+func readRequestLimit(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeStatus(w, http.StatusUnsupportedMediaType, "invalid_request")
 		return false
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	if err := decodeJSON(r.Body, dst); err != nil {
 		writeStatus(w, http.StatusBadRequest, "invalid_request")
 		return false
@@ -117,6 +219,18 @@ func readRequest(w http.ResponseWriter, r *http.Request, dst any) bool {
 
 func writeError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, store.ErrEditNotAllowed):
+		writeStatus(w, http.StatusForbidden, "edit_not_allowed")
+	case errors.Is(err, store.ErrCreateNotAllowed):
+		writeStatus(w, http.StatusForbidden, "create_not_allowed")
+	case errors.Is(err, store.ErrConflict):
+		writeStatus(w, http.StatusConflict, "conflict")
+	case errors.Is(err, store.ErrAlreadyExists):
+		writeStatus(w, http.StatusConflict, "already_exists")
+	case errors.Is(err, store.ErrNeedsValue):
+		writeStatus(w, http.StatusBadRequest, "needs_value")
+	case errors.Is(err, store.ErrInvalidChange):
+		writeStatus(w, http.StatusBadRequest, "invalid_change")
 	case errors.Is(err, store.ErrUnauthorized):
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeStatus(w, http.StatusUnauthorized, "unauthorized")

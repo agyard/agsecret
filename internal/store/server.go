@@ -21,6 +21,14 @@ var ErrUnauthorized = errors.New("invalid API key")
 type APIKey struct {
 	Name  string   `json:"name"`
 	Rules []string `json:"rules"`
+	KeyPermissions
+}
+
+// KeyPermissions independently grants changes to existing records and creation
+// of new records. Missing permission records (including legacy keys) deny both.
+type KeyPermissions struct {
+	AllowEdit   bool `json:"allow_edit"`
+	AllowCreate bool `json:"allow_create"`
 }
 
 // Remote is a named server. Names determine lookup order after the local vault.
@@ -39,6 +47,11 @@ CREATE TABLE IF NOT EXISTS remotes (
  name TEXT PRIMARY KEY NOT NULL,
  url TEXT NOT NULL,
  api_key TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS api_key_permissions (
+ digest BLOB PRIMARY KEY NOT NULL REFERENCES api_keys(digest) ON DELETE CASCADE,
+ allow_edit INTEGER NOT NULL DEFAULT 0 CHECK(allow_edit IN (0,1)),
+ allow_create INTEGER NOT NULL DEFAULT 0 CHECK(allow_create IN (0,1))
 );`
 
 // These optional tables are created by management writes. Existing vaults and
@@ -153,6 +166,10 @@ func rulesAllow(rules []string, name string) bool {
 }
 
 func (s *Store) CreateAPIKey(name string, rules []string) (string, error) {
+	return s.CreateAPIKeyWithPermissions(name, rules, KeyPermissions{})
+}
+
+func (s *Store) CreateAPIKeyWithPermissions(name string, rules []string, permissions KeyPermissions) (string, error) {
 	if err := ValidateAPIKeyName(name); err != nil {
 		return "", err
 	}
@@ -183,6 +200,9 @@ func (s *Store) CreateAPIKey(name string, rules []string) (string, error) {
 	if _, err := tx.Exec("INSERT INTO api_keys(name,digest,rules) VALUES(?,?,?)", name, digest[:], string(encoded)); err != nil {
 		return "", err
 	}
+	if _, err := tx.Exec("INSERT INTO api_key_permissions(digest,allow_edit,allow_create) VALUES(?,?,?)", digest[:], permissions.AllowEdit, permissions.AllowCreate); err != nil {
+		return "", err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
@@ -195,7 +215,15 @@ func (s *Store) APIKeys() ([]APIKey, error) {
 	if err != nil || !exists {
 		return keys, err
 	}
-	rows, err := s.db.Query("SELECT name,rules FROM api_keys ORDER BY name")
+	query := "SELECT name,rules,0,0 FROM api_keys ORDER BY name"
+	permissions, err := hasTable(s.db, "api_key_permissions")
+	if err != nil {
+		return nil, err
+	}
+	if permissions {
+		query = "SELECT k.name,k.rules,coalesce(p.allow_edit,0),coalesce(p.allow_create,0) FROM api_keys k LEFT JOIN api_key_permissions p ON p.digest=k.digest ORDER BY k.name"
+	}
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +231,7 @@ func (s *Store) APIKeys() ([]APIKey, error) {
 	for rows.Next() {
 		var key APIKey
 		var rules string
-		if err := rows.Scan(&key.Name, &rules); err != nil {
+		if err := rows.Scan(&key.Name, &rules, &key.AllowEdit, &key.AllowCreate); err != nil {
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(rules), &key.Rules); err != nil {
@@ -292,6 +320,11 @@ func (s *Store) deleteConfig(table, name string) error {
 	defer tx.Rollback()
 	if _, err := tx.Exec(serverSchema); err != nil {
 		return err
+	}
+	if table == "api_keys" {
+		if _, err := tx.Exec("DELETE FROM api_key_permissions WHERE digest=(SELECT digest FROM api_keys WHERE name=?)", name); err != nil {
+			return err
+		}
 	}
 	result, err := tx.Exec("DELETE FROM "+table+" WHERE name=?", name)
 	if err != nil {

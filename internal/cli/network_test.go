@@ -39,7 +39,7 @@ func TestKeyAndRemoteManagement(t *testing.T) {
 	}
 	entry := keys[0].(map[string]any)
 	wantRules := []any{rules[0], rules[1], rules[2]}
-	if entry["name"] != "laptop" || !reflect.DeepEqual(entry["rules"], wantRules) || len(entry) != 2 {
+	if entry["name"] != "laptop" || !reflect.DeepEqual(entry["rules"], wantRules) || entry["allow_edit"] != false || entry["allow_create"] != false || len(entry) != 4 {
 		t.Fatalf("key metadata: %v", keys)
 	}
 	if code, out, errOut := c.call("", args...); code != 1 || out != "" || !strings.Contains(errOut, "already exists") {
@@ -92,6 +92,11 @@ func (r *unusedKeyInput) Read([]byte) (int, error) {
 
 func TestNetworkUsageValidation(t *testing.T) {
 	for _, args := range [][]string{
+		{"key", "update", "laptop"},
+		{"key", "update", "laptop", "--rule", "!*"},
+		{"key", "create", "laptop", "--rule", "*", "--source", "work"},
+		{"serve", "--source", "work"},
+		{"ls", "--source", "UPPER"},
 		{"key", "create", "laptop"},
 		{"key", "create", "laptop", "--rule", "["},
 		{"key", "create", "laptop", "--rule", "!*"},
