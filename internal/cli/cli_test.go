@@ -16,6 +16,13 @@ type testCLI struct {
 	db, pass string
 }
 
+// Existing CLI/subprocess tests must never consult the developer's keyring.
+// Backend-specific tests inject a synthetic backend and explicitly choose auto.
+func TestMain(m *testing.M) {
+	os.Setenv("AGSECRET_KEYRING", "off")
+	os.Exit(m.Run())
+}
+
 func newTestCLI(t *testing.T) testCLI {
 	t.Helper()
 	dir := t.TempDir()

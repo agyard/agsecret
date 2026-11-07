@@ -3,6 +3,7 @@ module github.com/agyard/agsecret
 go 1.26.0
 
 require (
+	github.com/godbus/dbus/v5 v5.2.2
 	github.com/ncruces/go-sqlite3 v0.35.6
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/crypto v0.57.0

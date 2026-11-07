@@ -13,6 +13,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/agyard/agsecret/internal/keyring"
 	"github.com/agyard/agsecret/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -20,15 +21,19 @@ import (
 var Version = "dev"
 
 type options struct {
-	db          string
-	source      string
-	passFile    string
-	defaultPass bool // passFile was not chosen by the user
-	json        bool
-	started     bool // a command began running; earlier errors are usage errors
-	in          io.Reader
-	out         io.Writer
-	errOut      io.Writer
+	db            string
+	source        string
+	passFile      string
+	defaultPass   bool // passFile was not chosen by the user
+	keyringMode   string
+	keyring       keyring.Backend
+	unlockSource  string
+	keyringCached bool
+	json          bool
+	started       bool // a command began running; earlier errors are usage errors
+	in            io.Reader
+	out           io.Writer
+	errOut        io.Writer
 }
 
 // exitError sets the process exit code. A nil err prints nothing.
@@ -58,6 +63,13 @@ func (o *options) resolve() error {
 	envPass := os.Getenv("AGSECRET_PASS_FILE")
 	o.defaultPass = o.passFile == "" && envPass == ""
 	o.passFile = cmp.Or(o.passFile, envPass, strings.TrimSuffix(db, filepath.Ext(db))+".pass")
+	o.keyringMode = cmp.Or(o.keyringMode, os.Getenv("AGSECRET_KEYRING"), "auto")
+	if o.keyringMode != "auto" && o.keyringMode != "off" {
+		return errors.New("--keyring must be auto or off")
+	}
+	if o.keyring == nil {
+		o.keyring = keyring.New()
+	}
 	return nil
 }
 
@@ -234,6 +246,7 @@ func newRoot(o *options) *cobra.Command {
 	r.PersistentFlags().StringVar(&o.db, "db", "", "vault file (default $AGSECRET_DB or $XDG_DATA_HOME/agsecret/secrets.db)")
 	r.PersistentFlags().StringVar(&o.source, "source", "", "select local or a mounted remote for field and credential commands")
 	r.PersistentFlags().StringVar(&o.passFile, "pass-file", "", "file with the vault passphrase (default $AGSECRET_PASS_FILE or the vault path with its extension changed to .pass)")
+	r.PersistentFlags().StringVar(&o.keyringMode, "keyring", "", "unlock through the system keyring first (auto), or only the pass file/prompt (off); default $AGSECRET_KEYRING or auto")
 	r.CompletionOptions.DisableDefaultCmd = true
 	r.SetHelpCommand(&cobra.Command{Use: "help [COMMAND]", Short: "Show help for a command", RunE: func(_ *cobra.Command, args []string) error {
 		target, rest, err := r.Find(args)

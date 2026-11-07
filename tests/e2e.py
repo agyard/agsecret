@@ -213,7 +213,7 @@ def check_remote(root, env, run):
 def main():
     with tempfile.TemporaryDirectory(prefix='agsecret-selfcheck-') as directory:
         root = pathlib.Path(directory)
-        env = dict(os.environ, XDG_DATA_HOME=str(root / 'data'), AGSECRET_DB='', AGSECRET_PASS_FILE='')
+        env = dict(os.environ, XDG_DATA_HOME=str(root / 'data'), AGSECRET_DB='', AGSECRET_PASS_FILE='', AGSECRET_KEYRING='off')
 
         def run(*args, data=None, check=True, child_env=None):
             p = subprocess.run([APP, *args], input=data, text=True, capture_output=True,

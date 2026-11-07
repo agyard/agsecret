@@ -228,8 +228,54 @@ By default the vault is `$XDG_DATA_HOME/agsecret/secrets.db` (`~/.local/share/ag
 | --- | --- | --- |
 | Vault | `--db` | `AGSECRET_DB` |
 | Pass file | `--pass-file` | `AGSECRET_PASS_FILE` |
+| Keyring mode (`auto` or `off`) | `--keyring` | `AGSECRET_KEYRING` |
 
 Flags override environment variables. On Unix, the pass file must be private to you (`chmod 600`); on Windows, keep it in a private directory.
+
+### System keyring and pass-file fallback
+
+The default `--keyring auto` first tries the running user's Secret Service
+keyring on Linux and BSD. An unavailable, locked, missing or stale entry falls
+back to the configured private pass file, then the existing interactive prompt
+when applicable. macOS and Windows currently use the same pass-file/prompt
+fallback; native Keychain and Credential Manager backends are not implemented.
+
+After a successful file or prompt unlock, AG-Secret attempts to cache that
+vault's unlock passphrase in the unlocked default keyring collection. `init`
+also does this for existing vaults; it does not replace their values, file
+permissions or passphrases. There is no keyring unlock dialog or service
+autostart, and each Secret Service operation has a two-second deadline. Keyring
+errors do not expose provider output or prevent file fallback.
+
+`init` retains its private pass file for recovery and unattended use. Keeping
+that file means a copy of it plus the vault still permits decryption.
+`--keyring off` or `AGSECRET_KEYRING=off` forces the original file/prompt behavior.
+`agsecret init --json` reports `unlock_source` (`keyring`, `passfile` or `prompt`)
+and `keyring_cached` without printing the passphrase.
+
+The keyring stores only the vault unlock passphrase. Credential values remain
+in the encrypted database with their existing policies. The non-secret keyring
+account is a SHA-256 digest of the encrypted `.unlock` descriptor, so moving a
+vault does not lose its keyring entry. A new descriptor selects a new entry.
+No sidecar format or database migration is required. Keyring state is local to
+the desktop session and is not a portable backup.
+
+### aerc credential commands
+
+A user may explicitly authorize aerc to receive a password through its private
+credential-command pipe:
+
+```ini
+source-cred-cmd = /absolute/path/to/agsecret get example_mail:password --source local --dangerously-skip-check
+outgoing-cred-cmd = /absolute/path/to/agsecret get example_mail:password --source local --dangerously-skip-check
+```
+
+Remove passwords from the `source` and `outgoing` URLs: aerc gives inline
+passwords precedence. Use separate fields if receiving and sending have
+different passwords. The human override still checks field read access, expiry
+and use counters. Agents must not run these password-printing commands.
+
+### Field policies
 
 `put` sets options for passwords and TOTP fields:
 

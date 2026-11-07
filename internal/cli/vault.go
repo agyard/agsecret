@@ -114,12 +114,7 @@ func (o *options) withStore(fn func(*store.Store) error) error {
 	if err := o.checkVault(); err != nil {
 		return err
 	}
-	pass, err := o.passphrase()
-	if err != nil {
-		return err
-	}
-	s, err := store.Open(o.db, pass)
-	clear(pass)
+	s, err := o.openStore()
 	if err != nil {
 		return err
 	}
@@ -130,32 +125,86 @@ func (o *options) withStore(fn func(*store.Store) error) error {
 	return err
 }
 
+func (o *options) openStore() (*store.Store, error) {
+	o.unlockSource, o.keyringCached = "", false
+	var account string
+	useKeyring := o.keyringMode == "auto" && o.keyring != nil
+	if useKeyring {
+		var err error
+		account, err = store.UnlockID(o.db)
+		useKeyring = err == nil
+	}
+	if useKeyring {
+		pass, err := o.keyring.Get(account)
+		if err == nil {
+			s, openErr := store.Open(o.db, pass)
+			clear(pass)
+			if openErr == nil {
+				o.unlockSource = "keyring"
+				o.keyringCached = true
+				return s, nil
+			}
+		} else {
+			clear(pass)
+		}
+	}
+	pass, err := o.passphrase()
+	if err != nil {
+		return nil, err
+	}
+	defer clear(pass)
+	s, err := store.Open(o.db, pass)
+	if err != nil {
+		return nil, err
+	}
+	o.unlockSource = "passfile"
+	if _, err := os.Lstat(o.passFile); errors.Is(err, os.ErrNotExist) {
+		o.unlockSource = "prompt"
+	}
+	// Cache only after the passphrase has authenticated and opened this vault.
+	// Failure keeps the original pass file and never changes vault encryption.
+	if useKeyring {
+		o.keyringCached = o.keyring.Set(account, pass) == nil
+	}
+	return s, nil
+}
+
 func newInit(o *options) *cobra.Command {
 	return addJSONFlag(&cobra.Command{Use: "init", Short: "Create the vault", Args: cobra.NoArgs,
-		Long: `Create an encrypted vault. Unless you choose a pass file with --pass-file or
+		Long: `Create an encrypted vault. Unlock through the system keyring first, falling
+back to the private pass file or an interactive prompt. Use --keyring off to
+force file/prompt access. A successful file unlock caches its passphrase in an
+available, unlocked Secret Service keyring. The pass file is retained for fallback.
+
+Unless you choose a pass file with --pass-file or
 AGSECRET_PASS_FILE, init also creates one beside the vault, holding a random
 passphrase. Anyone who can read the pass file can open the vault.
 
-Running init again on an existing vault only checks that it opens.`,
+Running init again on an existing vault checks that it opens and attempts
+keyring caching; it never replaces the existing vault or pass file.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			created := false
-			if _, err := os.Lstat(o.db); err == nil {
-				if err := o.withStore(func(*store.Store) error { return nil }); err != nil {
+			if _, err := os.Lstat(o.db); err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
 					return err
 				}
-			} else if err := o.create(); err != nil {
-				return err
-			} else {
+				if err := o.create(); err != nil {
+					return err
+				}
 				created = true
 			}
+			if err := o.withStore(func(*store.Store) error { return nil }); err != nil {
+				return err
+			}
 			if o.json {
-				return encodeJSON(cmd.OutOrStdout(), map[string]any{"vault": o.db, "pass_file": o.passFile, "created": created})
+				return encodeJSON(cmd.OutOrStdout(), map[string]any{"vault": o.db, "pass_file": o.passFile,
+					"created": created, "unlock_source": o.unlockSource, "keyring_cached": o.keyringCached})
 			}
 			status := "Vault already exists:"
 			if created {
 				status = "Created vault:"
 			}
-			_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s %s\nPass file: %s\n", status, safeText(o.db), safeText(o.passFile))
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s %s\nPass file: %s\nUnlock source: %s\n", status, safeText(o.db), safeText(o.passFile), o.unlockSource)
 			return err
 		},
 	}, o)

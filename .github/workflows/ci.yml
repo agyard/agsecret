@@ -22,6 +22,12 @@ jobs:
         with:
           go-version: '1.26.x'
           check-latest: true
+      - name: Install private test dependencies
+        run: |
+          if ! command -v dbus-daemon >/dev/null || ! command -v tmux >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y dbus-daemon tmux
+          fi
       - name: Check source
         run: |
           sh scripts/bounded-check.sh go mod tidy
@@ -37,10 +43,6 @@ jobs:
         run: sh scripts/bounded-check.sh go test -race -p 1 -count=1 -timeout 2m ./...
       - name: Run end-to-end tests
         run: |
-          if ! command -v tmux >/dev/null; then
-            sudo apt-get update
-            sudo apt-get install --no-install-recommends -y tmux
-          fi
           make integration
       - name: Cross-build release targets
         env:

@@ -133,6 +133,34 @@ XChaCha20-Poly1305 under a key derived from the passphrase with Argon2id (time
 never replaces an existing vault or pass file, and it never changes the
 permissions of an existing directory.
 
+The CLI's default `--keyring auto` first tries an exact Secret Service item
+with attributes `service=agsecret` and `vault=SHA256(encrypted unlock descriptor)`.
+No username or credential field names enter these attributes. The descriptor
+is private but contains no plaintext passphrase; its digest is only an entry
+identifier. It is unchanged by moving the vault, and does not change format
+version 1 or require a new sidecar. Independently created descriptors select
+independent entries. Copies with the same descriptor intentionally share one
+local keyring entry.
+
+Linux and BSD use a private D-Bus connection to an already-running Secret
+Service and a `plain` Secret Service session on the local user's bus. The
+backend searches only that exact attribute pair and never enumerates unrelated
+items, autostarts a keyring daemon, calls Unlock/Prompt, or logs provider output.
+Locked, duplicate, missing, malformed and unavailable items fail to the existing
+private pass file/prompt path; a stale passphrase that cannot open the vault
+also falls back. D-Bus operations share a two-second deadline per get/set.
+Other platforms use the pass-file/prompt fallback until a native backend is
+implemented.
+
+A successful file/prompt unlock attempts to cache only the verified passphrase
+in the unlocked default collection, or replace the existing exact entry. Cache
+failure is non-fatal. `init` on an existing vault uses the same path, preserving
+the vault and pass file. The fallback file remains available and must be kept
+private. `--keyring off`/`AGSECRET_KEYRING=off` disables all keyring access, for
+example during an independent restore check. `init --json` returns only unlock
+source and cache status alongside its existing non-secret fields. Desktop
+keyring locking does not revoke keys already held by running server processes.
+
 Adiantum encrypts the database, its journals and its temporary files. It does
 not authenticate pages, and an observer can see which blocks change between
 copies. The `.unlock` file is authenticated, but that does not make the whole
